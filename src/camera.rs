@@ -21,6 +21,10 @@ pub trait Camera: Send {
     fn errors(&self) -> u64 {
         0
     }
+    /// The device went away (unplugged); it has to be opened again.
+    fn disconnected(&self) -> bool {
+        false
+    }
 }
 
 /// Open the camera a scenario asks for.

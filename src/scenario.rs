@@ -42,6 +42,29 @@ pub struct Scenario {
     /// only. Recordings are always raw.
     #[serde(default)]
     pub preview_lut: Option<String>,
+    /// Live preview look. Recordings are always raw.
+    #[serde(default)]
+    pub view: View,
+}
+
+/// Preview-only adjustments (applied after the LUT, if any).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct View {
+    /// Automatic (grey-world) white balance for colour sources.
+    pub auto_white_balance: bool,
+    /// Stretch the preview's levels to the image content (auto-levels).
+    pub auto_levels: bool,
+    /// Added to the 0..1 signal.
+    pub brightness: f32,
+    /// Multiplier around mid grey.
+    pub contrast: f32,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View { auto_white_balance: true, auto_levels: false, brightness: 0.0, contrast: 1.0 }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -56,6 +79,14 @@ pub struct CameraSettings {
     pub frame_rate: f64,
     pub exposure_us: f64,
     pub gain_db: f64,
+    /// Camera's own automatic exposure and gain (changes the recording).
+    #[serde(default)]
+    pub auto_exposure: bool,
+    /// Mirror the image on the camera (both = rotated by 180°).
+    #[serde(default)]
+    pub reverse_x: bool,
+    #[serde(default)]
+    pub reverse_y: bool,
     /// Any other GenICam feature, written as is (name -> number/string/bool).
     #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -82,10 +113,14 @@ impl Default for Scenario {
                 frame_rate: 50.0,
                 exposure_us: 10_000.0,
                 gain_db: 0.0,
+                auto_exposure: false,
+                reverse_x: false,
+                reverse_y: false,
                 extra: BTreeMap::new(),
             },
             recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into() },
             preview_lut: None,
+            view: View::default(),
         }
     }
 }

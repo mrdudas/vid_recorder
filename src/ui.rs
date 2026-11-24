@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -12,7 +12,7 @@ use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
 use crate::recorder::RecStats;
 use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
-use crate::scenario::{self, Device, Scenario};
+use crate::scenario::{self, Device, Scenario, View};
 
 /// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
 struct PreviewLut {
@@ -50,6 +50,12 @@ pub struct App {
     lut: Option<PreviewLut>,
     /// Cameras offered on the settings page (refreshed on request).
     devices: Vec<Device>,
+    /// Smoothed auto white balance gains (R, G, B) for the preview.
+    wb_gains: [f32; 3],
+    /// Smoothed auto-levels black and white points (0..1) for the preview.
+    levels: (f32, f32),
+    /// Scenario to reopen while its camera is unplugged, and the last try.
+    reconnect: Option<(Scenario, Instant)>,
 }
 
 /// USB3 Vision (if one is connected), every UVC camera, and the simulator.
@@ -89,6 +95,9 @@ impl App {
             lut_dir,
             lut: None,
             devices: find_devices(),
+            wb_gains: [1.0; 3],
+            levels: (0.0, 1.0),
+            reconnect: None,
         };
         let first = app.scenarios[0].clone();
         app.apply(&first);
@@ -100,6 +109,39 @@ impl App {
             Ok(()) => format!("Szcenárió aktív: {}", s.name),
             Err(e) => format!("Hiba: {e}"),
         };
+    }
+
+    /// Notice an unplugged camera: end a running recording (it keeps every
+    /// frame received so far) and retry opening the camera once a second.
+    fn watch_camera(&mut self) {
+        if self.engine.camera_lost() && self.reconnect.is_none() {
+            let Some(s) = self.engine.scenario.clone() else { return };
+            self.message = "A kamera levált. Újracsatlakozás…".into();
+            if self.recording.is_some() {
+                self.engine.stop_recording();
+                if let Some((info, _)) = self.recording.take() {
+                    self.message = format!(
+                        "A kamera levált, a felvétel leállt: {} – {} képkocka. Újracsatlakozás…",
+                        info.video,
+                        info.stats.queued.load(Relaxed)
+                    );
+                }
+                self.rec_name.clear();
+            }
+            self.reconnect = Some((s, Instant::now()));
+        }
+        if let Some((s, last)) = &self.reconnect
+            && last.elapsed() >= Duration::from_secs(1)
+        {
+            let s = s.clone();
+            match self.engine.reconnect(&s) {
+                Ok(()) => {
+                    self.reconnect = None;
+                    self.message = format!("A kamera újra csatlakozott. Szcenárió aktív: {}", s.name);
+                }
+                Err(_) => self.reconnect = Some((s, Instant::now())),
+            }
+        }
     }
 
     fn reload(&mut self) {
@@ -133,14 +175,55 @@ impl App {
     fn update_preview(&mut self, ctx: &egui::Context) {
         self.sync_lut();
         if let Some(frame) = self.engine.take_preview() {
-            let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref());
+            let view = self.engine.scenario.as_ref().map(|s| s.view.clone()).unwrap_or_default();
+            let wb = view.auto_white_balance.then_some(self.wb_gains);
+            let levels = view.auto_levels.then_some(self.levels);
+            let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref(), wb, &tone_table(&view, levels));
             self.engine.recycle(frame);
-            let Some(img) = img else { return };
+            let Some((img, means, hist)) = img else { return };
+            // Auto-levels: 0.5 % and 99.5 % of the brightness histogram.
+            let total: u32 = hist.iter().sum();
+            let pct = |p: f32| {
+                let mut acc = 0;
+                hist.iter().position(|&h| { acc += h; acc as f32 >= p * total as f32 }).unwrap_or(255) as f32 / 255.0
+            };
+            if total > 0 {
+                let (lo, hi) = (pct(0.005), pct(0.995));
+                let hi = hi.max(lo + 0.05);
+                self.levels = (0.8 * self.levels.0 + 0.2 * lo, 0.8 * self.levels.1 + 0.2 * hi);
+            }
+            // Grey world: scale R and B so their means match G; smoothed
+            // over frames so the preview does not flicker.
+            if let Some([r, g, b]) = means {
+                let target = [g / r.max(1e-3), 1.0, g / b.max(1e-3)].map(|x| x.clamp(0.25, 4.0) as f32);
+                for c in 0..3 {
+                    self.wb_gains[c] = 0.8 * self.wb_gains[c] + 0.2 * target[c];
+                }
+            }
             match &mut self.texture {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
             }
         }
+    }
+
+    /// White balance, brightness and contrast of the active scenario's
+    /// preview. Saved with the scenario on the settings page.
+    fn view_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = self.engine.scenario.as_mut() else { return };
+        let v = &mut s.view;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut v.auto_white_balance, "Automatikus fehéregyensúly");
+            ui.checkbox(&mut v.auto_levels, "Automatikus fényerő");
+            ui.label("Fényerő");
+            ui.add(egui::Slider::new(&mut v.brightness, -0.5..=0.5).fixed_decimals(2));
+            ui.label("Kontraszt");
+            ui.add(egui::Slider::new(&mut v.contrast, 0.25..=4.0).logarithmic(true).fixed_decimals(2));
+            if ui.button("Alaphelyzet").clicked() {
+                *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, ..View::default() };
+            }
+        });
+        ui.label("Csak az élőképre hat, a felvétel nyers marad.");
     }
 
     fn preview(&self, ui: &mut egui::Ui) {
@@ -213,6 +296,7 @@ impl App {
 
         self.status_line(ui);
         ui.separator();
+        self.view_controls(ui);
         self.preview(ui);
     }
 
@@ -315,16 +399,31 @@ impl App {
                 });
                 ui.end_row();
 
+                ui.label("Kép tükrözése (kamerán)");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut e.camera.reverse_x, "vízszintesen");
+                    ui.checkbox(&mut e.camera.reverse_y, "függőlegesen");
+                })
+                .response
+                .on_hover_text("Mindkettő: 180°-os forgatás. A felvételre is hat.");
+                ui.end_row();
+
                 ui.label("Képfrekvencia [fps]");
                 ui.add(egui::DragValue::new(&mut e.camera.frame_rate).range(0.1..=1000.0).speed(0.5));
                 ui.end_row();
 
+                ui.label("Automatikus expozíció");
+                ui.checkbox(&mut e.camera.auto_exposure, "a kamera állítja az expozíciót és az erősítést")
+                    .on_hover_text("A felvételre is hat: a nyers jel fényessége menet közben változhat.");
+                ui.end_row();
+
+                let manual = !e.camera.auto_exposure;
                 ui.label("Expozíció [µs]");
-                ui.add(egui::DragValue::new(&mut e.camera.exposure_us).range(1.0..=10_000_000.0).speed(10.0));
+                ui.add_enabled(manual, egui::DragValue::new(&mut e.camera.exposure_us).range(1.0..=10_000_000.0).speed(10.0));
                 ui.end_row();
 
                 ui.label("Erősítés [dB]");
-                ui.add(egui::DragValue::new(&mut e.camera.gain_db).range(0.0..=48.0).speed(0.1));
+                ui.add_enabled(manual, egui::DragValue::new(&mut e.camera.gain_db).range(0.0..=48.0).speed(0.1));
                 ui.end_row();
 
                 ui.label("Kódoló");
@@ -404,6 +503,7 @@ impl App {
 
         self.status_line(ui);
         ui.separator();
+        self.view_controls(ui);
         self.preview(ui);
     }
 
@@ -467,6 +567,10 @@ impl App {
         } else {
             s.camera.extra.clear();
         }
+        // The preview look is adjusted live on the active scenario.
+        if let Some(active) = self.engine.scenario.as_ref().filter(|a| a.name == s.name) {
+            s.view = active.view.clone();
+        }
         if s.name.trim().is_empty() {
             self.message = "A névnek nem szabad üresnek lennie.".into();
             return None;
@@ -478,6 +582,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.watch_camera();
         self.update_preview(&ctx);
         self.poll_test();
         egui::Panel::top("tabs").show(ui, |ui| {
@@ -547,10 +652,32 @@ fn extra_to_json(s: &Scenario) -> String {
     }
 }
 
-/// Downscaled 8-bit RGB preview, with the LUT applied if given. Bayer RGGB
-/// is shown by taking each 2×2 cell as one pixel (no interpolation); MJPEG is
-/// decoded first. `None` if the frame cannot be decoded.
-fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> Option<egui::ColorImage> {
+/// Auto-levels (black and white point, if given), then brightness/contrast,
+/// as an 8-bit table.
+fn tone_table(v: &View, levels: Option<(f32, f32)>) -> [u8; 256] {
+    std::array::from_fn(|i| {
+        let mut x = i as f32 / 255.0;
+        if let Some((lo, hi)) = levels {
+            x = (x - lo) / (hi - lo);
+        }
+        let x = (x - 0.5) * v.contrast + 0.5 + v.brightness;
+        (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+    })
+}
+
+/// Downscaled 8-bit RGB preview: white balance gains (colour sources only),
+/// then the LUT, then the tone table. Bayer RGGB is shown by taking each 2×2
+/// cell as one pixel (no interpolation); MJPEG is decoded first. Also returns
+/// the mean R, G, B before white balance (unsaturated pixels, colour only)
+/// for the auto white balance, and a brightness histogram before the tone
+/// table for the auto-levels. `None` if the frame cannot be decoded.
+fn to_color_image(
+    f: &Frame,
+    max_width: usize,
+    lut: Option<&PreviewLut>,
+    wb: Option<[f32; 3]>,
+    tone: &[u8; 256],
+) -> Option<(egui::ColorImage, Option<[f64; 3]>, [u32; 256])> {
     let (w, h) = (f.width as usize, f.height as usize);
     let decoded;
     let (data, format, w, h) = if f.format == PixelFormat::Mjpeg {
@@ -595,6 +722,8 @@ fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> Opti
     };
 
     let mut rgb = Vec::with_capacity(ow * oh * 3);
+    let (mut sum, mut n) = ([0u64; 3], 0u64);
+    let mut hist = [0u32; 256];
     for oy in 0..oh {
         let y = oy * step;
         for ox in 0..ow {
@@ -623,18 +752,28 @@ fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> Opti
                 Some(_) => {
                     // Mono: fast LUT path through the grey table.
                     let v = mono(x, y);
-                    rgb.extend_from_slice(&lut.map_or([v, v, v], |l| l.gray[v as usize]));
+                    let px = lut.map_or([v, v, v], |l| l.gray[v as usize]);
+                    hist[px[1] as usize] += 1;
+                    rgb.extend(px.map(|c| tone[c as usize]));
                     continue;
                 }
             };
-            match lut {
-                Some(l) => {
-                    let out = l.lut.apply(px.map(|c| c as f32 / 255.0));
-                    rgb.extend(out.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
-                }
-                None => rgb.extend_from_slice(&px),
+            if px.iter().all(|&c| c < 250) {
+                (0..3).for_each(|c| sum[c] += px[c] as u64);
+                n += 1;
             }
+            let px = match wb {
+                Some(g) => std::array::from_fn(|c| (px[c] as f32 * g[c]).min(255.0) as u8),
+                None => px,
+            };
+            let px = match lut {
+                Some(l) => l.lut.apply(px.map(|c| c as f32 / 255.0)).map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8),
+                None => px,
+            };
+            hist[((px[0] as u32 + 2 * px[1] as u32 + px[2] as u32) / 4) as usize] += 1;
+            rgb.extend(px.map(|c| tone[c as usize]));
         }
     }
-    Some(egui::ColorImage::from_rgb([ow, oh], &rgb))
+    let means = (n > 0).then(|| sum.map(|c| c as f64 / n as f64));
+    Some((egui::ColorImage::from_rgb([ow, oh], &rgb), means, hist))
 }

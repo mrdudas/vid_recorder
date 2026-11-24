@@ -69,6 +69,19 @@ impl Engine {
         self.camera.as_ref().map_or(0, |(_, c)| c.errors())
     }
 
+    /// The camera was unplugged (see [`Engine::reconnect`]).
+    pub fn camera_lost(&self) -> bool {
+        self.camera.as_ref().is_some_and(|(_, c)| c.disconnected())
+    }
+
+    /// Close the camera and open it again with the scenario's settings, e.g.
+    /// after it was unplugged and plugged back in.
+    pub fn reconnect(&mut self, s: &Scenario) -> Result<(), String> {
+        self.scenario = None;
+        self.camera = None;
+        self.apply(s)
+    }
+
     pub fn stats(&self) -> &Stats {
         &self.shared.stats
     }

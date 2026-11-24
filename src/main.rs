@@ -49,6 +49,10 @@ fn main() -> ExitCode {
             }
             Ok(true)
         }
+        Some("camera-xml") => u3v::genicam_xml().map(|x| {
+            println!("{x}");
+            true
+        }),
         Some("camera-test") => camera_test(&args[1..]),
         Some("--version") => {
             println!("{}", env!("CARGO_PKG_VERSION"));

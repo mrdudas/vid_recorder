@@ -2,8 +2,10 @@
 # - gives the logged-in user access (libusb, no root needed)
 # - raises the usbfs buffer limit (default 16 MB) so streaming does not drop frames
 #
+# The number must stay below 73: systemd applies TAG+="uaccess" in 73-seat-late.rules.
+#
 # Install:
-#   sudo cp linux/99-vid-recorder.rules /etc/udev/rules.d/
+#   sudo cp linux/70-vid-recorder.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   then re-plug the camera.
 

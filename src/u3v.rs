@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::thread::JoinHandle;
 
 use cameleon::Camera as CCamera;
+use cameleon::StreamError;
 use cameleon::genapi::{DefaultGenApiCtxt, ParamsCtxt};
 use cameleon::payload::PixelFormat as UPixelFormat;
 use cameleon::u3v::{self, ControlHandle, StreamHandle};
@@ -26,6 +27,8 @@ pub struct U3vCamera {
     thread: Option<JoinHandle<()>>,
     /// Payloads that arrived broken or in an unsupported format.
     stream_errors: Arc<AtomicU64>,
+    /// Set by the stream thread when the camera is unplugged.
+    lost: Arc<AtomicBool>,
 }
 
 /// "vendor model (serial)" for every connected USB3 Vision camera.
@@ -34,10 +37,20 @@ pub fn list() -> Result<Vec<String>, String> {
     Ok(cams.iter().map(|c| describe(c.info())).collect())
 }
 
+/// GenICam XML of the first camera: every feature name for `extra`.
+pub fn genicam_xml() -> Result<String, String> {
+    use cameleon::DeviceControl;
+    let mut cam = u3v::enumerate_cameras().map_err(|e| e.to_string())?.into_iter().next().ok_or("no USB3 Vision camera found")?;
+    cam.open().map_err(|e| format!("open: {e}"))?;
+    let xml = cam.ctrl.genapi().map_err(|e| format!("GenICam XML: {e}"));
+    let _ = cam.close();
+    xml
+}
+
 /// Linux limits USB transfer buffers to 16 MB by default, too little for
 /// streaming without loss. Raise it to `USBFS_MB` (0 means unlimited):
 /// directly if we may write sysfs, else through `pkexec` (asks for the
-/// admin password). `linux/99-vid-recorder.rules` does the same at plug-in.
+/// admin password). `linux/70-vid-recorder.rules` does the same at plug-in.
 #[cfg(target_os = "linux")]
 fn ensure_usbfs_limit() {
     const PATH: &str = "/sys/module/usbcore/parameters/usbfs_memory_mb";
@@ -54,7 +67,7 @@ fn ensure_usbfs_limit() {
     }
     match read() {
         Some(now) if now == 0 || now >= USBFS_MB => eprintln!("usbfs_memory_mb raised from {mb} to {now}"),
-        _ => eprintln!("warning: usbfs_memory_mb is {mb}, frames may be lost; install linux/99-vid-recorder.rules"),
+        _ => eprintln!("warning: usbfs_memory_mb is {mb}, frames may be lost; install linux/70-vid-recorder.rules"),
     }
 }
 
@@ -75,13 +88,25 @@ impl U3vCamera {
         ensure_usbfs_limit();
         let mut cam = cams.swap_remove(0);
         cam.open().map_err(|e| format!("open: {e}"))?;
+        // Slow writes (e.g. PixelFormat) answer "pending" more than the
+        // default 3 times.
+        cam.ctrl.set_retry_count(100);
         cam.load_context().map_err(|e| format!("GenICam XML: {e}"))?;
+        // A previous process that exited while streaming leaves acquisition
+        // running and the parameters locked (writes fail with WriteProtect).
+        if let Ok(mut p) = cam.params_ctxt() {
+            if let Some(c) = p.node("AcquisitionStop").and_then(|n| n.as_command(&p)) {
+                let _ = c.execute(&mut p);
+            }
+            let _ = set_int(&mut p, "TLParamsLocked", 0);
+        }
         Ok(U3vCamera {
             name: describe(cam.info()),
             cam,
             running: Arc::new(AtomicBool::new(false)),
             thread: None,
             stream_errors: Arc::new(AtomicU64::new(0)),
+            lost: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -93,7 +118,12 @@ impl Camera for U3vCamera {
 
     fn apply(&mut self, s: &CameraSettings) -> Result<(), String> {
         let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
+        // Chunk data may be left on (e.g. by Vimba); we don't use it, and
+        // cameleon fails to parse the Alvium's chunk payloads.
+        let _ = set_bool(&mut p, "ChunkModeActive", false);
         set_enum(&mut p, "PixelFormat", s.pixel_format.name())?;
+        set_bool(&mut p, "ReverseX", s.reverse_x)?;
+        set_bool(&mut p, "ReverseY", s.reverse_y)?;
         // Offsets first to 0 so any width/height fits, then the real offsets.
         set_int(&mut p, "OffsetX", 0)?;
         set_int(&mut p, "OffsetY", 0)?;
@@ -101,13 +131,45 @@ impl Camera for U3vCamera {
         set_int(&mut p, "Height", s.height as i64)?;
         set_int(&mut p, "OffsetX", s.offset_x as i64)?;
         set_int(&mut p, "OffsetY", s.offset_y as i64)?;
-        // Manual exposure/gain; the auto features may not exist on every model.
-        let _ = set_enum(&mut p, "ExposureAuto", "Off");
-        let _ = set_enum(&mut p, "GainAuto", "Off");
-        set_float(&mut p, "ExposureTime", s.exposure_us)?;
-        set_float(&mut p, "Gain", s.gain_db)?;
+        // The camera accepts any frame rate but silently drops frames that
+        // do not fit through its USB link: refuse those settings. Measured
+        // (Alvium 1800 U-291c, 2026-11): 373 MB/s ran clean, 415 MB/s lost
+        // frames although the reported limit is 450 MB/s, hence the margin.
+        let limit = p.node("DeviceLinkThroughputLimit").and_then(|n| n.as_integer(&p)).and_then(|n| n.value(&mut p).ok());
+        if let Some(limit) = limit {
+            let wire_bits = if s.pixel_format.is_packed() { s.pixel_format.bits() as f64 } else { 8.0 * s.pixel_format.bytes_per_pixel() as f64 };
+            let frame_bytes = s.width as f64 * s.height as f64 * wire_bits / 8.0;
+            let usable = limit as f64 * 0.85;
+            let max_fps = usable / frame_bytes;
+            if s.frame_rate > max_fps {
+                return Err(format!(
+                    "{:.0} fps needs {:.0} MB/s, the USB link reliably carries {:.0} MB/s: at most {:.1} fps with {}x{} {}",
+                    s.frame_rate,
+                    s.frame_rate * frame_bytes / 1e6,
+                    usable / 1e6,
+                    max_fps,
+                    s.width,
+                    s.height,
+                    s.pixel_format.name()
+                ));
+            }
+        }
         let _ = set_bool(&mut p, "AcquisitionFrameRateEnable", true);
         set_float(&mut p, "AcquisitionFrameRate", s.frame_rate)?;
+        if s.auto_exposure {
+            // Keep the exposure within one frame so the frame rate holds.
+            if let Err(e) = set_float(&mut p, "ExposureAutoMax", (1e6 / s.frame_rate * 0.95).max(100.0)) {
+                eprintln!("warning: {e}");
+            }
+            set_enum(&mut p, "ExposureAuto", "Continuous")?;
+            let _ = set_enum(&mut p, "GainAuto", "Continuous");
+        } else {
+            // Manual exposure/gain; the auto features may not exist on every model.
+            let _ = set_enum(&mut p, "ExposureAuto", "Off");
+            let _ = set_enum(&mut p, "GainAuto", "Off");
+            set_float(&mut p, "ExposureTime", s.exposure_us)?;
+            set_float(&mut p, "Gain", s.gain_db)?;
+        }
         for (name, value) in &s.extra {
             set_json(&mut p, name, value)?;
         }
@@ -120,6 +182,7 @@ impl Camera for U3vCamera {
         self.running.store(true, Relaxed);
         let running = self.running.clone();
         let errors = self.stream_errors.clone();
+        let lost = self.lost.clone();
         let thread = std::thread::Builder::new()
             .name("u3v-camera".into())
             .spawn(move || {
@@ -128,6 +191,11 @@ impl Camera for U3vCamera {
                     let payload = match rx.recv_blocking() {
                         Ok(p) => p,
                         Err(_) if !running.load(Relaxed) => break,
+                        Err(StreamError::Disconnected | StreamError::Io(_)) => {
+                            eprintln!("stream: camera disconnected");
+                            lost.store(true, Relaxed);
+                            break;
+                        }
                         Err(e) => {
                             errors.fetch_add(1, Relaxed);
                             eprintln!("stream: {e}");
@@ -174,8 +242,19 @@ impl Camera for U3vCamera {
         self.stream_errors.load(Relaxed)
     }
 
+    fn disconnected(&self) -> bool {
+        self.lost.load(Relaxed)
+    }
+
     fn stop(&mut self) {
         if !self.running.swap(false, Relaxed) {
+            return;
+        }
+        if self.disconnected() {
+            // Nothing to tell a device that is gone; just end the thread.
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
             return;
         }
         if let Err(e) = self.cam.stop_streaming() {
