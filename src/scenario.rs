@@ -8,9 +8,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::PixelFormat;
 
+/// Which camera a scenario uses.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Device {
+    /// First USB3 Vision camera (Allied Vision etc.).
+    #[default]
+    U3v,
+    /// UVC camera (webcam, panel camera) by its system name.
+    Uvc { name: String },
+    /// Generated test pattern.
+    Sim,
+}
+
+impl Device {
+    pub fn label(&self) -> String {
+        match self {
+            Device::U3v => "USB3 Vision (első kamera)".into(),
+            Device::Uvc { name } => format!("UVC: {name}"),
+            Device::Sim => "Szimulált kamera".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Scenario {
     pub name: String,
+    #[serde(default)]
+    pub device: Device,
     pub camera: CameraSettings,
     pub recording: RecordingSettings,
     /// `.cube` file in the S-Log LUT directory, applied to the live preview
@@ -47,6 +72,7 @@ impl Default for Scenario {
     fn default() -> Self {
         Scenario {
             name: "default".into(),
+            device: Device::U3v,
             camera: CameraSettings {
                 pixel_format: PixelFormat::Mono8,
                 width: 1920,

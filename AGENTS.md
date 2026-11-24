@@ -9,6 +9,13 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - A kamerával közvetlenül a USB3 Vision / GenICam protokollon beszélünk, Rust könyvtárral (`cameleon`, libusb-n keresztül).
   - Windowson a kamerához WinUSB meghajtó kell (pl. Zadiggal telepítve).
   - A kamerakezelés egy saját interfész mögött van, így a USB3 Vision réteg cserélhető.
+- **UVC kamerák is használhatók** (webkamera, UVC-kompatibilis panelkamera) a `nokhwa` könyvtárral: Macen AVFoundation, Windowson Media Foundation, Linuxon V4L2.
+  - Formátumok: MJPEG, YUYV, NV12, szürke (Mono8).
+  - **Az MJPEG változatlanul kerül a fájlba**, nincs kicsomagolás és újrakódolás. A YUYV és az NV12 veszteségmentesen kódolódik.
+  - A kódolót mindig az első ténylegesen beérkező kép formátuma határozza meg. Ha a kamera mást ad, mint amit a szcenárió kért, a program jelzi. Pl. a Mac beépített kamerája MJPEG kérésre is YUYV-t ad.
+  - A UVC nem ad képkocka-sorszámot, ezért a program a beérkezés sorrendjében számozza a képeket. **UVC-nél a kamera oldali képkockavesztést nem lehet kimutatni.** Az időbélyeg a rendszer felvételi ideje (Unix epoch, ns), ha a rendszer megadja.
+  - Az expozíciót és az erősítést UVC-nél a program egyelőre nem állítja.
+- **Eszközválasztás:** minden szcenárió tárolja, melyik kamerát használja (`device`: `u3v`, `uvc` + név, vagy `sim`). Szcenárióváltáskor a program a kamerát is átváltja.
 - **Szenzor:** Sony, ezért **S-Log** kell. Az S-Log görbék/LUT-ok **külön könyvtárban** vannak.
 - **Platformok:** macOS, Windows és Linux. Mindhárom támogatott, egyik sem másodrangú.
 

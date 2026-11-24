@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use crate::frame::PixelFormat;
+
 pub struct Profile {
     pub id: &'static str,
     pub label: &'static str,
@@ -21,6 +23,15 @@ pub struct Profile {
 
 /// Recordings must be lossless (raw sensor data, no LUT), so "auto" only
 /// picks a lossless profile. The lossy hardware profiles stay selectable.
+/// MJPEG from UVC cameras is stored as received (no decode, no re-encode).
+pub const MJPEG_COPY: Profile = Profile {
+    id: "copy",
+    label: "MJPEG (eredeti, újrakódolás nélkül)",
+    hardware: false,
+    lossless_bits: 8,
+    args: &["-c:v", "copy"],
+};
+
 pub const PROFILES: &[Profile] = &[
     Profile {
         id: "hevc_nvenc",
@@ -117,9 +128,13 @@ pub fn available() -> &'static [&'static Profile] {
     })
 }
 
-/// Resolve "auto" or a profile id to a usable profile for frames with
-/// `bits` significant bits per pixel.
-pub fn resolve(id: &str, bits: u32) -> Result<&'static Profile, String> {
+/// Resolve "auto" or a profile id to a usable profile for `format`.
+/// MJPEG is always copied unchanged.
+pub fn resolve(id: &str, format: PixelFormat) -> Result<&'static Profile, String> {
+    if format == PixelFormat::Mjpeg {
+        return Ok(&MJPEG_COPY);
+    }
+    let bits = format.bits();
     let avail = available();
     if id == "auto" {
         return avail

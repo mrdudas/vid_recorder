@@ -28,6 +28,10 @@ pub struct RecStats {
     pub queued: AtomicU64,
     pub finished: AtomicBool,
     pub error: Mutex<Option<String>>,
+    /// Encoder actually used (chosen from the first frame's format).
+    pub encoder: Mutex<Option<&'static str>>,
+    /// Set when the camera delivers another format than the scenario asked for.
+    pub format_note: Mutex<Option<String>>,
 }
 
 pub struct Recorder {
@@ -35,7 +39,6 @@ pub struct Recorder {
     pub stats: Arc<RecStats>,
     pub video_path: PathBuf,
     pub csv_path: PathBuf,
-    pub encoder: &'static Profile,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -51,7 +54,9 @@ impl Recorder {
         fps: f64,
         pool: BufferPool,
     ) -> Result<Recorder, String> {
-        let encoder = encoder::resolve(encoder_id, format.bits())?;
+        // Fail early if nothing can encode the requested format; the encoder
+        // is chosen again from the first frame's actual format.
+        encoder::resolve(encoder_id, format)?;
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let video_path = dir.join(format!("{name}.mkv"));
         let csv_path = dir.join(format!("{name}.csv"));
@@ -70,7 +75,8 @@ impl Recorder {
             pool,
             stats: stats.clone(),
             video_path: video_path.clone(),
-            encoder,
+            encoder_id: encoder_id.to_string(),
+            requested: format,
             fps,
             ffmpeg: None,
         };
@@ -78,7 +84,7 @@ impl Recorder {
             .name("recorder".into())
             .spawn(move || w.run())
             .map_err(|e| e.to_string())?;
-        Ok(Recorder { tx: Some(tx), stats, video_path, csv_path, encoder, thread: Some(thread) })
+        Ok(Recorder { tx: Some(tx), stats, video_path, csv_path, thread: Some(thread) })
     }
 
     /// Hand a frame to the writer. Never blocks.
@@ -116,7 +122,8 @@ struct Writer {
     pool: BufferPool,
     stats: Arc<RecStats>,
     video_path: PathBuf,
-    encoder: &'static Profile,
+    encoder_id: String,
+    requested: PixelFormat,
     fps: f64,
     ffmpeg: Option<(Child, ChildStdin)>,
 }
@@ -165,13 +172,26 @@ impl Writer {
     }
 
     fn spawn_ffmpeg(&self, f: &Frame) -> Result<(Child, ChildStdin), String> {
-        let mut child = Command::new(encoder::ffmpeg_path())
-            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "rawvideo"])
-            .args(["-pix_fmt", f.format.ffmpeg_input()])
-            .args(["-video_size", &format!("{}x{}", f.width, f.height)])
+        if f.format != self.requested {
+            let note = format!("a kamera {}-t ad (kért: {})", f.format.name(), self.requested.name());
+            eprintln!("note: {note}");
+            *self.stats.format_note.lock().unwrap() = Some(note);
+        }
+        let encoder: &Profile = encoder::resolve(&self.encoder_id, f.format)?;
+        *self.stats.encoder.lock().unwrap() = Some(encoder.label);
+        let mut cmd = Command::new(encoder::ffmpeg_path());
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        if f.format == PixelFormat::Mjpeg {
+            // Concatenated JPEG frames, copied into the MKV unchanged.
+            cmd.args(["-f", "mjpeg"]);
+        } else {
+            cmd.args(["-f", "rawvideo", "-pix_fmt", f.format.ffmpeg_input()])
+                .args(["-video_size", &format!("{}x{}", f.width, f.height)]);
+        }
+        let mut child = cmd
             .args(["-framerate", &format!("{}", self.fps)])
             .args(["-i", "pipe:0"])
-            .args(self.encoder.args)
+            .args(encoder.args)
             .arg("-y")
             .arg(&self.video_path)
             .stdin(Stdio::piped())

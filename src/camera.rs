@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::frame::{BufferPool, Frame, PixelFormat};
-use crate::scenario::CameraSettings;
+use crate::scenario::{CameraSettings, Device};
 
 /// Receives every frame on the camera's acquisition thread. Must be fast.
 pub type FrameSink = Box<dyn FnMut(Frame) + Send>;
@@ -17,6 +17,19 @@ pub trait Camera: Send {
     fn apply(&mut self, s: &CameraSettings) -> Result<(), String>;
     fn start(&mut self, pool: BufferPool, sink: FrameSink) -> Result<(), String>;
     fn stop(&mut self);
+    /// Frames the camera delivered broken or in an unusable format.
+    fn errors(&self) -> u64 {
+        0
+    }
+}
+
+/// Open the camera a scenario asks for.
+pub fn open(device: &Device) -> Result<Box<dyn Camera>, String> {
+    Ok(match device {
+        Device::U3v => Box::new(crate::u3v::U3vCamera::open_first()?),
+        Device::Uvc { name } => Box::new(crate::uvc::UvcCamera::new(name)),
+        Device::Sim => Box::new(SimCamera::new()),
+    })
 }
 
 /// Generates a moving test pattern at the configured frame rate with
@@ -41,6 +54,9 @@ impl Camera for SimCamera {
     fn apply(&mut self, s: &CameraSettings) -> Result<(), String> {
         if s.width == 0 || s.height == 0 || s.frame_rate <= 0.0 {
             return Err("width, height and frame rate must be positive".into());
+        }
+        if matches!(s.pixel_format, PixelFormat::Yuyv | PixelFormat::Nv12 | PixelFormat::Mjpeg) {
+            return Err(format!("the simulated camera has no {} output", s.pixel_format.name()));
         }
         self.settings = Some(s.clone());
         Ok(())

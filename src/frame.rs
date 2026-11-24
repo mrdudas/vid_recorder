@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-/// Supported pixel formats. Names match GenICam SFNC `PixelFormat` entries.
-/// Formats above 8 bit are unpacked, little endian, 2 bytes per pixel.
+/// Supported pixel formats. Mono/Bayer names match GenICam SFNC
+/// `PixelFormat` entries (above 8 bit: unpacked, little endian, 2 bytes per
+/// pixel). YUYV, NV12 and MJPEG come from UVC cameras.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PixelFormat {
     Mono8,
@@ -13,16 +14,26 @@ pub enum PixelFormat {
     Mono16,
     BayerRG8,
     BayerRG12,
+    #[serde(rename = "YUYV")]
+    Yuyv,
+    #[serde(rename = "NV12")]
+    Nv12,
+    /// Each frame is one complete JPEG image (variable size).
+    #[serde(rename = "MJPEG")]
+    Mjpeg,
 }
 
 impl PixelFormat {
-    pub const ALL: [PixelFormat; 6] = [
+    pub const ALL: [PixelFormat; 9] = [
         PixelFormat::Mono8,
         PixelFormat::Mono10,
         PixelFormat::Mono12,
         PixelFormat::Mono16,
         PixelFormat::BayerRG8,
         PixelFormat::BayerRG12,
+        PixelFormat::Yuyv,
+        PixelFormat::Nv12,
+        PixelFormat::Mjpeg,
     ];
 
     pub fn name(self) -> &'static str {
@@ -33,12 +44,17 @@ impl PixelFormat {
             PixelFormat::Mono16 => "Mono16",
             PixelFormat::BayerRG8 => "BayerRG8",
             PixelFormat::BayerRG12 => "BayerRG12",
+            PixelFormat::Yuyv => "YUYV",
+            PixelFormat::Nv12 => "NV12",
+            PixelFormat::Mjpeg => "MJPEG",
         }
     }
 
+    /// Bytes per pixel of the first plane (1 for NV12 luma; MJPEG: 1 as an
+    /// estimate, real size varies).
     pub fn bytes_per_pixel(self) -> usize {
         match self {
-            PixelFormat::Mono8 | PixelFormat::BayerRG8 => 1,
+            PixelFormat::Mono8 | PixelFormat::BayerRG8 | PixelFormat::Nv12 | PixelFormat::Mjpeg => 1,
             _ => 2,
         }
     }
@@ -47,6 +63,7 @@ impl PixelFormat {
     pub fn bits(self) -> u32 {
         match self {
             PixelFormat::Mono8 | PixelFormat::BayerRG8 => 8,
+            PixelFormat::Yuyv | PixelFormat::Nv12 | PixelFormat::Mjpeg => 8,
             PixelFormat::Mono10 => 10,
             PixelFormat::Mono12 | PixelFormat::BayerRG12 => 12,
             PixelFormat::Mono16 => 16,
@@ -59,9 +76,13 @@ impl PixelFormat {
 
     /// ffmpeg rawvideo input format used for recording. Bayer data is
     /// recorded as a grey image (the mosaic is kept, not demosaiced) so the
-    /// raw sensor values survive for later processing.
+    /// raw sensor values survive for later processing. MJPEG is not raw
+    /// video; the recorder copies it unchanged.
     pub fn ffmpeg_input(self) -> &'static str {
         match self {
+            PixelFormat::Yuyv => "yuyv422",
+            PixelFormat::Nv12 => "nv12",
+            PixelFormat::Mjpeg => "mjpeg",
             PixelFormat::Mono8 | PixelFormat::BayerRG8 => "gray",
             PixelFormat::Mono10 => "gray10le",
             PixelFormat::Mono12 | PixelFormat::BayerRG12 => "gray12le",
@@ -82,8 +103,13 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Size of one frame in bytes (MJPEG: an upper-range estimate).
     pub fn byte_size(width: u32, height: u32, format: PixelFormat) -> usize {
-        width as usize * height as usize * format.bytes_per_pixel()
+        let px = width as usize * height as usize;
+        match format {
+            PixelFormat::Nv12 => px * 3 / 2,
+            _ => px * format.bytes_per_pixel(),
+        }
     }
 }
 

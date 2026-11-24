@@ -1,0 +1,179 @@
+//! UVC cameras (webcams, panel cameras) via `nokhwa`:
+//! AVFoundation on macOS, Media Foundation on Windows, V4L2 on Linux.
+//!
+//! UVC gives no frame counter, so frame ids are assigned here in arrival
+//! order and lost frames cannot be detected from ids. Timestamps are the
+//! backend's capture time if it reports one, else the host arrival time.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use nokhwa::Camera as NCamera;
+use nokhwa::pixel_format::RgbFormat;
+use nokhwa::utils::{
+    ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+};
+
+use crate::camera::{Camera, FrameSink};
+use crate::frame::{BufferPool, Frame, PixelFormat};
+use crate::scenario::CameraSettings;
+
+/// Names of the UVC cameras the system reports.
+pub fn list() -> Vec<String> {
+    if !ensure_permission() {
+        return Vec::new();
+    }
+    nokhwa::query(ApiBackend::Auto)
+        .map(|cams| cams.iter().map(|c| c.human_name()).collect())
+        .unwrap_or_default()
+}
+
+/// macOS asks the user for camera access once; elsewhere this is a no-op.
+fn ensure_permission() -> bool {
+    if nokhwa::nokhwa_check() {
+        return true;
+    }
+    let (tx, rx) = mpsc::channel();
+    nokhwa::nokhwa_initialize(move |granted| {
+        let _ = tx.send(granted);
+    });
+    rx.recv_timeout(Duration::from_secs(60)).unwrap_or(false)
+}
+
+fn find_index(name: &str) -> Result<CameraIndex, String> {
+    if !ensure_permission() {
+        return Err("camera access denied".into());
+    }
+    let cams = nokhwa::query(ApiBackend::Auto).map_err(|e| e.to_string())?;
+    cams.iter()
+        .find(|c| c.human_name() == name)
+        .map(|c| c.index().clone())
+        .ok_or_else(|| format!("UVC camera \"{name}\" not found"))
+}
+
+fn to_fourcc(f: PixelFormat) -> Result<FrameFormat, String> {
+    Ok(match f {
+        PixelFormat::Mjpeg => FrameFormat::MJPEG,
+        PixelFormat::Yuyv => FrameFormat::YUYV,
+        PixelFormat::Nv12 => FrameFormat::NV12,
+        PixelFormat::Mono8 => FrameFormat::GRAY,
+        other => return Err(format!("{} is not a UVC format (use MJPEG, YUYV, NV12 or Mono8)", other.name())),
+    })
+}
+
+pub struct UvcCamera {
+    name: String,
+    settings: Option<CameraSettings>,
+    running: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl UvcCamera {
+    pub fn new(name: &str) -> Self {
+        UvcCamera { name: name.into(), settings: None, running: Arc::new(AtomicBool::new(false)), thread: None }
+    }
+}
+
+impl Camera for UvcCamera {
+    fn name(&self) -> String {
+        format!("UVC: {}", self.name)
+    }
+
+    fn apply(&mut self, s: &CameraSettings) -> Result<(), String> {
+        to_fourcc(s.pixel_format)?;
+        self.settings = Some(s.clone());
+        Ok(())
+    }
+
+    fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {
+        self.stop();
+        let s = self.settings.clone().ok_or("no settings applied")?;
+        let index = find_index(&self.name)?;
+        let fourcc = to_fourcc(s.pixel_format)?;
+        self.running.store(true, Relaxed);
+        let running = self.running.clone();
+        // The camera is opened on the capture thread (backends are not Send);
+        // the open result is reported back so `start` can fail properly.
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+        let thread = std::thread::Builder::new()
+            .name("uvc-camera".into())
+            .spawn(move || {
+                let format = CameraFormat::new(Resolution::new(s.width, s.height), fourcc, s.frame_rate.round() as u32);
+                let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(format));
+                let mut cam = match NCamera::new(index, requested).and_then(|mut c| c.open_stream().map(|_| c)) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("open {fourcc} {}x{} @ {}: {e}", s.width, s.height, s.frame_rate)));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                let start = Instant::now();
+                let mut id = 0u64;
+                while running.load(Relaxed) {
+                    let buf = match cam.frame() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("uvc frame: {e}");
+                            continue;
+                        }
+                    };
+                    let res = buf.resolution();
+                    let Some(format) = from_fourcc(buf.source_frame_format()) else { continue };
+                    let bytes = buf.buffer();
+                    let mut data = pool.get(bytes.len());
+                    data.copy_from_slice(bytes);
+                    let ts = buf.capture_timestamp().unwrap_or_else(|| start.elapsed());
+                    sink(Frame {
+                        id,
+                        timestamp_ns: ts.as_nanos() as u64,
+                        width: res.width(),
+                        height: res.height(),
+                        format,
+                        data,
+                    });
+                    id += 1;
+                }
+                let _ = cam.stop_stream();
+            })
+            .map_err(|e| e.to_string())?;
+        self.thread = Some(thread);
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.stop();
+                Err(e)
+            }
+            Err(_) => {
+                self.stop();
+                Err("UVC capture thread failed".into())
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for UvcCamera {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn from_fourcc(f: FrameFormat) -> Option<PixelFormat> {
+    Some(match f {
+        FrameFormat::MJPEG => PixelFormat::Mjpeg,
+        FrameFormat::YUYV => PixelFormat::Yuyv,
+        FrameFormat::NV12 => PixelFormat::Nv12,
+        FrameFormat::GRAY => PixelFormat::Mono8,
+        _ => return None,
+    })
+}

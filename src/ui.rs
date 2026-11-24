@@ -11,7 +11,7 @@ use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
 use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
-use crate::scenario::{self, Scenario};
+use crate::scenario::{self, Device, Scenario};
 
 /// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
 struct PreviewLut {
@@ -43,6 +43,19 @@ pub struct App {
     texture: Option<egui::TextureHandle>,
     lut_dir: PathBuf,
     lut: Option<PreviewLut>,
+    /// Cameras offered on the settings page (refreshed on request).
+    devices: Vec<Device>,
+}
+
+/// USB3 Vision (if one is connected), every UVC camera, and the simulator.
+fn find_devices() -> Vec<Device> {
+    let mut v = Vec::new();
+    if crate::u3v::list().is_ok_and(|l| !l.is_empty()) {
+        v.push(Device::U3v);
+    }
+    v.extend(crate::uvc::list().into_iter().map(|name| Device::Uvc { name }));
+    v.push(Device::Sim);
+    v
 }
 
 impl App {
@@ -67,6 +80,7 @@ impl App {
             texture: None,
             lut_dir,
             lut: None,
+            devices: find_devices(),
         };
         let first = app.scenarios[0].clone();
         app.apply(&first);
@@ -113,6 +127,7 @@ impl App {
         if let Some(frame) = self.engine.take_preview() {
             let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref());
             self.engine.recycle(frame);
+            let Some(img) = img else { return };
             match &mut self.texture {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
@@ -168,7 +183,7 @@ impl App {
                     };
                     match self.engine.start_recording(&name) {
                         Ok(info) => {
-                            self.message = format!("Felvétel: {} ({})", info.video, info.encoder);
+                            self.message = format!("Felvétel: {}", info.video);
                             self.recording = Some((info, Instant::now()));
                         }
                         Err(e) => self.message = format!("Hiba: {e}"),
@@ -196,10 +211,11 @@ impl App {
     fn status_line(&mut self, ui: &mut egui::Ui) {
         let st = self.engine.stats();
         let mut line = format!(
-            "{} · fogadott: {} · kameránál elveszett: {}",
+            "{} · fogadott: {} · kameránál elveszett: {} · hibás kép: {}",
             self.engine.camera_name(),
             st.received.load(Relaxed),
-            st.lost_at_camera.load(Relaxed)
+            st.lost_at_camera.load(Relaxed),
+            self.engine.camera_errors()
         );
         if let Some((info, started)) = &self.recording {
             line += &format!(
@@ -209,6 +225,12 @@ impl App {
                 info.stats.queued.load(Relaxed) - info.stats.written.load(Relaxed),
                 info.stats.dropped.load(Relaxed)
             );
+            if let Some(enc) = *info.stats.encoder.lock().unwrap() {
+                line += &format!(" · {enc}");
+            }
+            if let Some(n) = info.stats.format_note.lock().unwrap().as_ref() {
+                line += &format!(" · {n}");
+            }
             if let Some(e) = info.stats.error.lock().unwrap().as_ref() {
                 line += &format!(" · HIBA: {e}");
             }
@@ -248,6 +270,19 @@ impl App {
                 let e = &mut self.edit;
                 ui.label("Név");
                 ui.text_edit_singleline(&mut e.name);
+                ui.end_row();
+
+                ui.label("Kamera");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("device").selected_text(e.device.label()).show_ui(ui, |ui| {
+                        for d in &self.devices {
+                            ui.selectable_value(&mut e.device, d.clone(), d.label());
+                        }
+                    });
+                    if ui.button("⟳").on_hover_text("Kameralista frissítése").clicked() {
+                        self.devices = find_devices();
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Pixelformátum");
@@ -399,48 +434,89 @@ fn extra_to_json(s: &Scenario) -> String {
 }
 
 /// Downscaled 8-bit RGB preview, with the LUT applied if given. Bayer RGGB
-/// is shown by taking each 2×2 cell as one pixel (no interpolation).
-fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> egui::ColorImage {
+/// is shown by taking each 2×2 cell as one pixel (no interpolation); MJPEG is
+/// decoded first. `None` if the frame cannot be decoded.
+fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> Option<egui::ColorImage> {
     let (w, h) = (f.width as usize, f.height as usize);
+    let decoded;
+    let (data, format, w, h) = if f.format == PixelFormat::Mjpeg {
+        let options = zune_jpeg::zune_core::options::DecoderOptions::default()
+            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGB);
+        let mut dec =
+            zune_jpeg::JpegDecoder::new_with_options(zune_jpeg::zune_core::bytestream::ZCursor::new(&f.data[..]), options);
+        decoded = dec.decode().ok()?;
+        let info = dec.info()?;
+        (&decoded[..], None, info.width as usize, info.height as usize)
+    } else {
+        (&f.data[..], Some(f.format), w, h)
+    };
+
     let mut step = w.div_ceil(max_width).max(1);
-    if f.format.is_bayer() {
+    if format.is_some_and(|f| f.is_bayer() || f == PixelFormat::Yuyv || f == PixelFormat::Nv12) {
         step = step.next_multiple_of(2);
     }
     let (ow, oh) = (w / step, h / step);
-    let bpp = f.format.bytes_per_pixel();
-    let shift = f.format.bits().saturating_sub(8);
-    let sample = |x: usize, y: usize| -> u8 {
+    let need = match format {
+        None => w * h * 3,
+        Some(fmt) => Frame::byte_size(w as u32, h as u32, fmt),
+    };
+    if data.len() < need || ow == 0 || oh == 0 {
+        return None;
+    }
+    let bpp = format.map_or(3, |f| f.bytes_per_pixel());
+    let shift = format.map_or(0, |f| f.bits().saturating_sub(8));
+    let mono = |x: usize, y: usize| -> u8 {
         let i = (y * w + x) * bpp;
         if bpp == 1 {
-            f.data[i]
+            data[i]
         } else {
-            (u16::from_le_bytes([f.data[i], f.data[i + 1]]) >> shift).min(255) as u8
+            (u16::from_le_bytes([data[i], data[i + 1]]) >> shift).min(255) as u8
         }
     };
+    // BT.601 limited range, as used by UVC cameras.
+    let yuv = |y: u8, u: u8, v: u8| -> [u8; 3] {
+        let (c, d, e) = (y as f32 - 16.0, u as f32 - 128.0, v as f32 - 128.0);
+        let clamp = |x: f32| x.clamp(0.0, 255.0) as u8;
+        [clamp(1.164 * c + 1.596 * e), clamp(1.164 * c - 0.392 * d - 0.813 * e), clamp(1.164 * c + 2.017 * d)]
+    };
+
     let mut rgb = Vec::with_capacity(ow * oh * 3);
     for oy in 0..oh {
         let y = oy * step;
         for ox in 0..ow {
             let x = ox * step;
-            if f.format.is_bayer() {
-                let r = sample(x, y);
-                let g = ((sample(x + 1, y) as u16 + sample(x, y + 1) as u16) / 2) as u8;
-                let b = sample(x + 1, y + 1);
-                match lut {
-                    Some(l) => {
-                        let out = l.lut.apply([r, g, b].map(|c| c as f32 / 255.0));
-                        rgb.extend(out.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
-                    }
-                    None => rgb.extend_from_slice(&[r, g, b]),
+            let px: [u8; 3] = match format {
+                None => {
+                    let i = (y * w + x) * 3;
+                    [data[i], data[i + 1], data[i + 2]]
                 }
-            } else {
-                let v = sample(x, y);
-                match lut {
-                    Some(l) => rgb.extend_from_slice(&l.gray[v as usize]),
-                    None => rgb.extend_from_slice(&[v, v, v]),
+                Some(PixelFormat::Yuyv) => {
+                    let i = (y * w + x) * 2;
+                    yuv(data[i], data[i + 1], data[i + 3])
                 }
+                Some(PixelFormat::Nv12) => {
+                    let uv = w * h + (y / 2) * w + x;
+                    yuv(data[y * w + x], data[uv], data[uv + 1])
+                }
+                Some(f) if f.is_bayer() => {
+                    let g = ((mono(x + 1, y) as u16 + mono(x, y + 1) as u16) / 2) as u8;
+                    [mono(x, y), g, mono(x + 1, y + 1)]
+                }
+                Some(_) => {
+                    // Mono: fast LUT path through the grey table.
+                    let v = mono(x, y);
+                    rgb.extend_from_slice(&lut.map_or([v, v, v], |l| l.gray[v as usize]));
+                    continue;
+                }
+            };
+            match lut {
+                Some(l) => {
+                    let out = l.lut.apply(px.map(|c| c as f32 / 255.0));
+                    rgb.extend(out.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
+                }
+                None => rgb.extend_from_slice(&px),
             }
         }
     }
-    egui::ColorImage::from_rgb([ow, oh], &rgb)
+    Some(egui::ColorImage::from_rgb([ow, oh], &rgb))
 }

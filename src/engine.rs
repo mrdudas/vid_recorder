@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::camera::Camera;
+use crate::camera::{self, Camera};
 use crate::frame::{BufferPool, Frame};
 use crate::recorder::{RecStats, Recorder};
-use crate::scenario::Scenario;
+use crate::scenario::{Device, Scenario};
 
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(40);
 
@@ -32,7 +32,8 @@ struct Shared {
 }
 
 pub struct Engine {
-    camera: Box<dyn Camera>,
+    /// Open camera and the device it was opened for.
+    camera: Option<(Device, Box<dyn Camera>)>,
     shared: Arc<Shared>,
     pub scenario: Option<Scenario>,
     /// Recordings stopped but still being finalized.
@@ -43,13 +44,12 @@ pub struct RecordingInfo {
     pub stats: Arc<RecStats>,
     pub video: String,
     pub csv: String,
-    pub encoder: &'static str,
 }
 
 impl Engine {
-    pub fn new(camera: Box<dyn Camera>) -> Self {
+    pub fn new() -> Self {
         Engine {
-            camera,
+            camera: None,
             shared: Arc::new(Shared {
                 pool: BufferPool::default(),
                 stats: Stats::default(),
@@ -62,21 +62,33 @@ impl Engine {
     }
 
     pub fn camera_name(&self) -> String {
-        self.camera.name()
+        self.camera.as_ref().map_or("nincs kamera".into(), |(_, c)| c.name())
+    }
+
+    pub fn camera_errors(&self) -> u64 {
+        self.camera.as_ref().map_or(0, |(_, c)| c.errors())
     }
 
     pub fn stats(&self) -> &Stats {
         &self.shared.stats
     }
 
-    /// Switch the camera to a scenario (stop, apply, restart).
+    /// Switch to a scenario: open its camera if it is a different device,
+    /// then stop, apply the settings and restart.
     pub fn apply(&mut self, s: &Scenario) -> Result<(), String> {
         if self.is_recording() {
             return Err("cannot change scenario while recording".into());
         }
-        self.camera.stop();
         self.scenario = None;
-        self.camera.apply(&s.camera)?;
+        if let Some((_, cam)) = self.camera.as_mut() {
+            cam.stop();
+        }
+        if self.camera.as_ref().is_none_or(|(d, _)| *d != s.device) {
+            self.camera = None; // close the old device first
+            self.camera = Some((s.device.clone(), camera::open(&s.device)?));
+        }
+        let cam = &mut self.camera.as_mut().unwrap().1;
+        cam.apply(&s.camera)?;
         let shared = self.shared.clone();
         shared.stats.received.store(0, Relaxed);
         shared.stats.lost_at_camera.store(0, Relaxed);
@@ -103,7 +115,7 @@ impl Engine {
                 None => shared.pool.put(frame.data),
             }
         });
-        self.camera.start(self.shared.pool.clone(), sink)?;
+        cam.start(self.shared.pool.clone(), sink)?;
         self.scenario = Some(s.clone());
         Ok(())
     }
@@ -141,7 +153,6 @@ impl Engine {
             stats: rec.stats.clone(),
             video: rec.video_path.display().to_string(),
             csv: rec.csv_path.display().to_string(),
-            encoder: rec.encoder.label,
         };
         *self.shared.recorder.lock().unwrap() = Some(rec);
         Ok(info)
@@ -173,7 +184,9 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.camera.stop();
+        if let Some((_, cam)) = self.camera.as_mut() {
+            cam.stop();
+        }
         self.finish_recording();
     }
 }

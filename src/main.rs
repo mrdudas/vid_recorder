@@ -5,21 +5,26 @@ mod frame;
 mod lut;
 mod recorder;
 mod scenario;
+mod u3v;
 mod ui;
+mod uvc;
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use camera::SimCamera;
 use engine::Engine;
 use frame::PixelFormat;
 use scenario::Scenario;
 
 const USAGE: &str = "\
 usage:
-  vid_recorder                 start the GUI (simulated camera for now)
+  vid_recorder                 start the GUI
+  vid_recorder cameras         list connected USB3 Vision and UVC cameras
+  vid_recorder camera-test <scenario> [seconds=10]
+                               record with a saved scenario (its camera)
+                               and verify that no frame was lost
   vid_recorder encoders        list encoders that work on this machine
   vid_recorder luts            list and check the preview LUTs in slog/
   vid_recorder record-test [seconds=10] [fps=100] [WxH=1920x1200] [format=Mono8] [encoder=auto]
@@ -30,6 +35,18 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         None => gui(),
+        Some("cameras") => {
+            match u3v::list() {
+                Ok(c) if c.is_empty() => println!("USB3 Vision: none"),
+                Ok(c) => c.iter().for_each(|c| println!("USB3 Vision: {c}")),
+                Err(e) => println!("USB3 Vision: {e}"),
+            }
+            for c in uvc::list() {
+                println!("UVC: {c}");
+            }
+            Ok(true)
+        }
+        Some("camera-test") => camera_test(&args[1..]),
         Some("encoders") => {
             list_encoders();
             Ok(true)
@@ -56,7 +73,6 @@ fn scenario_dir() -> PathBuf {
 }
 
 fn gui() -> Result<bool, String> {
-    let engine = Engine::new(Box::new(SimCamera::new()));
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 850.0]),
         ..Default::default()
@@ -64,7 +80,7 @@ fn gui() -> Result<bool, String> {
     eframe::run_native(
         "vid_recorder",
         options,
-        Box::new(|_cc| Ok(Box::new(ui::App::new(engine, scenario_dir(), PathBuf::from("slog"))))),
+        Box::new(|_cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog"))))),
     )
     .map_err(|e| e.to_string())?;
     Ok(true)
@@ -95,10 +111,10 @@ fn list_encoders() {
         let kind = if p.hardware { "hw" } else { "sw" };
         println!("  [{}] {:<18} {kind}  {}", if ok { "x" } else { " " }, p.id, p.label);
     }
-    for bits in [8, 12] {
-        match encoder::resolve("auto", bits) {
-            Ok(p) => println!("auto, {bits} bit -> {}", p.id),
-            Err(e) => println!("auto, {bits} bit -> {e}"),
+    for f in [PixelFormat::Mono8, PixelFormat::Mono12, PixelFormat::Yuyv, PixelFormat::Mjpeg] {
+        match encoder::resolve("auto", f) {
+            Ok(p) => println!("auto, {} -> {}", f.name(), p.id),
+            Err(e) => println!("auto, {} -> {e}", f.name()),
         }
     }
 }
@@ -123,16 +139,38 @@ fn record_test(args: &[String]) -> Result<bool, String> {
     s.camera.pixel_format = format;
     s.recording.encoder = arg(4, "auto");
 
-    let mut engine = Engine::new(Box::new(SimCamera::new()));
-    engine.apply(&s)?;
+    s.device = scenario::Device::Sim;
+    run_and_verify(Engine::new(), &s, seconds)
+}
+
+fn camera_test(args: &[String]) -> Result<bool, String> {
+    let name = args.first().ok_or("usage: camera-test <scenario> [seconds]")?;
+    let seconds: f64 = args.get(1).map_or(Ok(10.0), |s| s.parse()).map_err(|e| format!("seconds: {e}"))?;
+    let s = scenario::load_all(&scenario_dir())
+        .into_iter()
+        .find(|s| &s.name == name)
+        .ok_or_else(|| format!("scenario {name} not found in {}", scenario_dir().display()))?;
+    run_and_verify(Engine::new(), &s, seconds)
+}
+
+/// Start the scenario, record for `seconds`, then check that every frame
+/// reached the MKV and the CSV.
+fn run_and_verify(mut engine: Engine, s: &Scenario, seconds: f64) -> Result<bool, String> {
+    let c = &s.camera;
+    engine.apply(s)?;
+    eprintln!("camera: {}", engine.camera_name());
     let name = chrono::Local::now().format("test_%Y%m%d_%H%M%S").to_string();
     let info = engine.start_recording(&name)?;
-    eprintln!("recording {} with {} for {seconds}s ({}x{} {} @ {fps} fps)", info.video, info.encoder, w, h, format.name());
+    eprintln!(
+        "recording {} for {seconds}s ({}x{} {} @ {} fps)",
+        info.video, c.width, c.height, c.pixel_format.name(), c.frame_rate
+    );
     std::thread::sleep(Duration::from_secs_f64(seconds));
     let stop = std::time::Instant::now();
     engine.finish_recording();
     let drain = stop.elapsed().as_secs_f64();
     let lost_camera = engine.stats().lost_at_camera.load(Relaxed);
+    let camera_errors = engine.camera_errors();
     drop(engine);
 
     let st = &info.stats;
@@ -142,10 +180,15 @@ fn record_test(args: &[String]) -> Result<bool, String> {
         .unwrap_or(0);
     let video_frames = count_video_frames(&info.video);
 
+    println!("encoder             {}", st.encoder.lock().unwrap().unwrap_or("-"));
+    if let Some(n) = st.format_note.lock().unwrap().as_ref() {
+        println!("format              {n}");
+    }
     println!("frames to recorder  {}", queued + dropped);
     println!("written             {written}");
     println!("dropped (queue)     {dropped}");
     println!("lost at camera      {lost_camera}");
+    println!("camera errors       {camera_errors}");
     println!("csv rows            {csv_rows}");
     println!("finish after stop   {drain:.2} s (large = encoder slower than camera)");
     match video_frames {
@@ -157,6 +200,7 @@ fn record_test(args: &[String]) -> Result<bool, String> {
     }
     let ok = dropped == 0
         && lost_camera == 0
+        && camera_errors == 0
         && written == queued
         && csv_rows == written
         && video_frames.is_none_or(|n| n == written)
