@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/git-pull.sh",
+            "timeout": 30,
+            "statusMessage": "git pull..."
+          }
+        ]
+      }
+    ]
+  }
+}

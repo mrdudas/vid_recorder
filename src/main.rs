@@ -21,6 +21,7 @@ use scenario::Scenario;
 const USAGE: &str = "\
 usage:
   vid_recorder                 start the GUI
+  vid_recorder --version       print the version
   vid_recorder cameras         list connected USB3 Vision and UVC cameras
   vid_recorder camera-test <scenario> [seconds=10]
                                record with a saved scenario (its camera)
@@ -47,6 +48,10 @@ fn main() -> ExitCode {
             Ok(true)
         }
         Some("camera-test") => camera_test(&args[1..]),
+        Some("--version") => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            Ok(true)
+        }
         Some("encoders") => {
             list_encoders();
             Ok(true)
