@@ -34,6 +34,19 @@ pub fn list() -> Result<Vec<String>, String> {
     Ok(cams.iter().map(|c| describe(c.info())).collect())
 }
 
+/// Linux limits USB transfer buffers to 16 MB by default, too little for
+/// streaming without loss. `linux/99-vid-recorder.rules` raises it.
+fn warn_usbfs_limit() {
+    if cfg!(target_os = "linux") {
+        let path = "/sys/module/usbcore/parameters/usbfs_memory_mb";
+        if let Some(mb) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+            if mb != 0 && mb < 1000 {
+                eprintln!("warning: usbfs_memory_mb is {mb}, frames may be lost; install linux/99-vid-recorder.rules");
+            }
+        }
+    }
+}
+
 fn describe(i: &cameleon::CameraInfo) -> String {
     format!("{} {} ({})", i.vendor_name, i.model_name, i.serial_number)
 }
@@ -45,6 +58,7 @@ impl U3vCamera {
         if cams.is_empty() {
             return Err("no USB3 Vision camera found".into());
         }
+        warn_usbfs_limit();
         let mut cam = cams.swap_remove(0);
         cam.open().map_err(|e| format!("open: {e}"))?;
         cam.load_context().map_err(|e| format!("GenICam XML: {e}"))?;

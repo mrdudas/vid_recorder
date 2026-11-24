@@ -21,14 +21,20 @@ use crate::camera::{Camera, FrameSink};
 use crate::frame::{BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
-/// Names of the UVC cameras the system reports.
+/// Names of the UVC cameras the system reports. On Linux one camera shows
+/// up as several /dev/video nodes with the same name (capture + metadata),
+/// so names are listed once.
 pub fn list() -> Vec<String> {
     if !ensure_permission() {
         return Vec::new();
     }
-    nokhwa::query(ApiBackend::Auto)
-        .map(|cams| cams.iter().map(|c| c.human_name()).collect())
-        .unwrap_or_default()
+    let mut names: Vec<String> = Vec::new();
+    for c in nokhwa::query(ApiBackend::Auto).unwrap_or_default() {
+        if !names.contains(&c.human_name()) {
+            names.push(c.human_name());
+        }
+    }
+    names
 }
 
 /// macOS asks the user for camera access once; elsewhere this is a no-op.
@@ -43,15 +49,18 @@ fn ensure_permission() -> bool {
     rx.recv_timeout(Duration::from_secs(60)).unwrap_or(false)
 }
 
-fn find_index(name: &str) -> Result<CameraIndex, String> {
+/// All device indices with this name; the first one that opens is used
+/// (on Linux the metadata node has the same name but delivers no video).
+fn find_indices(name: &str) -> Result<Vec<CameraIndex>, String> {
     if !ensure_permission() {
         return Err("camera access denied".into());
     }
     let cams = nokhwa::query(ApiBackend::Auto).map_err(|e| e.to_string())?;
-    cams.iter()
-        .find(|c| c.human_name() == name)
-        .map(|c| c.index().clone())
-        .ok_or_else(|| format!("UVC camera \"{name}\" not found"))
+    let found: Vec<CameraIndex> = cams.iter().filter(|c| c.human_name() == name).map(|c| c.index().clone()).collect();
+    if found.is_empty() {
+        return Err(format!("UVC camera \"{name}\" not found"));
+    }
+    Ok(found)
 }
 
 fn to_fourcc(f: PixelFormat) -> Result<FrameFormat, String> {
@@ -91,7 +100,7 @@ impl Camera for UvcCamera {
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {
         self.stop();
         let s = self.settings.clone().ok_or("no settings applied")?;
-        let index = find_index(&self.name)?;
+        let indices = find_indices(&self.name)?;
         let fourcc = to_fourcc(s.pixel_format)?;
         self.running.store(true, Relaxed);
         let running = self.running.clone();
@@ -103,7 +112,16 @@ impl Camera for UvcCamera {
             .spawn(move || {
                 let format = CameraFormat::new(Resolution::new(s.width, s.height), fourcc, s.frame_rate.round() as u32);
                 let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(format));
-                let mut cam = match NCamera::new(index, requested).and_then(|mut c| c.open_stream().map(|_| c)) {
+                let mut opened = Err(String::new());
+                for index in indices {
+                    opened = NCamera::new(index, requested)
+                        .and_then(|mut c| c.open_stream().map(|_| c))
+                        .map_err(|e| e.to_string());
+                    if opened.is_ok() {
+                        break;
+                    }
+                }
+                let mut cam = match opened {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = ready_tx.send(Err(format!("open {fourcc} {}x{} @ {}: {e}", s.width, s.height, s.frame_rate)));

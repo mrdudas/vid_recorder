@@ -8,6 +8,7 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - **Nem használunk Vimba SDK-t** (döntés: 2026-11-24). Ok: a Vimba X macOS-es változata csak Apple Siliconon fut, és így minden platformon egységes a kód.
   - A kamerával közvetlenül a USB3 Vision / GenICam protokollon beszélünk, Rust könyvtárral (`cameleon`, libusb-n keresztül).
   - Windowson a kamerához WinUSB meghajtó kell (pl. Zadiggal telepítve).
+  - Linuxon a `linux/99-vid-recorder.rules` udev szabály kell: root nélküli hozzáférést ad, és a 16 MB-os `usbfs_memory_mb` korlátot 1000-re emeli, különben képkockák veszhetnek el.
   - A kamerakezelés egy saját interfész mögött van, így a USB3 Vision réteg cserélhető.
 - **UVC kamerák is használhatók** (webkamera, UVC-kompatibilis panelkamera) a `nokhwa` könyvtárral: Macen AVFoundation, Windowson Media Foundation, Linuxon V4L2.
   - Formátumok: MJPEG, YUYV, NV12, szürke (Mono8).
