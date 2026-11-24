@@ -1,0 +1,446 @@
+//! GUI: main page (scenario select, record start/end, preview) and settings
+//! page (edit, try and save scenarios). Preview refreshes at most 25 fps.
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::Instant;
+
+use eframe::egui;
+
+use crate::encoder;
+use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
+use crate::frame::{Frame, PixelFormat};
+use crate::lut::{self, Lut};
+use crate::scenario::{self, Scenario};
+
+/// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
+struct PreviewLut {
+    name: String,
+    lut: Lut,
+    gray: Vec<[u8; 3]>,
+}
+
+/// Preview images are downscaled to at most this width.
+const PREVIEW_MAX_WIDTH: usize = 960;
+
+#[derive(PartialEq)]
+enum Page {
+    Main,
+    Settings,
+}
+
+pub struct App {
+    engine: Engine,
+    dir: PathBuf,
+    scenarios: Vec<Scenario>,
+    page: Page,
+    /// Working copy on the settings page.
+    edit: Scenario,
+    extra_json: String,
+    rec_name: String,
+    recording: Option<(RecordingInfo, Instant)>,
+    message: String,
+    texture: Option<egui::TextureHandle>,
+    lut_dir: PathBuf,
+    lut: Option<PreviewLut>,
+}
+
+impl App {
+    pub fn new(engine: Engine, dir: PathBuf, lut_dir: PathBuf) -> Self {
+        let mut scenarios = scenario::load_all(&dir);
+        if scenarios.is_empty() {
+            let s = Scenario::default();
+            let _ = scenario::save(&dir, &s);
+            scenarios.push(s);
+        }
+        let edit = scenarios[0].clone();
+        let mut app = App {
+            engine,
+            dir,
+            extra_json: extra_to_json(&edit),
+            edit,
+            scenarios,
+            page: Page::Main,
+            rec_name: String::new(),
+            recording: None,
+            message: String::new(),
+            texture: None,
+            lut_dir,
+            lut: None,
+        };
+        let first = app.scenarios[0].clone();
+        app.apply(&first);
+        app
+    }
+
+    fn apply(&mut self, s: &Scenario) {
+        self.message = match self.engine.apply(s) {
+            Ok(()) => format!("Szcenárió aktív: {}", s.name),
+            Err(e) => format!("Hiba: {e}"),
+        };
+    }
+
+    fn reload(&mut self) {
+        self.scenarios = scenario::load_all(&self.dir);
+    }
+
+    /// Load the active scenario's preview LUT if it changed.
+    fn sync_lut(&mut self) {
+        let wanted = self.engine.scenario.as_ref().and_then(|s| s.preview_lut.clone());
+        if wanted.as_deref() == self.lut.as_ref().map(|l| l.name.as_str()) {
+            return;
+        }
+        self.lut = None;
+        if let Some(name) = wanted {
+            match Lut::load(&self.lut_dir.join(&name)) {
+                Ok(lut) => {
+                    let gray = lut.gray_table();
+                    self.lut = Some(PreviewLut { name, lut, gray });
+                }
+                Err(e) => {
+                    self.message = format!("LUT hiba: {e}");
+                    // Remember the name so the failing load is not retried every frame.
+                    if let Some(s) = self.engine.scenario.as_mut() {
+                        s.preview_lut = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_preview(&mut self, ctx: &egui::Context) {
+        self.sync_lut();
+        if let Some(frame) = self.engine.take_preview() {
+            let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref());
+            self.engine.recycle(frame);
+            match &mut self.texture {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
+            }
+        }
+    }
+
+    fn preview(&self, ui: &mut egui::Ui) {
+        match &self.texture {
+            Some(t) => {
+                ui.add(egui::Image::new(t).shrink_to_fit());
+            }
+            None => {
+                ui.label("Nincs kép.");
+            }
+        }
+    }
+
+    fn main_page(&mut self, ui: &mut egui::Ui) {
+        let recording = self.recording.is_some();
+        ui.horizontal(|ui| {
+            ui.label("Szcenárió:");
+            let current = self.engine.scenario.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+            let mut chosen = None;
+            ui.add_enabled_ui(!recording, |ui| {
+                egui::ComboBox::from_id_salt("scenario")
+                    .selected_text(&current)
+                    .show_ui(ui, |ui| {
+                        for s in &self.scenarios {
+                            if ui.selectable_label(s.name == current, &s.name).clicked() && s.name != current {
+                                chosen = Some(s.clone());
+                            }
+                        }
+                    });
+            });
+            if let Some(s) = chosen {
+                self.apply(&s);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Felvétel neve:");
+            ui.add_enabled(
+                !recording,
+                egui::TextEdit::singleline(&mut self.rec_name).hint_text("üresen: automatikus (dátum, idő)"),
+            );
+            if !recording {
+                if ui.button("⏺ Record Start").clicked() {
+                    let name = if self.rec_name.trim().is_empty() {
+                        chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string()
+                    } else {
+                        self.rec_name.trim().to_string()
+                    };
+                    match self.engine.start_recording(&name) {
+                        Ok(info) => {
+                            self.message = format!("Felvétel: {} ({})", info.video, info.encoder);
+                            self.recording = Some((info, Instant::now()));
+                        }
+                        Err(e) => self.message = format!("Hiba: {e}"),
+                    }
+                }
+            } else if ui.button("⏹ Record End").clicked() {
+                self.engine.stop_recording();
+                if let Some((info, _)) = self.recording.take() {
+                    self.message = format!(
+                        "Felvétel leállítva: {} – {} képkocka, {} eldobva",
+                        info.video,
+                        info.stats.queued.load(Relaxed),
+                        info.stats.dropped.load(Relaxed)
+                    );
+                }
+                self.rec_name.clear();
+            }
+        });
+
+        self.status_line(ui);
+        ui.separator();
+        self.preview(ui);
+    }
+
+    fn status_line(&mut self, ui: &mut egui::Ui) {
+        let st = self.engine.stats();
+        let mut line = format!(
+            "{} · fogadott: {} · kameránál elveszett: {}",
+            self.engine.camera_name(),
+            st.received.load(Relaxed),
+            st.lost_at_camera.load(Relaxed)
+        );
+        if let Some((info, started)) = &self.recording {
+            line += &format!(
+                " · ⏺ {:.0} s · írva: {} · sorban: {} · eldobva: {}",
+                started.elapsed().as_secs_f64(),
+                info.stats.written.load(Relaxed),
+                info.stats.queued.load(Relaxed) - info.stats.written.load(Relaxed),
+                info.stats.dropped.load(Relaxed)
+            );
+            if let Some(e) = info.stats.error.lock().unwrap().as_ref() {
+                line += &format!(" · HIBA: {e}");
+            }
+        }
+        let fin = self.engine.finalizing();
+        if fin > 0 {
+            line += &format!(" · lezárás alatt: {fin}");
+        }
+        ui.label(line);
+        if !self.message.is_empty() {
+            ui.label(&self.message);
+        }
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        let recording = self.recording.is_some();
+        egui::Panel::left("scenario_list").resizable(false).show(ui, |ui| {
+            ui.heading("Szcenáriók");
+            let mut pick = None;
+            for s in &self.scenarios {
+                if ui.selectable_label(s.name == self.edit.name, &s.name).clicked() {
+                    pick = Some(s.clone());
+                }
+            }
+            if let Some(s) = pick {
+                self.extra_json = extra_to_json(&s);
+                self.edit = s;
+            }
+            ui.separator();
+            if ui.button("Új").clicked() {
+                self.edit = Scenario { name: "uj_szcenario".into(), ..self.edit.clone() };
+            }
+        });
+
+        ui.add_enabled_ui(!recording, |ui| {
+            egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
+                let e = &mut self.edit;
+                ui.label("Név");
+                ui.text_edit_singleline(&mut e.name);
+                ui.end_row();
+
+                ui.label("Pixelformátum");
+                egui::ComboBox::from_id_salt("pixfmt").selected_text(e.camera.pixel_format.name()).show_ui(ui, |ui| {
+                    for f in PixelFormat::ALL {
+                        ui.selectable_value(&mut e.camera.pixel_format, f, f.name());
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Szélesség × magasság");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut e.camera.width).range(8..=16384));
+                    ui.add(egui::DragValue::new(&mut e.camera.height).range(8..=16384));
+                });
+                ui.end_row();
+
+                ui.label("Eltolás X, Y");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut e.camera.offset_x));
+                    ui.add(egui::DragValue::new(&mut e.camera.offset_y));
+                });
+                ui.end_row();
+
+                ui.label("Képfrekvencia [fps]");
+                ui.add(egui::DragValue::new(&mut e.camera.frame_rate).range(0.1..=1000.0).speed(0.5));
+                ui.end_row();
+
+                ui.label("Expozíció [µs]");
+                ui.add(egui::DragValue::new(&mut e.camera.exposure_us).range(1.0..=10_000_000.0).speed(10.0));
+                ui.end_row();
+
+                ui.label("Erősítés [dB]");
+                ui.add(egui::DragValue::new(&mut e.camera.gain_db).range(0.0..=48.0).speed(0.1));
+                ui.end_row();
+
+                ui.label("Kódoló");
+                egui::ComboBox::from_id_salt("encoder").selected_text(&e.recording.encoder).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut e.recording.encoder, "auto".to_string(), "auto");
+                    for p in encoder::available() {
+                        ui.selectable_value(&mut e.recording.encoder, p.id.to_string(), p.label);
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Élőkép LUT (S-Log)");
+                let current = e.preview_lut.clone().unwrap_or_else(|| "nincs".into());
+                egui::ComboBox::from_id_salt("lut").selected_text(current).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut e.preview_lut, None, "nincs");
+                    for name in lut::list(&self.lut_dir) {
+                        ui.selectable_value(&mut e.preview_lut, Some(name.clone()), name);
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Kimeneti mappa");
+                let mut dir = e.recording.output_dir.display().to_string();
+                if ui.text_edit_singleline(&mut dir).changed() {
+                    e.recording.output_dir = dir.into();
+                }
+                ui.end_row();
+
+                ui.label("További kamerabeállítások\n(JSON: név → érték)");
+                ui.add(egui::TextEdit::multiline(&mut self.extra_json).code_editor().desired_rows(3));
+                ui.end_row();
+            });
+
+            ui.horizontal(|ui| {
+                if ui.button("Kipróbálás").clicked()
+                    && let Some(s) = self.edited()
+                {
+                    self.apply(&s);
+                }
+                if ui.button("Mentés").clicked()
+                    && let Some(s) = self.edited()
+                {
+                    self.message = match scenario::save(&self.dir, &s) {
+                        Ok(p) => format!("Mentve: {}", p.display()),
+                        Err(e) => format!("Hiba mentéskor: {e}"),
+                    };
+                    self.reload();
+                }
+                if ui.button("Törlés").clicked() {
+                    self.message = match scenario::delete(&self.dir, &self.edit.name) {
+                        Ok(()) => format!("Törölve: {}", self.edit.name),
+                        Err(e) => format!("Hiba törléskor: {e}"),
+                    };
+                    self.reload();
+                }
+            });
+        });
+
+        self.status_line(ui);
+        ui.separator();
+        self.preview(ui);
+    }
+
+    /// The edited scenario with the extra-features JSON parsed in.
+    fn edited(&mut self) -> Option<Scenario> {
+        let mut s = self.edit.clone();
+        let text = self.extra_json.trim();
+        if !text.is_empty() {
+            match serde_json::from_str(text) {
+                Ok(m) => s.camera.extra = m,
+                Err(e) => {
+                    self.message = format!("Hibás JSON a további beállításokban: {e}");
+                    return None;
+                }
+            }
+        } else {
+            s.camera.extra.clear();
+        }
+        if s.name.trim().is_empty() {
+            self.message = "A névnek nem szabad üresnek lennie.".into();
+            return None;
+        }
+        Some(s)
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.update_preview(&ctx);
+        egui::Panel::top("tabs").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.page, Page::Main, "Főoldal");
+                ui.selectable_value(&mut self.page, Page::Settings, "Beállítások");
+            });
+        });
+        egui::CentralPanel::default().show(ui, |ui| match self.page {
+            Page::Main => self.main_page(ui),
+            Page::Settings => self.settings_page(ui),
+        });
+        ctx.request_repaint_after(PREVIEW_INTERVAL);
+    }
+
+    fn on_exit(&mut self) {
+        self.engine.finish_recording();
+    }
+}
+
+fn extra_to_json(s: &Scenario) -> String {
+    if s.camera.extra.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(&s.camera.extra).unwrap_or_default()
+    }
+}
+
+/// Downscaled 8-bit RGB preview, with the LUT applied if given. Bayer RGGB
+/// is shown by taking each 2×2 cell as one pixel (no interpolation).
+fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> egui::ColorImage {
+    let (w, h) = (f.width as usize, f.height as usize);
+    let mut step = w.div_ceil(max_width).max(1);
+    if f.format.is_bayer() {
+        step = step.next_multiple_of(2);
+    }
+    let (ow, oh) = (w / step, h / step);
+    let bpp = f.format.bytes_per_pixel();
+    let shift = f.format.bits().saturating_sub(8);
+    let sample = |x: usize, y: usize| -> u8 {
+        let i = (y * w + x) * bpp;
+        if bpp == 1 {
+            f.data[i]
+        } else {
+            (u16::from_le_bytes([f.data[i], f.data[i + 1]]) >> shift).min(255) as u8
+        }
+    };
+    let mut rgb = Vec::with_capacity(ow * oh * 3);
+    for oy in 0..oh {
+        let y = oy * step;
+        for ox in 0..ow {
+            let x = ox * step;
+            if f.format.is_bayer() {
+                let r = sample(x, y);
+                let g = ((sample(x + 1, y) as u16 + sample(x, y + 1) as u16) / 2) as u8;
+                let b = sample(x + 1, y + 1);
+                match lut {
+                    Some(l) => {
+                        let out = l.lut.apply([r, g, b].map(|c| c as f32 / 255.0));
+                        rgb.extend(out.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
+                    }
+                    None => rgb.extend_from_slice(&[r, g, b]),
+                }
+            } else {
+                let v = sample(x, y);
+                match lut {
+                    Some(l) => rgb.extend_from_slice(&l.gray[v as usize]),
+                    None => rgb.extend_from_slice(&[v, v, v]),
+                }
+            }
+        }
+    }
+    egui::ColorImage::from_rgb([ow, oh], &rgb)
+}
