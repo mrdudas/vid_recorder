@@ -35,17 +35,31 @@ pub fn list() -> Result<Vec<String>, String> {
 }
 
 /// Linux limits USB transfer buffers to 16 MB by default, too little for
-/// streaming without loss. `linux/99-vid-recorder.rules` raises it.
-fn warn_usbfs_limit() {
-    if cfg!(target_os = "linux") {
-        let path = "/sys/module/usbcore/parameters/usbfs_memory_mb";
-        if let Some(mb) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u32>().ok()) {
-            if mb != 0 && mb < 1000 {
-                eprintln!("warning: usbfs_memory_mb is {mb}, frames may be lost; install linux/99-vid-recorder.rules");
-            }
-        }
+/// streaming without loss. Raise it to `USBFS_MB` (0 means unlimited):
+/// directly if we may write sysfs, else through `pkexec` (asks for the
+/// admin password). `linux/99-vid-recorder.rules` does the same at plug-in.
+#[cfg(target_os = "linux")]
+fn ensure_usbfs_limit() {
+    const PATH: &str = "/sys/module/usbcore/parameters/usbfs_memory_mb";
+    const USBFS_MB: u32 = 1000;
+    let read = || std::fs::read_to_string(PATH).ok().and_then(|s| s.trim().parse::<u32>().ok());
+    let Some(mb) = read() else { return };
+    if mb == 0 || mb >= USBFS_MB {
+        return;
+    }
+    if std::fs::write(PATH, USBFS_MB.to_string()).is_err() {
+        let _ = std::process::Command::new("pkexec")
+            .args(["sh", "-c", &format!("echo {USBFS_MB} > {PATH}")])
+            .status();
+    }
+    match read() {
+        Some(now) if now == 0 || now >= USBFS_MB => eprintln!("usbfs_memory_mb raised from {mb} to {now}"),
+        _ => eprintln!("warning: usbfs_memory_mb is {mb}, frames may be lost; install linux/99-vid-recorder.rules"),
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_usbfs_limit() {}
 
 fn describe(i: &cameleon::CameraInfo) -> String {
     format!("{} {} ({})", i.vendor_name, i.model_name, i.serial_number)
@@ -58,7 +72,7 @@ impl U3vCamera {
         if cams.is_empty() {
             return Err("no USB3 Vision camera found".into());
         }
-        warn_usbfs_limit();
+        ensure_usbfs_limit();
         let mut cam = cams.swap_remove(0);
         cam.open().map_err(|e| format!("open: {e}"))?;
         cam.load_context().map_err(|e| format!("GenICam XML: {e}"))?;
