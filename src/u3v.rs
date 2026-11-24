@@ -10,7 +10,7 @@ use cameleon::payload::PixelFormat as UPixelFormat;
 use cameleon::u3v::{self, ControlHandle, StreamHandle};
 
 use crate::camera::{Camera, FrameSink};
-use crate::frame::{BufferPool, Frame, PixelFormat};
+use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
 type Cam = CCamera<ControlHandle, StreamHandle, DefaultGenApiCtxt>;
@@ -136,8 +136,17 @@ impl Camera for U3vCamera {
                     };
                     let frame = payload.image_info().zip(payload.image()).and_then(|(info, image)| {
                         let format = map_format(&info.pixel_format)?;
-                        let mut data = pool.get(image.len());
-                        data.copy_from_slice(image);
+                        let data = if format.is_packed() {
+                            // Unpack to 2 bytes per pixel (bit-exact) right here,
+                            // so everything downstream sees plain 16-bit data.
+                            let mut data = pool.get(info.width * info.height * 2);
+                            frame::unpack(format, image, &mut data);
+                            data
+                        } else {
+                            let mut data = pool.get(image.len());
+                            data.copy_from_slice(image);
+                            data
+                        };
                         Some(Frame {
                             id: payload.id(),
                             timestamp_ns: payload.timestamp().as_nanos() as u64,
@@ -192,7 +201,11 @@ fn map_format(f: &UPixelFormat) -> Option<PixelFormat> {
         UPixelFormat::Mono12 => PixelFormat::Mono12,
         UPixelFormat::Mono16 => PixelFormat::Mono16,
         UPixelFormat::BayerRG8 => PixelFormat::BayerRG8,
+        UPixelFormat::BayerRG10 => PixelFormat::BayerRG10,
         UPixelFormat::BayerRG12 => PixelFormat::BayerRG12,
+        UPixelFormat::BayerRG10p => PixelFormat::BayerRG10p,
+        UPixelFormat::BayerRG12p => PixelFormat::BayerRG12p,
+        UPixelFormat::YCbCr422_8_CbYCrY => PixelFormat::Uyvy,
         _ => return None,
     })
 }

@@ -55,7 +55,7 @@ impl Camera for SimCamera {
         if s.width == 0 || s.height == 0 || s.frame_rate <= 0.0 {
             return Err("width, height and frame rate must be positive".into());
         }
-        if matches!(s.pixel_format, PixelFormat::Yuyv | PixelFormat::Nv12 | PixelFormat::Mjpeg) {
+        if matches!(s.pixel_format, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12 | PixelFormat::Mjpeg) {
             return Err(format!("the simulated camera has no {} output", s.pixel_format.name()));
         }
         self.settings = Some(s.clone());

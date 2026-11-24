@@ -452,7 +452,7 @@ fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> Opti
     };
 
     let mut step = w.div_ceil(max_width).max(1);
-    if format.is_some_and(|f| f.is_bayer() || f == PixelFormat::Yuyv || f == PixelFormat::Nv12) {
+    if format.is_some_and(|f| f.is_bayer() || matches!(f, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12)) {
         step = step.next_multiple_of(2);
     }
     let (ow, oh) = (w / step, h / step);
@@ -493,6 +493,10 @@ fn to_color_image(f: &Frame, max_width: usize, lut: Option<&PreviewLut>) -> Opti
                 Some(PixelFormat::Yuyv) => {
                     let i = (y * w + x) * 2;
                     yuv(data[i], data[i + 1], data[i + 3])
+                }
+                Some(PixelFormat::Uyvy) => {
+                    let i = (y * w + x) * 2;
+                    yuv(data[i + 1], data[i], data[i + 2])
                 }
                 Some(PixelFormat::Nv12) => {
                     let uv = w * h + (y / 2) * w + x;
