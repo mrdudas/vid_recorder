@@ -49,8 +49,9 @@ fn ensure_permission() -> bool {
     rx.recv_timeout(Duration::from_secs(60)).unwrap_or(false)
 }
 
-/// All device indices with this name; the first one that opens is used
-/// (on Linux the metadata node has the same name but delivers no video).
+/// All device indices with this name; the first one that opens and starts
+/// streaming is used (on Linux the metadata node has the same name but
+/// fails to open).
 fn find_indices(name: &str) -> Result<Vec<CameraIndex>, String> {
     if !ensure_permission() {
         return Err("camera access denied".into());

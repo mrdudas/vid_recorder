@@ -192,6 +192,8 @@ impl Writer {
             .args(["-framerate", &format!("{}", self.fps)])
             .args(["-i", "pipe:0"])
             .args(encoder.args)
+            // Bayer is stored as grey; the tag tells the export what it is.
+            .args(["-metadata:s:v:0", &format!("PIXEL_FORMAT={}", f.format.name())])
             .arg("-y")
             .arg(&self.video_path)
             .stdin(Stdio::piped())

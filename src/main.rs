@@ -1,8 +1,10 @@
 mod camera;
 mod encoder;
 mod engine;
+mod export;
 mod frame;
 mod lut;
+mod magnify;
 mod recorder;
 mod scenario;
 mod u3v;
@@ -58,8 +60,9 @@ fn main() -> ExitCode {
         }
         Some("record-test") => record_test(&args[1..]),
         Some("luts") => Ok(check_luts()),
+        Some("export") => export::run(&args[1..]),
         _ => {
-            eprintln!("{USAGE}");
+            eprintln!("{USAGE}\n{}", export::USAGE);
             return ExitCode::from(2);
         }
     };
@@ -216,9 +219,7 @@ fn run_and_verify(mut engine: Engine, s: &Scenario, seconds: f64) -> Result<bool
 
 /// Packet count of the first video stream via ffprobe (next to ffmpeg).
 fn count_video_frames(path: &str) -> Option<u64> {
-    let ffmpeg = encoder::ffmpeg_path();
-    let ffprobe = ffmpeg.with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" });
-    let out = Command::new(ffprobe)
+    let out = Command::new(encoder::ffprobe_path())
         .args(["-v", "error", "-select_streams", "v:0", "-count_packets"])
         .args(["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path])
         .output()

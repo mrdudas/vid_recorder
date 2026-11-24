@@ -107,6 +107,11 @@ pub fn ffmpeg_path() -> PathBuf {
     .clone()
 }
 
+/// ffprobe next to the ffmpeg binary.
+pub fn ffprobe_path() -> PathBuf {
+    ffmpeg_path().with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" })
+}
+
 fn probe(p: &Profile) -> bool {
     Command::new(ffmpeg_path())
         .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=640x480:r=25", "-frames:v", "5", "-pix_fmt", "yuv420p"])
