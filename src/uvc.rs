@@ -17,7 +17,7 @@ use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
 };
 
-use crate::camera::{Camera, FrameSink};
+use crate::camera::{Camera, FrameSink, Mode};
 use crate::frame::{BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
@@ -96,6 +96,52 @@ impl Camera for UvcCamera {
         to_fourcc(s.pixel_format)?;
         self.settings = Some(s.clone());
         Ok(())
+    }
+
+    /// Formats the backend lists, highest frame rate per format and size.
+    /// Sizes below 640 px wide are skipped.
+    fn modes(&mut self, _: &CameraSettings) -> Result<Vec<Mode>, String> {
+        let mut last = String::new();
+        for index in find_indices(&self.name)? {
+            let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+            // nokhwa's AVFoundation backend lists the fourccs but no sizes or
+            // frame rates; then try common sizes at 30 fps and let the
+            // recording test show which work.
+            let list = NCamera::new(index, requested).and_then(|mut c| {
+                let mut all = c.compatible_camera_formats().unwrap_or_default();
+                if all.is_empty() {
+                    for fourcc in c.compatible_fourcc()? {
+                        for (w, h) in [(1920, 1080), (1280, 720), (640, 480)] {
+                            all.push(CameraFormat::new(Resolution::new(w, h), fourcc, 30));
+                        }
+                    }
+                }
+                Ok(all)
+            });
+            let list = match list {
+                Ok(l) if !l.is_empty() => l,
+                Ok(_) => continue,
+                Err(e) => {
+                    last = e.to_string();
+                    continue;
+                }
+            };
+            let mut modes: Vec<Mode> = Vec::new();
+            for f in list {
+                let Some(format) = from_fourcc(f.format()) else { continue };
+                let (width, height, fps) = (f.width(), f.height(), f.frame_rate() as f64);
+                if width < 640 {
+                    continue;
+                }
+                match modes.iter_mut().find(|m| m.format == format && m.width == width && m.height == height) {
+                    Some(m) => m.fps = m.fps.max(fps),
+                    None => modes.push(Mode { format, width, height, fps }),
+                }
+            }
+            modes.sort_by_key(|m| (m.format.name(), std::cmp::Reverse(m.width * m.height)));
+            return Ok(modes);
+        }
+        Err(format!("no format list from \"{}\": {last}", self.name))
     }
 
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::camera::{self, Camera};
+use crate::camera::{self, Camera, Mode};
 use crate::frame::{BufferPool, Frame};
 use crate::recorder::{RecStats, Recorder};
 use crate::scenario::{Device, Scenario};
@@ -131,6 +131,23 @@ impl Engine {
         cam.start(self.shared.pool.clone(), sink)?;
         self.scenario = Some(s.clone());
         Ok(())
+    }
+
+    /// Stop the camera (opening `s.device` if needed) and ask it which modes
+    /// it supports. The camera stays stopped until the next `apply`.
+    pub fn modes(&mut self, s: &Scenario) -> Result<Vec<Mode>, String> {
+        if self.is_recording() {
+            return Err("cannot probe while recording".into());
+        }
+        self.scenario = None;
+        if let Some((_, cam)) = self.camera.as_mut() {
+            cam.stop();
+        }
+        if self.camera.as_ref().is_none_or(|(d, _)| *d != s.device) {
+            self.camera = None;
+            self.camera = Some((s.device.clone(), camera::open(&s.device)?));
+        }
+        self.camera.as_mut().unwrap().1.modes(&s.camera)
     }
 
     /// Take the latest preview frame, if a new one arrived.

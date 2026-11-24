@@ -9,7 +9,7 @@ use eframe::egui;
 
 use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
-use crate::recorder::RecStats;
+use crate::probe::{self, Level, Verdict};
 use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
 use crate::scenario::{self, Device, Scenario, View};
@@ -41,9 +41,14 @@ pub struct App {
     rec_name: String,
     recording: Option<(RecordingInfo, Instant)>,
     /// Running recording test (settings page) and its last result.
-    test: Option<RecTest>,
+    test: Option<(probe::Test, Scenario)>,
     test_secs: f64,
-    test_result: Option<(bool, String)>,
+    test_result: Option<Verdict>,
+    /// Camera discovery: modes still to test, results so far, and the
+    /// scenario to return to afterwards (`Some` while discovery runs).
+    probe_queue: std::collections::VecDeque<Scenario>,
+    probe_results: Vec<(Scenario, Verdict)>,
+    probe_base: Option<Scenario>,
     message: String,
     texture: Option<egui::TextureHandle>,
     lut_dir: PathBuf,
@@ -88,8 +93,11 @@ impl App {
             rec_name: String::new(),
             recording: None,
             test: None,
-            test_secs: 10.0,
+            test_secs: 5.0,
             test_result: None,
+            probe_queue: Default::default(),
+            probe_results: Vec::new(),
+            probe_base: None,
             message: String::new(),
             texture: None,
             lut_dir,
@@ -488,18 +496,37 @@ impl App {
                     .clicked()
                     && let Some(s) = self.edited()
                 {
-                    self.start_test(&s);
+                    self.test_result = None;
+                    match probe::Test::start(&mut self.engine, &s, self.test_secs) {
+                        Ok(t) => self.test = Some((t, s)),
+                        Err(v) => self.test_result = Some(v),
+                    }
                 }
-                ui.add(egui::DragValue::new(&mut self.test_secs).range(2.0..=600.0).suffix(" s"));
+                if ui
+                    .button("Kamera felderítése")
+                    .on_hover_text("Lekérdezi a kamerától, milyen formátumokat, méreteket és legnagyobb fps-t tud, és mindegyiket lefuttatja a felvételi teszttel (a kamera, expozíció, erősítés és extra beállítások innen jönnek). Ha a kódoló nem bírja, tömörítetlenül is kipróbálja.")
+                    .clicked()
+                    && let Some(s) = self.edited()
+                {
+                    self.start_probe(s);
+                }
+                ui.add(egui::DragValue::new(&mut self.test_secs).range(2.0..=600.0).suffix(" s / teszt"));
             });
         });
-        if let Some(t) = &self.test {
-            ui.label(format!("Felvételi teszt fut… {:.0} s", t.started.elapsed().as_secs_f64()));
+        if let Some((t, s)) = &self.test {
+            ui.horizontal(|ui| {
+                let left = self.probe_queue.len();
+                let more = if left > 0 { format!(", még {left} teszt van hátra") } else { String::new() };
+                ui.label(format!("Teszt fut: {} ({:.0}/{:.0} s){more}", s.name, t.elapsed(), self.test_secs));
+                if left > 0 && ui.button("Leállítás").on_hover_text("A futó teszt még befejeződik.").clicked() {
+                    self.probe_queue.clear();
+                }
+            });
         }
-        if let Some((ok, text)) = &self.test_result {
-            let color = if *ok { egui::Color32::from_rgb(40, 160, 70) } else { egui::Color32::from_rgb(200, 60, 50) };
-            ui.colored_label(color, text);
+        if let Some(v) = &self.test_result {
+            ui.colored_label(level_color(v.level), &v.text);
         }
+        self.probe_table(ui);
 
         self.status_line(ui);
         ui.separator();
@@ -507,49 +534,79 @@ impl App {
         self.preview(ui);
     }
 
-    fn start_test(&mut self, s: &Scenario) {
+    fn start_probe(&mut self, base: Scenario) {
         self.test_result = None;
-        if let Err(e) = self.engine.apply(s) {
-            self.test_result = Some((false, format!("A szcenárió nem indul: {e}")));
-            return;
-        }
-        let st = self.engine.stats();
-        let lost_before = st.lost_at_camera.load(Relaxed);
-        let name = chrono::Local::now().format("_teszt_%Y%m%d_%H%M%S").to_string();
-        match self.engine.start_recording(&name) {
-            Ok(info) => {
-                let c = &s.camera;
-                self.test = Some(RecTest {
-                    info,
-                    started: Instant::now(),
-                    stopped: None,
-                    secs: self.test_secs,
-                    lost_before,
-                    frame_bytes: Frame::byte_size(c.width, c.height, c.pixel_format),
-                })
+        self.probe_results.clear();
+        match self.engine.modes(&base) {
+            Ok(modes) if !modes.is_empty() => {
+                self.probe_queue = probe::plan(&base, &modes).into();
+                self.probe_base = Some(base);
             }
-            Err(e) => self.test_result = Some((false, format!("A felvétel nem indul: {e}"))),
+            Ok(_) => self.test_result = Some(Verdict::fail("A kamera nem adott rögzíthető módot.".into())),
+            Err(e) => self.test_result = Some(Verdict::fail(format!("A kamera nem kérdezhető le: {e}"))),
         }
     }
 
-    /// Advance the recording test: stop after its time, evaluate once the
-    /// files are complete, then delete them.
+    /// Advance the running test; during discovery start the next one, and
+    /// when all are done go back to the edited scenario.
     fn poll_test(&mut self) {
-        let Some(t) = &mut self.test else { return };
-        if t.stopped.is_none() && t.started.elapsed().as_secs_f64() >= t.secs {
-            self.engine.stop_recording();
-            t.stopped = Some(Instant::now());
+        if let Some((t, _)) = &mut self.test {
+            let Some(v) = t.poll(&mut self.engine) else { return };
+            let (_, s) = self.test.take().unwrap();
+            if self.probe_base.is_some() {
+                if let Some(r) = probe::raw_retry(&s, &v) {
+                    self.probe_queue.push_front(r);
+                }
+                self.probe_results.push((s, v));
+            } else {
+                self.test_result = Some(v);
+            }
         }
-        let Some(stopped) = t.stopped else { return };
-        if !t.info.stats.finished.load(Relaxed) {
+        if self.probe_base.is_none() {
             return;
         }
-        let t = self.test.take().unwrap();
-        let st = &t.info.stats;
-        let lost = self.engine.stats().lost_at_camera.load(Relaxed) - t.lost_before;
-        self.test_result = Some(evaluate(&t, st, lost, stopped.elapsed().as_secs_f64(), self.engine.camera_errors()));
-        let _ = std::fs::remove_file(&t.info.video);
-        let _ = std::fs::remove_file(&t.info.csv);
+        match self.probe_queue.pop_front() {
+            Some(s) => match probe::Test::start(&mut self.engine, &s, self.test_secs) {
+                Ok(t) => self.test = Some((t, s)),
+                Err(v) => self.probe_results.push((s, v)),
+            },
+            None => {
+                let base = self.probe_base.take().unwrap();
+                if let Err(e) = self.engine.apply(&base) {
+                    self.message = format!("Vissza a szerkesztett szcenárióra: {e}");
+                }
+            }
+        }
+    }
+
+    /// Discovery results; "Betöltés" puts a mode into the editor.
+    fn probe_table(&mut self, ui: &mut egui::Ui) {
+        if self.probe_results.is_empty() {
+            return;
+        }
+        ui.label("Kamera felderítése – a Betöltés gombbal a szerkesztőbe kerül, aztán Mentés:");
+        let mut load = None;
+        egui::ScrollArea::vertical().id_salt("probe").max_height(220.0).show(ui, |ui| {
+            egui::Grid::new("probe_grid").striped(true).show(ui, |ui| {
+                for (i, (s, v)) in self.probe_results.iter().enumerate() {
+                    let c = &s.camera;
+                    ui.label(c.pixel_format.name());
+                    ui.label(format!("{}x{}", c.width, c.height));
+                    ui.label(format!("{} fps", c.frame_rate));
+                    ui.label(&s.recording.encoder);
+                    ui.colored_label(level_color(v.level), v.text.lines().next().unwrap_or("")).on_hover_text(&v.text);
+                    if ui.button("Betöltés").clicked() {
+                        load = Some(i);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(i) = load {
+            let s = self.probe_results[i].0.clone();
+            self.extra_json = extra_to_json(&s);
+            self.edit = s;
+        }
     }
 
     /// The edited scenario with the extra-features JSON parsed in.
@@ -603,45 +660,12 @@ impl eframe::App for App {
     }
 }
 
-struct RecTest {
-    info: RecordingInfo,
-    started: Instant,
-    stopped: Option<Instant>,
-    secs: f64,
-    lost_before: u64,
-    frame_bytes: usize,
-}
-
-/// Verdict of a recording test. `finish_s`: time from stop until the files
-/// were complete (how far the encoder was behind).
-fn evaluate(t: &RecTest, st: &RecStats, lost: u64, finish_s: f64, camera_errors: u64) -> (bool, String) {
-    let written = st.written.load(Relaxed);
-    let dropped = st.dropped.load(Relaxed);
-    let frames = st.queued.load(Relaxed) + dropped;
-    let cam_fps = frames as f64 / t.secs;
-    let enc_fps = written as f64 / (t.secs + finish_s);
-    let encoder = st.encoder.lock().unwrap().unwrap_or("-");
-    let mut text = format!(
-        "{frames} kocka ({cam_fps:.1} fps), elveszett a kameránál: {lost}, hibás: {camera_errors}, eldobva: {dropped}, \
-         kódoló ({encoder}): ~{enc_fps:.0} fps, lezárás a leállítás után: {finish_s:.1} s"
-    );
-    if let Some(e) = st.error.lock().unwrap().as_ref() {
-        return (false, format!("HIBA: {e}\n{text}"));
+fn level_color(l: Level) -> egui::Color32 {
+    match l {
+        Level::Ok => egui::Color32::from_rgb(40, 160, 70),
+        Level::Short => egui::Color32::from_rgb(210, 140, 30),
+        Level::Fail => egui::Color32::from_rgb(200, 60, 50),
     }
-    if dropped > 0 || lost > 0 || camera_errors > 0 {
-        return (false, format!("NEM JÓ: képkockák vesztek el.\n{text}"));
-    }
-    // No loss, but an encoder slower than the camera only lasts until the
-    // queue is full.
-    if finish_s > 1.0 && enc_fps < cam_fps {
-        let queue = (crate::recorder::QUEUE_BUDGET_BYTES / t.frame_bytes.max(1)) as f64;
-        let lasts = queue / (cam_fps - enc_fps);
-        text = format!(
-            "RÖVID FELVÉTELHEZ JÓ: a kódoló lassabb a kameránál, kb. {lasts:.0} s felvétel után veszne el képkocka.\n{text}"
-        );
-        return (false, text);
-    }
-    (true, format!("OK: nem veszett el képkocka, a kódoló bírja a tempót.\n{text}"))
 }
 
 fn extra_to_json(s: &Scenario) -> String {

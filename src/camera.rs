@@ -8,6 +8,16 @@ use std::time::{Duration, Instant};
 use crate::frame::{BufferPool, Frame, PixelFormat};
 use crate::scenario::{CameraSettings, Device};
 
+/// One way the camera can run: pixel format, size and the highest frame
+/// rate the camera reports for it.
+#[derive(Clone, Debug)]
+pub struct Mode {
+    pub format: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+}
+
 /// Receives every frame on the camera's acquisition thread. Must be fast.
 pub type FrameSink = Box<dyn FnMut(Frame) + Send>;
 
@@ -17,6 +27,10 @@ pub trait Camera: Send {
     fn apply(&mut self, s: &CameraSettings) -> Result<(), String>;
     fn start(&mut self, pool: BufferPool, sink: FrameSink) -> Result<(), String>;
     fn stop(&mut self);
+    /// Modes the camera reports, with `s`'s exposure and extra features
+    /// applied first (they limit the frame rate). Only called while not
+    /// streaming.
+    fn modes(&mut self, s: &CameraSettings) -> Result<Vec<Mode>, String>;
     /// Frames the camera delivered broken or in an unusable format.
     fn errors(&self) -> u64 {
         0
@@ -64,6 +78,16 @@ impl Camera for SimCamera {
         }
         self.settings = Some(s.clone());
         Ok(())
+    }
+
+    /// Like the Alvium 1800 U-291c the project uses.
+    fn modes(&mut self, _: &CameraSettings) -> Result<Vec<Mode>, String> {
+        let m = |format, fps| Mode { format, width: 1920, height: 1080, fps };
+        Ok(vec![
+            m(PixelFormat::BayerRG8, 155.0),
+            m(PixelFormat::BayerRG10p, 155.0),
+            m(PixelFormat::BayerRG12p, 120.0),
+        ])
     }
 
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {

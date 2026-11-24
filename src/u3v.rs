@@ -10,7 +10,7 @@ use cameleon::genapi::{DefaultGenApiCtxt, ParamsCtxt};
 use cameleon::payload::PixelFormat as UPixelFormat;
 use cameleon::u3v::{self, ControlHandle, StreamHandle};
 
-use crate::camera::{Camera, FrameSink};
+use crate::camera::{Camera, FrameSink, Mode};
 use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
@@ -176,6 +176,50 @@ impl Camera for U3vCamera {
         Ok(())
     }
 
+    /// Every available PixelFormat we can record, at full sensor size and
+    /// at 1920x1080 if smaller, each with the camera's maximum frame rate.
+    fn modes(&mut self, s: &CameraSettings) -> Result<Vec<Mode>, String> {
+        let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
+        let p = &mut p;
+        // Exposure and e.g. DeviceLinkThroughputLimit bound the frame rate.
+        let _ = set_enum(p, "ExposureAuto", "Off");
+        let _ = set_float(p, "ExposureTime", s.exposure_us);
+        for (name, value) in &s.extra {
+            let _ = set_json(p, name, value);
+        }
+        let node = p.node("PixelFormat").and_then(|n| n.as_enumeration(p)).ok_or_else(|| missing("PixelFormat", "enumeration"))?;
+        let mut names = Vec::new();
+        for e in node.entries(p) {
+            if e.is_available(p).unwrap_or(false) {
+                names.push(e.symbolic(p).to_string());
+            }
+        }
+        let mut modes = Vec::new();
+        for name in names {
+            let Some(format) = PixelFormat::ALL.into_iter().find(|f| f.name() == name) else { continue };
+            if set_enum(p, "PixelFormat", &name).is_err() {
+                continue;
+            }
+            let _ = set_int(p, "OffsetX", 0);
+            let _ = set_int(p, "OffsetY", 0);
+            let (Ok(w), Ok(h)) = (int_max(p, "Width"), int_max(p, "Height")) else { continue };
+            let mut sizes = vec![(w, h)];
+            if w >= 1920 && h >= 1080 && (w, h) != (1920, 1080) {
+                sizes.push((1920, 1080));
+            }
+            for (w, h) in sizes {
+                if set_int(p, "Width", w).is_err() || set_int(p, "Height", h).is_err() {
+                    continue;
+                }
+                let _ = set_bool(p, "AcquisitionFrameRateEnable", true);
+                let Ok(fps) = float_max(p, "AcquisitionFrameRate") else { continue };
+                // Rounded down: the exact maximum may not be settable.
+                modes.push(Mode { format, width: w as u32, height: h as u32, fps: (fps * 100.0).floor() / 100.0 });
+            }
+        }
+        Ok(modes)
+    }
+
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {
         self.stop();
         let rx = self.cam.start_streaming(STREAM_QUEUE).map_err(|e| format!("start streaming: {e}"))?;
@@ -296,6 +340,16 @@ fn missing(name: &str, kind: &str) -> String {
 fn set_int(p: &mut Params, name: &str, v: i64) -> Result<(), String> {
     let node = p.node(name).and_then(|n| n.as_integer(p)).ok_or_else(|| missing(name, "integer"))?;
     node.set_value(p, v).map_err(|e| format!("{name} = {v}: {e}"))
+}
+
+fn int_max(p: &mut Params, name: &str) -> Result<i64, String> {
+    let node = p.node(name).and_then(|n| n.as_integer(p)).ok_or_else(|| missing(name, "integer"))?;
+    node.max(p).map_err(|e| format!("{name} max: {e}"))
+}
+
+fn float_max(p: &mut Params, name: &str) -> Result<f64, String> {
+    let node = p.node(name).and_then(|n| n.as_float(p)).ok_or_else(|| missing(name, "float"))?;
+    node.max(p).map_err(|e| format!("{name} max: {e}"))
 }
 
 fn set_float(p: &mut Params, name: &str, v: f64) -> Result<(), String> {

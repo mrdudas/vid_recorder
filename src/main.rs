@@ -5,6 +5,7 @@ mod export;
 mod frame;
 mod lut;
 mod magnify;
+mod probe;
 mod recorder;
 mod scenario;
 mod u3v;
@@ -28,6 +29,12 @@ usage:
   vid_recorder camera-test <scenario> [seconds=10]
                                record with a saved scenario (its camera)
                                and verify that no frame was lost
+  vid_recorder probe <scenario|sim|u3v> [seconds=5]
+                               ask the camera which formats, sizes and max
+                               frame rates it supports and record-test each
+                               (device, exposure, gain, extra features from
+                               the scenario); retries uncompressed if the
+                               encoder is too slow
   vid_recorder encoders        list encoders that work on this machine
   vid_recorder luts            list and check the preview LUTs in slog/
   vid_recorder record-test [seconds=10] [fps=100] [WxH=1920x1200] [format=Mono8] [encoder=auto]
@@ -54,6 +61,7 @@ fn main() -> ExitCode {
             true
         }),
         Some("camera-test") => camera_test(&args[1..]),
+        Some("probe") => probe_camera(&args[1..]),
         Some("--version") => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(true)
@@ -163,6 +171,34 @@ fn camera_test(args: &[String]) -> Result<bool, String> {
         .find(|s| &s.name == name)
         .ok_or_else(|| format!("scenario {name} not found in {}", scenario_dir().display()))?;
     run_and_verify(Engine::new(), &s, seconds)
+}
+
+fn probe_camera(args: &[String]) -> Result<bool, String> {
+    let name = args.first().ok_or("usage: probe <scenario|sim|u3v> [seconds]")?;
+    let seconds: f64 = args.get(1).map_or(Ok(5.0), |s| s.parse()).map_err(|e| format!("seconds: {e}"))?;
+    let base = match scenario::load_all(&scenario_dir()).into_iter().find(|s| &s.name == name) {
+        Some(s) => s,
+        None if name == "sim" => Scenario { device: scenario::Device::Sim, ..Scenario::default() },
+        None if name == "u3v" => Scenario { device: scenario::Device::U3v, ..Scenario::default() },
+        None => return Err(format!("scenario {name} not found in {}", scenario_dir().display())),
+    };
+    let mut engine = Engine::new();
+    let modes = engine.modes(&base)?;
+    eprintln!("camera: {}, {} modes, ~{:.0} s", engine.camera_name(), modes.len(), modes.len() as f64 * (seconds + 1.0));
+    let mut queue: std::collections::VecDeque<Scenario> = probe::plan(&base, &modes).into();
+    let mut any_ok = false;
+    while let Some(s) = queue.pop_front() {
+        let c = &s.camera;
+        let v = probe::Test::run(&mut engine, &s, seconds);
+        let verdict = v.text.lines().next().unwrap_or("");
+        println!("{:<18} {:>9} {:>7} fps  {:<5} {verdict}", c.pixel_format.name(), format!("{}x{}", c.width, c.height), c.frame_rate, s.recording.encoder);
+        println!("    {}", v.text.lines().nth(1).unwrap_or(""));
+        any_ok |= v.level == probe::Level::Ok;
+        if let Some(r) = probe::raw_retry(&s, &v) {
+            queue.push_front(r);
+        }
+    }
+    Ok(any_ok)
 }
 
 /// Start the scenario, record for `seconds`, then check that every frame

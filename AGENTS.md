@@ -47,6 +47,10 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - Itt állítjuk össze a **szcenáriókat** (kamerabeállítás-készleteket).
 - Élőképen ellenőrizhető, milyen képet ad a kamera az adott beállításokkal.
 - Minden beállítás elmenthető, **JSON** formátumban.
+- **Felvételi teszt:** a szerkesztett szcenáriót a megadott ideig rögzíti, és megmutatja, veszett-e el képkocka, illetve bírja-e a kódoló a tempót. A tesztfájlokat utána törli.
+- **Kamera felderítése:** a kamerától lekérdezi a módokat, és mindegyiket lefuttatja a felvételi teszttel. Ha a kódoló túl lassú, tömörítetlenül (`raw`) is kipróbálja. Parancssorból: `probe <szcenárió|sim|u3v> [mp]`.
+  - **USB3 Vision:** a GenICam adja meg az elérhető pixelformátumokat, a legnagyobb méretet és formátumonként a legnagyobb fps-t, az expozíció és az extra beállítások alapján.
+  - **UVC:** a rendszer listája alapján. Macen a nokhwa csak a formátumot adja meg, ezért ott a program 1080p, 720p és 480p méretet próbál 30 fps-sel.
 
 ### Főoldal
 - Itt lehet kiválasztani a mentett szcenáriókat. **Szcenárióváltáskor a kamera azonnal átáll** az új beállításokra.
