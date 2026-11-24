@@ -43,7 +43,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Create `<dir>/<name>.mkv` and `<dir>/<name>.csv`. ffmpeg starts with the
+    /// Create `<dir>/<name>.mkv` (`.nut` for uncompressed) and `<dir>/<name>.csv`. ffmpeg starts with the
     /// first frame, so the stream format always matches the actual frames.
     pub fn start(
         dir: &Path,
@@ -56,9 +56,9 @@ impl Recorder {
     ) -> Result<Recorder, String> {
         // Fail early if nothing can encode the requested format; the encoder
         // is chosen again from the first frame's actual format.
-        encoder::resolve(encoder_id, format)?;
+        let container = encoder::resolve(encoder_id, format)?.container;
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let video_path = dir.join(format!("{name}.mkv"));
+        let video_path = dir.join(format!("{name}.{container}"));
         let csv_path = dir.join(format!("{name}.csv"));
         if video_path.exists() || csv_path.exists() {
             return Err(format!("{} already exists", video_path.display()));

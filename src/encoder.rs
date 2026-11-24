@@ -19,6 +19,9 @@ pub struct Profile {
     pub lossless_bits: u32,
     /// Output codec arguments (everything after the input).
     pub args: &'static [&'static str],
+    /// File extension / container: "mkv", or "nut" for uncompressed video
+    /// (Matroska cannot hold raw 10-16 bit grey without mislabelling it).
+    pub container: &'static str,
 }
 
 /// Recordings must be lossless (raw sensor data, no LUT), so "auto" only
@@ -30,6 +33,7 @@ pub const MJPEG_COPY: Profile = Profile {
     hardware: false,
     lossless_bits: 8,
     args: &["-c:v", "copy"],
+    container: "mkv",
 };
 
 pub const PROFILES: &[Profile] = &[
@@ -41,6 +45,7 @@ pub const PROFILES: &[Profile] = &[
         hardware: true,
         lossless_bits: 0,
         args: &["-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "lossless"],
+        container: "mkv",
     },
     Profile {
         id: "hevc_qsv",
@@ -48,6 +53,7 @@ pub const PROFILES: &[Profile] = &[
         hardware: true,
         lossless_bits: 0,
         args: &["-c:v", "hevc_qsv", "-preset", "veryslow", "-global_quality", "12"],
+        container: "mkv",
     },
     Profile {
         id: "hevc_amf",
@@ -55,6 +61,7 @@ pub const PROFILES: &[Profile] = &[
         hardware: true,
         lossless_bits: 0,
         args: &["-c:v", "hevc_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "10", "-qp_p", "10"],
+        container: "mkv",
     },
     Profile {
         id: "hevc_videotoolbox",
@@ -62,6 +69,7 @@ pub const PROFILES: &[Profile] = &[
         hardware: true,
         lossless_bits: 0,
         args: &["-c:v", "hevc_videotoolbox", "-b:v", "200M", "-allow_sw", "0"],
+        container: "mkv",
     },
     // Fast, but bit-exact only for 8 bit (higher depths are converted).
     Profile {
@@ -70,6 +78,7 @@ pub const PROFILES: &[Profile] = &[
         hardware: false,
         lossless_bits: 8,
         args: &["-c:v", "ffvhuff", "-pred", "median"],
+        container: "mkv",
     },
     Profile {
         id: "ffv1",
@@ -77,6 +86,17 @@ pub const PROFILES: &[Profile] = &[
         hardware: false,
         lossless_bits: 16,
         args: &["-c:v", "ffv1", "-level", "3", "-g", "1", "-slices", "16", "-slicecrc", "1"],
+        container: "mkv",
+    },
+    // No compression: almost no CPU, but disk speed must keep up
+    // (1920x1080 16-bit @ 155 fps ≈ 640 MB/s).
+    Profile {
+        id: "raw",
+        label: "Tömörítetlen (NUT, minimális CPU, sok tárhely)",
+        hardware: false,
+        lossless_bits: 16,
+        args: &["-c:v", "rawvideo"],
+        container: "nut",
     },
 ];
 

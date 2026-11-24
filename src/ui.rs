@@ -9,6 +9,7 @@ use eframe::egui;
 
 use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
+use crate::recorder::RecStats;
 use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
 use crate::scenario::{self, Device, Scenario};
@@ -39,6 +40,10 @@ pub struct App {
     extra_json: String,
     rec_name: String,
     recording: Option<(RecordingInfo, Instant)>,
+    /// Running recording test (settings page) and its last result.
+    test: Option<RecTest>,
+    test_secs: f64,
+    test_result: Option<(bool, String)>,
     message: String,
     texture: Option<egui::TextureHandle>,
     lut_dir: PathBuf,
@@ -76,6 +81,9 @@ impl App {
             page: Page::Main,
             rec_name: String::new(),
             recording: None,
+            test: None,
+            test_secs: 10.0,
+            test_result: None,
             message: String::new(),
             texture: None,
             lut_dir,
@@ -246,7 +254,7 @@ impl App {
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
-        let recording = self.recording.is_some();
+        let recording = self.recording.is_some() || self.test.is_some();
         egui::Panel::left("scenario_list").resizable(false).show(ui, |ui| {
             ui.heading("Szcenáriók");
             let mut pick = None;
@@ -373,11 +381,75 @@ impl App {
                     self.reload();
                 }
             });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Felvételi teszt")
+                    .on_hover_text("Rögzít a megadott ideig, ellenőrzi, hogy nem veszett-e el képkocka, és hogy a kódoló bírja-e a tempót. A tesztfájlokat utána törli.")
+                    .clicked()
+                    && let Some(s) = self.edited()
+                {
+                    self.start_test(&s);
+                }
+                ui.add(egui::DragValue::new(&mut self.test_secs).range(2.0..=600.0).suffix(" s"));
+            });
         });
+        if let Some(t) = &self.test {
+            ui.label(format!("Felvételi teszt fut… {:.0} s", t.started.elapsed().as_secs_f64()));
+        }
+        if let Some((ok, text)) = &self.test_result {
+            let color = if *ok { egui::Color32::from_rgb(40, 160, 70) } else { egui::Color32::from_rgb(200, 60, 50) };
+            ui.colored_label(color, text);
+        }
 
         self.status_line(ui);
         ui.separator();
         self.preview(ui);
+    }
+
+    fn start_test(&mut self, s: &Scenario) {
+        self.test_result = None;
+        if let Err(e) = self.engine.apply(s) {
+            self.test_result = Some((false, format!("A szcenárió nem indul: {e}")));
+            return;
+        }
+        let st = self.engine.stats();
+        let lost_before = st.lost_at_camera.load(Relaxed);
+        let name = chrono::Local::now().format("_teszt_%Y%m%d_%H%M%S").to_string();
+        match self.engine.start_recording(&name) {
+            Ok(info) => {
+                let c = &s.camera;
+                self.test = Some(RecTest {
+                    info,
+                    started: Instant::now(),
+                    stopped: None,
+                    secs: self.test_secs,
+                    lost_before,
+                    frame_bytes: Frame::byte_size(c.width, c.height, c.pixel_format),
+                })
+            }
+            Err(e) => self.test_result = Some((false, format!("A felvétel nem indul: {e}"))),
+        }
+    }
+
+    /// Advance the recording test: stop after its time, evaluate once the
+    /// files are complete, then delete them.
+    fn poll_test(&mut self) {
+        let Some(t) = &mut self.test else { return };
+        if t.stopped.is_none() && t.started.elapsed().as_secs_f64() >= t.secs {
+            self.engine.stop_recording();
+            t.stopped = Some(Instant::now());
+        }
+        let Some(stopped) = t.stopped else { return };
+        if !t.info.stats.finished.load(Relaxed) {
+            return;
+        }
+        let t = self.test.take().unwrap();
+        let st = &t.info.stats;
+        let lost = self.engine.stats().lost_at_camera.load(Relaxed) - t.lost_before;
+        self.test_result = Some(evaluate(&t, st, lost, stopped.elapsed().as_secs_f64(), self.engine.camera_errors()));
+        let _ = std::fs::remove_file(&t.info.video);
+        let _ = std::fs::remove_file(&t.info.csv);
     }
 
     /// The edited scenario with the extra-features JSON parsed in.
@@ -407,6 +479,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.update_preview(&ctx);
+        self.poll_test();
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.page, Page::Main, "Főoldal");
@@ -423,6 +496,47 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.engine.finish_recording();
     }
+}
+
+struct RecTest {
+    info: RecordingInfo,
+    started: Instant,
+    stopped: Option<Instant>,
+    secs: f64,
+    lost_before: u64,
+    frame_bytes: usize,
+}
+
+/// Verdict of a recording test. `finish_s`: time from stop until the files
+/// were complete (how far the encoder was behind).
+fn evaluate(t: &RecTest, st: &RecStats, lost: u64, finish_s: f64, camera_errors: u64) -> (bool, String) {
+    let written = st.written.load(Relaxed);
+    let dropped = st.dropped.load(Relaxed);
+    let frames = st.queued.load(Relaxed) + dropped;
+    let cam_fps = frames as f64 / t.secs;
+    let enc_fps = written as f64 / (t.secs + finish_s);
+    let encoder = st.encoder.lock().unwrap().unwrap_or("-");
+    let mut text = format!(
+        "{frames} kocka ({cam_fps:.1} fps), elveszett a kameránál: {lost}, hibás: {camera_errors}, eldobva: {dropped}, \
+         kódoló ({encoder}): ~{enc_fps:.0} fps, lezárás a leállítás után: {finish_s:.1} s"
+    );
+    if let Some(e) = st.error.lock().unwrap().as_ref() {
+        return (false, format!("HIBA: {e}\n{text}"));
+    }
+    if dropped > 0 || lost > 0 || camera_errors > 0 {
+        return (false, format!("NEM JÓ: képkockák vesztek el.\n{text}"));
+    }
+    // No loss, but an encoder slower than the camera only lasts until the
+    // queue is full.
+    if finish_s > 1.0 && enc_fps < cam_fps {
+        let queue = (crate::recorder::QUEUE_BUDGET_BYTES / t.frame_bytes.max(1)) as f64;
+        let lasts = queue / (cam_fps - enc_fps);
+        text = format!(
+            "RÖVID FELVÉTELHEZ JÓ: a kódoló lassabb a kameránál, kb. {lasts:.0} s felvétel után veszne el képkocka.\n{text}"
+        );
+        return (false, text);
+    }
+    (true, format!("OK: nem veszett el képkocka, a kódoló bírja a tempót.\n{text}"))
 }
 
 fn extra_to_json(s: &Scenario) -> String {
