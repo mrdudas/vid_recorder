@@ -18,6 +18,17 @@ pub struct Mode {
     pub fps: f64,
 }
 
+/// Image geometry the camera allows, read at every `apply`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Geometry {
+    /// Full sensor (largest image) for the applied pixel format.
+    pub sensor: (u32, u32),
+    /// Smallest width and height.
+    pub min_size: (u32, u32),
+    /// Steps of Width, Height, OffsetX and OffsetY.
+    pub step: [u32; 4],
+}
+
 /// What the camera allows, read from it in well under a second instead of
 /// trying settings one by one.
 #[derive(Clone, Debug)]
@@ -61,10 +72,17 @@ pub trait Camera: Send {
     fn max_fps(&self) -> Option<f64> {
         None
     }
+    /// Geometry read at the last `apply`.
+    fn geometry(&self) -> Option<Geometry> {
+        None
+    }
     /// Frames the camera delivered broken or in an unusable format.
     fn errors(&self) -> u64 {
         0
     }
+    /// Restart the device (it reconnects as if replugged). For a camera
+    /// that is attached but sends nothing.
+    fn reset(&mut self) {}
     /// The device went away (unplugged); it has to be opened again.
     fn disconnected(&self) -> bool {
         false

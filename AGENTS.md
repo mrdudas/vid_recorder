@@ -12,6 +12,12 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - A kamerakezelés egy saját interfész mögött van, így a USB3 Vision réteg cserélhető.
   - **Képfrekvencia:** a kamera bármilyen értéket elfogad, de ha a szenzor vagy a USB nem bírja, csendben lassabb lesz, vagy eldobja a képeket. A program ezért elutasítja azt a beállítást, amely meghaladja a kamera `AcquisitionFrameRate` maximumát (ez függ a formátumtól, a mérettől és az expozíciótól) vagy a `DeviceLinkThroughputLimit`-et.
   - **USB:** mérés szerint (Alvium 1800 U-291c, 2026-11) a kapcsolat hibátlanul átviszi azt, amit a kamera 1080p-n maximálisan ad (kb. 406 MB/s). A képkockavesztés oka a processzorterhelés volt: amikor a kódoló leköti a CPU-t, a kamera olvasása lemarad. Ezért fut az ffmpeg alacsonyabb prioritással, és ezért FFVHuff az alapértelmezett kódoló.
+  - **Hibatűrés** (`Engine::poll`, az UI és a `record` parancs is hívja):
+    - ha a kamera leválik, 3 s-ig nem küld képet, vagy induláskor nincs meg, a program másodpercenként újranyitja;
+    - ha a kamera csatlakozik, de nem küld képet, előbb GenICam `DeviceReset`-et kap;
+    - **a futó felvétel nem áll le**, a kamera visszatérése után ugyanabban a fájlban folytatódik. A CSV `frameID` és `timestamp` értékei a kiesésen át folytatódnak, a hiányzó képkockák sorszám-ugrásként látszanak, és elveszettnek számítanak;
+    - a leállítás legfeljebb 2 s-ot vár egy beragadt kameraszálra.
+  - **Tesztelésnél tilos a USB-portot letiltani** (`usbN-portM/disable`): az Alvium ettől megakadt, és szoftveresen (vezérlő-újraindítással) sem jött vissza, csak kihúzással (2026-11-25). A kihúzást a felhasználónak kell kipróbálnia.
 - **UVC kamerák is használhatók** (webkamera, UVC-kompatibilis panelkamera) a `nokhwa` könyvtárral: Macen AVFoundation, Windowson Media Foundation, Linuxon V4L2.
   - Formátumok: MJPEG, YUYV, NV12, szürke (Mono8).
   - **Az MJPEG változatlanul kerül a fájlba**, nincs kicsomagolás és újrakódolás. A YUYV és az NV12 veszteségmentesen kódolódik.
@@ -49,7 +55,14 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - Élőképen ellenőrizhető, milyen képet ad a kamera az adott beállításokkal.
 - Minden beállítás elmenthető, **JSON** formátumban.
 - **Elrendezés:** az ablak maximalizálva indul. Bal oldalt a beállítások, jobb oldalt az élőkép, amely kitölti a rendelkezésre álló helyet.
-- **Kivágás (ROI):** az élőképen kihúzott téglalap lesz a kamera `Width/Height/OffsetX/OffsetY` értéke. A kamera lépésközeire kerekít, és azonnal kipróbálja. Kisebb magasság mellett nagyobb az elérhető fps. Az eltolás a tükrözés utáni képben értendő (SFNC).
+- **Kivágás (ROI):** az élőkép (a beállítóoldalon és a főoldalon is) mindig a teljes szenzort mutatja, és a kamera kivágott képe a helyén látszik. A kivágás egy sárga téglalap: belsejét húzva mozgatható, oldalait és sarkait húzva átméretezhető, mellette húzva új rajzolható. Elengedéskor a program a kamera lépésközeire kerekíti, legalább a kamera legkisebb képméretére (`WidthMin/HeightMin`) állítja, és azonnal kipróbálja. Kisebb magasság mellett nagyobb az elérhető fps. Az eltolás a tükrözés utáni képben értendő (SFNC).
+  - **Az Alvium 1800 U-291c kivágási szabályai** (mérve 2026-11-25, BayerRG8/10p/12p esetén azonosak):
+    - szélesség 8-cal osztható, legalább 8; magasság páros, legalább 8; mindkét eltolás 8-cal osztható;
+    - a használható terület tükrözés nélkül 1944×1472. `ReverseX` mellett 1936 a szélesség, `ReverseY` mellett 1470 a magasság (a Bayer-minta megtartásához egy oszlop- vagy sorpár kiesik);
+    - legnagyobb eltolás = (terület − méret), 8-ra lefelé kerekítve. A jobb és az alsó szélt ezért csak akkor éri el a kivágás, ha a különbség 8-cal osztható;
+    - ezen belül minden kombinációt elfogad (60 véletlen mintából 60). A program a vásznat és a határokat minden beállításkor a kamerától olvassa ki.
+  - **A tükrözés átállítása után a kamera néhány ms-ig még a régi határokkal dolgozik.** Ha azonnal utána a teljes magasságot írjuk, visszautasítja.
+  - **Ha az Alvium elutasít egy írást, vagy olyan funkciót olvasunk, amely nincs meg rajta (pl. `DecimationHorizontal`), utána minden írást elutasít (GenCp InvalidParameter), amíg újra meg nem nyitjuk.** Ezért a program írás előtt ellenőrzi az egész értékek tartományát és lépésközét (ez a kiolvasás a fenti várakozást is megoldja), I/O hiba után pedig újranyitja a kamerát. Az el nem fogadott kivágás helyett visszaáll az előzőre. Nem létező funkciót nem szabad olvasni.
 - **Határok felmérése:** felvétel nélkül, kb. 2–3 s alatt kiolvassa a kamerából a szenzorméretet, a lépésközöket, az expozíció- és erősítéstartományt, valamint a legnagyobb fps-t formátumonként és magasságonként (a USB-korláttal együtt). A beállítóoldal első megnyitásakor magától lefut. Parancssorból: `limits <szcenárió|u3v>`. A 12 bites és a többi formátum közti váltás az Alviumon kb. 1,5 s, ezért a formátumok csoportosítva futnak.
 - **Automatikus expozíció:** a szcenárió megadja, milyen tartományban állíthatja a kamera az expozíciót (`auto_exposure_range`, µs) és az erősítést (`auto_gain_range`, dB). A felső expozícióhatár legfeljebb a képkocka idejének 95%-a lehet. Az fps-t a program az alsó határnál ellenőrzi.
 - **Felvételi teszt:** a szerkesztett szcenáriót a megadott ideig rögzíti, és megmutatja, veszett-e el képkocka, illetve bírja-e a kódoló a tempót. A tesztfájlokat utána törli.
@@ -70,9 +83,11 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - Itt lehet kiválasztani a mentett szcenáriókat. **Szcenárióváltáskor a kamera azonnal átáll** az új beállításokra.
 - **Record Start** és **Record End** gomb.
 - Élőkép (max. 25 fps).
+- **Kivágás a főoldalon is**, ugyanúgy, mint a beállítóoldalon, de csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy „A szcenárió kivágása” gombig marad meg. Felvétel közben nem változtatható.
 
 ## Indítás és frissítés
 
+- **Fej nélküli felvétel** (pl. SSH-n): `record <szcenárió> [mp]`. Enterre vagy az idő leteltével áll le, és a fenti hibatűréssel fut.
 - **A programot az indítószkripttel indítjuk:** `./run.sh` (macOS/Linux) vagy `.\run.ps1` (Windows). Az argumentumokat továbbadja, pl. `./run.sh record-test 5`. Ha nincs hálózat, a frissítés nem sikerül, vagy helyi módosítás van, a meglévő verzió indul.
   - **Fejlesztő gép** (git-klón és telepített Rust): `git pull --ff-only`, fordítás, ha bármi változott, aztán indítás.
   - **Felhasználói gép** (kiadásból telepítve): ha a GitHub legújabb kiadása eltér a `VERSION` fájlban lévőtől, letölti és kicsomagolja a helyére. Nem kell Rust és fordítás. Az ffmpeg-et viszont telepíteni kell.

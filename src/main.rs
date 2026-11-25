@@ -30,6 +30,11 @@ usage:
   vid_recorder camera-test <scenario> [seconds=10]
                                record with a saved scenario (its camera)
                                and verify that no frame was lost
+  vid_recorder record <scenario> [seconds]
+                               record with a saved scenario until the time
+                               is up or Enter is pressed (no GUI, e.g. over
+                               ssh); waits for a missing camera and keeps
+                               recording across unplug / replug
   vid_recorder probe <scenario|sim|u3v> [seconds=5]
                                ask the camera which formats, sizes and max
                                frame rates it supports and record-test each
@@ -66,6 +71,7 @@ fn main() -> ExitCode {
             true
         }),
         Some("camera-test") => camera_test(&args[1..]),
+        Some("record") => record(&args[1..]),
         Some("probe") => probe_camera(&args[1..]),
         Some("limits") => limits(&args[1..]),
         Some("--version") => {
@@ -177,6 +183,68 @@ fn camera_test(args: &[String]) -> Result<bool, String> {
         .find(|s| &s.name == name)
         .ok_or_else(|| format!("scenario {name} not found in {}", scenario_dir().display()))?;
     run_and_verify(Engine::new(), &s, seconds)
+}
+
+fn record(args: &[String]) -> Result<bool, String> {
+    let name = args.first().ok_or("usage: record <scenario> [seconds]")?;
+    let seconds: Option<f64> = args.get(1).map(|s| s.parse()).transpose().map_err(|e| format!("seconds: {e}"))?;
+    let s = scenario_or_device(name)?;
+    let mut engine = Engine::new();
+    let wait = std::time::Instant::now();
+    if let Err(e) = engine.apply(&s) {
+        if !engine.waiting_for_camera() {
+            return Err(e);
+        }
+        eprintln!("no camera ({e}), waiting…");
+        while engine.waiting_for_camera() {
+            if let Some(m) = engine.poll() {
+                eprintln!("{m}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        engine.scenario.as_ref().ok_or("camera did not start")?;
+        eprintln!("camera found after {:.0} s", wait.elapsed().as_secs_f64());
+    }
+    let rec = chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string();
+    let info = engine.start_recording(&rec)?;
+    eprintln!("camera: {}\nrecording {} ({})", engine.camera_name(), info.video, seconds.map_or("Enter stops".into(), |s| format!("{s} s")));
+    let (tx, rx) = std::sync::mpsc::channel();
+    if seconds.is_none() {
+        std::thread::spawn(move || {
+            let _ = std::io::stdin().read_line(&mut String::new());
+            let _ = tx.send(());
+        });
+    }
+    let start = std::time::Instant::now();
+    let mut report = std::time::Instant::now();
+    while seconds.is_none_or(|s| start.elapsed().as_secs_f64() < s) && !matches!(rx.try_recv(), Ok(())) && engine.is_recording() {
+        if let Some(m) = engine.poll() {
+            eprintln!("{:.1} s: {m}", start.elapsed().as_secs_f64());
+        }
+        if report.elapsed() >= Duration::from_secs(5) {
+            report = std::time::Instant::now();
+            let st = &info.stats;
+            eprintln!(
+                "{:.0} s: written {} · queued {} · lost at camera {}{}",
+                start.elapsed().as_secs_f64(),
+                st.written.load(Relaxed),
+                st.queued.load(Relaxed) - st.written.load(Relaxed),
+                engine.stats().lost_at_camera.load(Relaxed),
+                if engine.waiting_for_camera() { " · WAITING FOR CAMERA" } else { "" }
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    engine.finish_recording();
+    let st = &info.stats;
+    println!("video               {}", info.video);
+    println!("written             {}", st.written.load(Relaxed));
+    println!("dropped (queue)     {}", st.dropped.load(Relaxed));
+    println!("lost at camera      {}", engine.stats().lost_at_camera.load(Relaxed));
+    if let Some(e) = st.error.lock().unwrap().as_ref() {
+        println!("error               {e}");
+    }
+    Ok(st.error.lock().unwrap().is_none())
 }
 
 /// Scenario by name, or the defaults for "sim" / "u3v".

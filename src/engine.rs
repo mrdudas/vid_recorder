@@ -4,13 +4,19 @@
 //! the preview slot if 40 ms passed since the last copy (max 25 fps), then
 //! moved to the recorder if recording. Nothing there waits on the UI, the
 //! encoder or the disk.
+//!
+//! Fault tolerance ([`Engine::poll`]): a camera that is unplugged, stops
+//! sending frames or is missing when a scenario starts is reopened every
+//! second. A running recording is not stopped: it continues in the same
+//! file once the camera is back, with frame ids and timestamps continued
+//! across the gap (the missing frames show as an id jump and count as lost).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::camera::{self, Camera, Limits, Mode};
+use crate::camera::{self, Camera, Geometry, Limits, Mode};
 use crate::frame::{BufferPool, Frame};
 use crate::recorder::{RecStats, Recorder};
 use crate::scenario::{Device, Scenario};
@@ -24,9 +30,21 @@ pub struct Stats {
     pub lost_at_camera: AtomicU64,
 }
 
+/// Last frame passed on, so ids and timestamps continue after a reconnect.
+#[derive(Default)]
+struct Continuity {
+    last: Option<(u64, u64, Instant)>,
+    /// Set by a reconnect: shift the next frames to follow `last`.
+    rebase: bool,
+    /// Added (wrapping) to the camera's ids and timestamps.
+    id_offset: u64,
+    ts_offset: u64,
+}
+
 struct Shared {
     pool: BufferPool,
     stats: Stats,
+    continuity: Mutex<Continuity>,
     preview: Mutex<Option<Frame>>,
     recorder: Mutex<Option<Recorder>>,
 }
@@ -38,6 +56,12 @@ pub struct Engine {
     pub scenario: Option<Scenario>,
     /// Recordings stopped but still being finalized.
     finishing: Vec<Recorder>,
+    /// Scenario to get (back) to while the camera is missing, and the last try.
+    lost: Option<(Scenario, Instant)>,
+    /// Frame count and when it last changed (stall detection).
+    last_received: (u64, Instant),
+    /// Last reconnect error, logged only when it changes.
+    last_error: String,
 }
 
 pub struct RecordingInfo {
@@ -53,11 +77,15 @@ impl Engine {
             shared: Arc::new(Shared {
                 pool: BufferPool::default(),
                 stats: Stats::default(),
+                continuity: Mutex::new(Continuity::default()),
                 preview: Mutex::new(None),
                 recorder: Mutex::new(None),
             }),
             scenario: None,
             finishing: Vec::new(),
+            lost: None,
+            last_received: (0, Instant::now()),
+            last_error: String::new(),
         }
     }
 
@@ -69,17 +97,86 @@ impl Engine {
         self.camera.as_ref().map_or(0, |(_, c)| c.errors())
     }
 
-    /// The camera was unplugged (see [`Engine::reconnect`]).
-    pub fn camera_lost(&self) -> bool {
-        self.camera.as_ref().is_some_and(|(_, c)| c.disconnected())
+    /// Not opened, or the open device went away.
+    fn camera_gone(&self) -> bool {
+        self.camera.as_ref().is_none_or(|(_, c)| c.disconnected())
     }
 
-    /// Close the camera and open it again with the scenario's settings, e.g.
-    /// after it was unplugged and plugged back in.
-    pub fn reconnect(&mut self, s: &Scenario) -> Result<(), String> {
+    /// Waiting for the camera to come back (see [`Engine::poll`]).
+    pub fn waiting_for_camera(&self) -> bool {
+        self.lost.is_some()
+    }
+
+    /// Call regularly (UI frame, CLI loop). Notices a camera that is gone
+    /// or sends no frames, reopens it once a second, and returns a message
+    /// when something changed. A recording keeps running meanwhile.
+    pub fn poll(&mut self) -> Option<String> {
+        if self.lost.is_none() {
+            let s = self.scenario.as_ref()?;
+            let n = self.shared.stats.received.load(Relaxed);
+            if n != self.last_received.0 {
+                self.last_received = (n, Instant::now());
+            }
+            let unplugged = self.camera.as_ref().is_some_and(|(_, c)| c.disconnected());
+            // No frame for 3 s (or 3 frame times): hung camera or USB.
+            // Not with a hardware trigger, where frames may pause.
+            let c = &s.camera;
+            let frame_time = 1.0 / c.frame_rate + if c.auto_exposure { 0.0 } else { c.exposure_us / 1e6 };
+            let triggered = c.extra.get("TriggerMode").is_some_and(|v| v == "On");
+            let stalled = !triggered && self.last_received.1.elapsed().as_secs_f64() > (3.0 * frame_time).max(3.0);
+            if !unplugged && !stalled {
+                return None;
+            }
+            let s = s.clone();
+            if stalled && !unplugged {
+                // Attached but silent: restart it; it comes back as if replugged.
+                if let Some((_, cam)) = self.camera.as_mut() {
+                    cam.reset();
+                }
+                self.camera = None;
+            }
+            self.lost = Some((s, Instant::now() - Duration::from_secs(1)));
+            let why = if unplugged { "levált" } else { "nem küld képet" };
+            let rec = if self.is_recording() { " A felvétel folytatódik, amint visszajön." } else { "" };
+            eprintln!("camera {why}, reconnecting");
+            return Some(format!("A kamera {why}. Újracsatlakozás…{rec}"));
+        }
+        let (s, last) = self.lost.as_ref().unwrap();
+        if last.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
+        let s = s.clone();
+        let since = self.shared.continuity.lock().unwrap().last.map(|(_, _, t)| t.elapsed().as_secs_f64());
+        // Close the old handle first (frees the device), then reopen.
         self.scenario = None;
         self.camera = None;
-        self.apply(s)
+        match self.start(&s, true) {
+            Ok(()) => {
+                self.lost = None;
+                self.last_error.clear();
+                eprintln!("camera back");
+                Some(match since {
+                    Some(gap) if self.is_recording() => {
+                        format!("A kamera újra csatlakozott {gap:.1} s kiesés után, a felvétel folytatódik. Szcenárió: {}", s.name)
+                    }
+                    _ => format!("A kamera csatlakozott. Szcenárió aktív: {}", s.name),
+                })
+            }
+            // Opened but the settings fail: retrying will not help.
+            Err(e) if !self.camera_gone() => {
+                self.lost = None;
+                self.stop_recording();
+                Some(format!("Hiba visszacsatlakozáskor: {e}. A felvétel leállt."))
+            }
+            Err(e) => {
+                if e != self.last_error {
+                    eprintln!("reconnect: {e}");
+                    self.last_error = e;
+                }
+                self.lost = Some((s, Instant::now()));
+                None
+            }
+        }
     }
 
     pub fn stats(&self) -> &Stats {
@@ -88,10 +185,23 @@ impl Engine {
 
     /// Switch to a scenario: open its camera if it is a different device,
     /// then stop, apply the settings and restart.
+    /// If the camera cannot be opened, [`Engine::poll`] keeps trying.
     pub fn apply(&mut self, s: &Scenario) -> Result<(), String> {
         if self.is_recording() {
             return Err("cannot change scenario while recording".into());
         }
+        self.lost = None;
+        *self.shared.continuity.lock().unwrap() = Continuity::default();
+        let r = self.start(s, false);
+        if r.is_err() && self.camera_gone() && s.device != Device::Sim {
+            self.lost = Some((s.clone(), Instant::now()));
+        }
+        r
+    }
+
+    /// Open (if needed), configure and start the camera. `rebase`: the
+    /// frames continue the previous ones (reconnect).
+    fn start(&mut self, s: &Scenario, rebase: bool) -> Result<(), String> {
         self.scenario = None;
         if let Some((_, cam)) = self.camera.as_mut() {
             cam.stop();
@@ -101,21 +211,48 @@ impl Engine {
             self.camera = Some((s.device.clone(), camera::open(&s.device)?));
         }
         let cam = &mut self.camera.as_mut().unwrap().1;
-        cam.apply(&s.camera)?;
+        if let Err(e) = cam.apply(&s.camera) {
+            // A camera that refused a write may refuse all further ones
+            // (Alvium): reopen it on the next apply.
+            if e.contains("I/O error") {
+                self.camera = None;
+            }
+            return Err(e);
+        }
         let shared = self.shared.clone();
-        shared.stats.received.store(0, Relaxed);
-        shared.stats.lost_at_camera.store(0, Relaxed);
-        let mut last_id: Option<u64> = None;
+        if rebase {
+            shared.continuity.lock().unwrap().rebase = true;
+        } else {
+            shared.stats.received.store(0, Relaxed);
+            shared.stats.lost_at_camera.store(0, Relaxed);
+        }
+        let fps = s.camera.frame_rate;
         let mut last_preview: Option<Instant> = None;
-        let sink = Box::new(move |frame: Frame| {
+        let sink = Box::new(move |mut frame: Frame| {
             let st = &shared.stats;
             st.received.fetch_add(1, Relaxed);
-            if let Some(prev) = last_id
-                && frame.id > prev + 1
             {
-                st.lost_at_camera.fetch_add(frame.id - prev - 1, Relaxed);
+                let mut c = shared.continuity.lock().unwrap();
+                if c.rebase {
+                    c.rebase = false;
+                    if let Some((id, ts, at)) = c.last {
+                        // Frames the camera would have sent during the gap.
+                        let gap = at.elapsed();
+                        let missing = ((gap.as_secs_f64() * fps).round() as u64).saturating_sub(1);
+                        c.id_offset = (id + 1 + missing).wrapping_sub(frame.id);
+                        c.ts_offset = (ts + gap.as_nanos() as u64).wrapping_sub(frame.timestamp_ns);
+                        eprintln!("continuing after {:.2} s, {missing} frames missing", gap.as_secs_f64());
+                    }
+                }
+                frame.id = frame.id.wrapping_add(c.id_offset);
+                frame.timestamp_ns = frame.timestamp_ns.wrapping_add(c.ts_offset);
+                if let Some((prev, _, _)) = c.last
+                    && frame.id > prev + 1
+                {
+                    st.lost_at_camera.fetch_add(frame.id - prev - 1, Relaxed);
+                }
+                c.last = Some((frame.id, frame.timestamp_ns, Instant::now()));
             }
-            last_id = Some(frame.id);
 
             if last_preview.is_none_or(|t| t.elapsed() >= PREVIEW_INTERVAL) {
                 last_preview = Some(Instant::now());
@@ -130,6 +267,7 @@ impl Engine {
         });
         cam.start(self.shared.pool.clone(), sink)?;
         self.scenario = Some(s.clone());
+        self.last_received = (self.shared.stats.received.load(Relaxed), Instant::now());
         Ok(())
     }
 
@@ -145,6 +283,11 @@ impl Engine {
         self.stopped_camera(s)?.limits(&s.camera)
     }
 
+    /// Sensor size, smallest size and steps of the active camera.
+    pub fn geometry(&self) -> Option<Geometry> {
+        self.camera.as_ref().and_then(|(_, c)| c.geometry())
+    }
+
     /// Highest frame rate the camera allows with the active settings.
     pub fn max_fps(&self) -> Option<f64> {
         self.camera.as_ref().and_then(|(_, c)| c.max_fps())
@@ -155,6 +298,7 @@ impl Engine {
             return Err("cannot probe while recording".into());
         }
         self.scenario = None;
+        self.lost = None;
         if let Some((_, cam)) = self.camera.as_mut() {
             cam.stop();
         }

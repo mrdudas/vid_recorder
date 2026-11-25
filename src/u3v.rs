@@ -10,7 +10,7 @@ use cameleon::genapi::{DefaultGenApiCtxt, ParamsCtxt};
 use cameleon::payload::PixelFormat as UPixelFormat;
 use cameleon::u3v::{self, ControlHandle, StreamHandle};
 
-use crate::camera::{Camera, FrameSink, Limits, Mode};
+use crate::camera::{Camera, FrameSink, Geometry, Limits, Mode};
 use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
@@ -31,6 +31,7 @@ pub struct U3vCamera {
     lost: Arc<AtomicBool>,
     /// Highest frame rate the camera allowed at the last `apply`.
     max_fps: Option<f64>,
+    geometry: Option<Geometry>,
 }
 
 /// "vendor model (serial)" for every connected USB3 Vision camera.
@@ -76,6 +77,26 @@ fn ensure_usbfs_limit() {
 #[cfg(not(target_os = "linux"))]
 fn ensure_usbfs_limit() {}
 
+/// Why an attached Allied Vision device (USB vendor 1ab2) is not usable:
+/// cameleon skips devices it cannot open without saying why.
+fn why_not_found() -> String {
+    let Ok(list) = rusb::DeviceList::new() else { return String::new() };
+    let mut out = String::new();
+    for d in list.iter() {
+        if d.device_descriptor().is_ok_and(|desc| desc.vendor_id() == 0x1ab2) {
+            let state = match d.open() {
+                Ok(h) => match h.active_configuration() {
+                    Ok(c) => format!("opens, configuration {c}"),
+                    Err(e) => format!("configuration: {e}"),
+                },
+                Err(e) => format!("cannot open: {e}"),
+            };
+            out += &format!(" (Allied Vision device on bus {} address {}: {state})", d.bus_number(), d.address());
+        }
+    }
+    out
+}
+
 fn describe(i: &cameleon::CameraInfo) -> String {
     format!("{} {} ({})", i.vendor_name, i.model_name, i.serial_number)
 }
@@ -85,7 +106,7 @@ impl U3vCamera {
     pub fn open_first() -> Result<U3vCamera, String> {
         let mut cams = u3v::enumerate_cameras().map_err(|e| format!("USB enumeration: {e}"))?;
         if cams.is_empty() {
-            return Err("no USB3 Vision camera found".into());
+            return Err(format!("no USB3 Vision camera found{}", why_not_found()));
         }
         ensure_usbfs_limit();
         let mut cam = cams.swap_remove(0);
@@ -110,6 +131,7 @@ impl U3vCamera {
             stream_errors: Arc::new(AtomicU64::new(0)),
             lost: Arc::new(AtomicBool::new(false)),
             max_fps: None,
+            geometry: None,
         })
     }
 }
@@ -131,6 +153,7 @@ impl Camera for U3vCamera {
         // Offsets first to 0 so any width/height fits, then the real offsets.
         set_int(&mut p, "OffsetX", 0)?;
         set_int(&mut p, "OffsetY", 0)?;
+        self.geometry = geometry(&mut p).ok();
         set_int(&mut p, "Width", s.width as i64)?;
         set_int(&mut p, "Height", s.height as i64)?;
         set_int(&mut p, "OffsetX", s.offset_x as i64)?;
@@ -196,6 +219,10 @@ impl Camera for U3vCamera {
         self.max_fps
     }
 
+    fn geometry(&self) -> Option<Geometry> {
+        self.geometry
+    }
+
     /// Only register reads and cheap writes, no streaming: the whole table
     /// takes about a second.
     fn limits(&mut self, s: &CameraSettings) -> Result<Limits, String> {
@@ -234,15 +261,12 @@ impl Camera for U3vCamera {
         // Geometry of the scenario's format (others are the same on the
         // Alvium, but the table re-reads the maximum per format).
         set_enum(p, "PixelFormat", s.pixel_format.name())?;
+        // Mirroring takes a column / row pair off the usable area.
+        set_bool(p, "ReverseX", s.reverse_x)?;
+        set_bool(p, "ReverseY", s.reverse_y)?;
         set_int(p, "OffsetX", 0)?;
         set_int(p, "OffsetY", 0)?;
-        let inc = |p: &mut Params, name| {
-            p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.inc(p).ok().flatten()).unwrap_or(1).max(1) as u32
-        };
-        let int_min = |p: &mut Params, name| p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.min(p).ok()).unwrap_or(1) as u32;
-        let sensor = (int_max(p, "Width")? as u32, int_max(p, "Height")? as u32);
-        let min_size = (int_min(p, "Width"), int_min(p, "Height"));
-        let step = [inc(p, "Width"), inc(p, "Height"), inc(p, "OffsetX"), inc(p, "OffsetY")];
+        let Geometry { sensor, min_size, step } = geometry(p)?;
 
         let fps_at = |p: &mut Params, f: PixelFormat, w: u32, h: u32| -> Option<f64> {
             set_int(p, "Width", w as i64).ok()?;
@@ -351,6 +375,10 @@ impl Camera for U3vCamera {
                             continue;
                         }
                     };
+                    // Stopped (or given up on) while waiting: pass nothing on.
+                    if !running.load(Relaxed) {
+                        break;
+                    }
                     let frame = payload.image_info().zip(payload.image()).and_then(|(info, image)| {
                         let format = map_format(&info.pixel_format)?;
                         let data = if format.is_packed() {
@@ -395,22 +423,40 @@ impl Camera for U3vCamera {
         self.lost.load(Relaxed)
     }
 
+    fn reset(&mut self) {
+        self.stop();
+        let Ok(mut p) = self.cam.params_ctxt() else { return };
+        match p.node("DeviceReset").and_then(|n| n.as_command(&p)) {
+            Some(c) => match c.execute(&mut p) {
+                Ok(()) => eprintln!("camera reset sent"),
+                Err(e) => eprintln!("camera reset: {e}"),
+            },
+            None => eprintln!("camera has no DeviceReset"),
+        }
+    }
+
     fn stop(&mut self) {
         if !self.running.swap(false, Relaxed) {
             return;
         }
-        if self.disconnected() {
-            // Nothing to tell a device that is gone; just end the thread.
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-            return;
-        }
-        if let Err(e) = self.cam.stop_streaming() {
+        // Nothing to tell a device that is gone.
+        if !self.disconnected()
+            && let Err(e) = self.cam.stop_streaming()
+        {
             eprintln!("stop streaming: {e}");
         }
+        // A thread stuck on a hung device must not hang us: wait at most
+        // 2 s, then leave it (it passes nothing on once it wakes up).
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !t.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                eprintln!("warning: camera stream thread did not stop, left behind");
+            }
         }
     }
 }
@@ -494,7 +540,28 @@ fn missing(name: &str, kind: &str) -> String {
 
 fn set_int(p: &mut Params, name: &str, v: i64) -> Result<(), String> {
     let node = p.node(name).and_then(|n| n.as_integer(p)).ok_or_else(|| missing(name, "integer"))?;
+    // Check the range first: after a write it rejects, the Alvium refuses
+    // every further write until it is reopened.
+    if let (Ok(min), Ok(max)) = (node.min(p), node.max(p)) {
+        let inc = node.inc(p).ok().flatten().unwrap_or(1).max(1);
+        if v < min || v > max || (v - min) % inc != 0 {
+            return Err(format!("{name} = {v}: a kamera {min}..{max} értéket fogad el, {inc} lépésközzel"));
+        }
+    }
     node.set_value(p, v).map_err(|e| format!("{name} = {v}: {e}"))
+}
+
+/// Sensor size, smallest size and steps; the offsets must be 0.
+fn geometry(p: &mut Params) -> Result<Geometry, String> {
+    let inc = |p: &mut Params, name| {
+        p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.inc(p).ok().flatten()).unwrap_or(1).max(1) as u32
+    };
+    let int_min = |p: &mut Params, name| p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.min(p).ok()).unwrap_or(1) as u32;
+    Ok(Geometry {
+        sensor: (int_max(p, "Width")? as u32, int_max(p, "Height")? as u32),
+        min_size: (int_min(p, "Width"), int_min(p, "Height")),
+        step: [inc(p, "Width"), inc(p, "Height"), inc(p, "OffsetX"), inc(p, "OffsetY")],
+    })
 }
 
 fn int_max(p: &mut Params, name: &str) -> Result<i64, String> {

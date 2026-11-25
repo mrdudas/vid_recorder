@@ -3,11 +3,11 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use eframe::egui;
 
-use crate::camera::Limits;
+use crate::camera::{Geometry, Limits};
 use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
 use crate::probe::{self, Level, Verdict};
@@ -26,7 +26,7 @@ struct PreviewLut {
 /// Preview images are downscaled to at most this width.
 const PREVIEW_MAX_WIDTH: usize = 960;
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Page {
     Main,
     Settings,
@@ -108,17 +108,37 @@ pub struct App {
     wb_gains: [f32; 3],
     /// Smoothed auto-levels black and white points (0..1) for the preview.
     levels: (f32, f32),
-    /// Scenario to reopen while its camera is unplugged, and the last try.
-    reconnect: Option<(Scenario, Instant)>,
     /// Camera limits for the device they were read from (or why not).
     limits: Option<(Device, Result<Limits, String>)>,
     /// Read the limits on the next frame (after the message is shown).
     limits_pending: bool,
+    /// Geometry of the camera last applied (kept while it is away).
+    geometry: Option<(Device, Geometry)>,
     /// Size of the last preview frame (camera pixels).
     frame_size: (u32, u32),
-    /// Crop selection being dragged on the preview: start, in camera pixels.
-    crop_start: Option<egui::Pos2>,
+    /// Its crop offset on the sensor.
+    frame_pos: (u32, u32),
+    /// Crop selection being dragged on the preview.
+    crop_drag: Option<CropDrag>,
     rec: RecPage,
+}
+
+/// Edges of the crop selection held by the mouse (all four: moving it).
+#[derive(Clone, Copy)]
+struct Grab {
+    l: bool,
+    r: bool,
+    t: bool,
+    b: bool,
+}
+
+/// A crop selection being dragged, in sensor pixels.
+struct CropDrag {
+    /// `None`: a new selection drawn from `from`.
+    grab: Option<Grab>,
+    from: egui::Pos2,
+    start: egui::Rect,
+    sel: egui::Rect,
 }
 
 /// USB3 Vision (if one is connected), every UVC camera, and the simulator.
@@ -163,11 +183,12 @@ impl App {
             devices: find_devices(),
             wb_gains: [1.0; 3],
             levels: (0.0, 1.0),
-            reconnect: None,
             limits: None,
             limits_pending: false,
+            geometry: None,
             frame_size: (0, 0),
-            crop_start: None,
+            frame_pos: (0, 0),
+            crop_drag: None,
             rec: RecPage::default(),
         };
         let first = app.scenarios[0].clone();
@@ -178,40 +199,21 @@ impl App {
     fn apply(&mut self, s: &Scenario) {
         self.message = match self.engine.apply(s) {
             Ok(()) => format!("Szcenárió aktív: {}", s.name),
+            Err(e) if self.engine.waiting_for_camera() => format!("Nincs kamera ({e}). Várakozás a csatlakozásra…"),
             Err(e) => format!("Hiba: {e}"),
         };
     }
 
-    /// Notice an unplugged camera: end a running recording (it keeps every
-    /// frame received so far) and retry opening the camera once a second.
+    /// Unplugged, hung or missing camera: the engine reopens it and keeps
+    /// a running recording going; show what happened.
     fn watch_camera(&mut self) {
-        if self.engine.camera_lost() && self.reconnect.is_none() {
-            let Some(s) = self.engine.scenario.clone() else { return };
-            self.message = "A kamera levált. Újracsatlakozás…".into();
-            if self.recording.is_some() {
-                self.engine.stop_recording();
-                if let Some((info, _)) = self.recording.take() {
-                    self.message = format!(
-                        "A kamera levált, a felvétel leállt: {} – {} képkocka. Újracsatlakozás…",
-                        info.video,
-                        info.stats.queued.load(Relaxed)
-                    );
-                }
-                self.rec_name.clear();
-            }
-            self.reconnect = Some((s, Instant::now()));
+        if let Some(m) = self.engine.poll() {
+            self.message = m;
         }
-        if let Some((s, last)) = &self.reconnect
-            && last.elapsed() >= Duration::from_secs(1)
-        {
-            let s = s.clone();
-            match self.engine.reconnect(&s) {
-                Ok(()) => {
-                    self.reconnect = None;
-                    self.message = format!("A kamera újra csatlakozott. Szcenárió aktív: {}", s.name);
-                }
-                Err(_) => self.reconnect = Some((s, Instant::now())),
-            }
+        // Gave up (settings fail after reconnect) and stopped the recording.
+        if self.recording.is_some() && !self.engine.is_recording() {
+            self.recording = None;
+            self.rec_name.clear();
         }
     }
 
@@ -245,8 +247,14 @@ impl App {
 
     fn update_preview(&mut self, ctx: &egui::Context) {
         self.sync_lut();
+        if let (Some(g), Some(s)) = (self.engine.geometry(), &self.engine.scenario) {
+            self.geometry = Some((s.device.clone(), g));
+        }
         if let Some(frame) = self.engine.take_preview() {
             self.frame_size = (frame.width, frame.height);
+            if let Some(s) = &self.engine.scenario {
+                self.frame_pos = (s.camera.offset_x, s.camera.offset_y);
+            }
             let view = self.engine.scenario.as_ref().map(|s| s.view.clone()).unwrap_or_default();
             let wb = view.auto_white_balance.then_some(self.wb_gains);
             let levels = view.auto_levels.then_some(self.levels);
@@ -301,68 +309,208 @@ impl App {
         ui.small("Csak az élőképre hat, a felvétel nyers marad.");
     }
 
-    /// The preview scaled to fill the available space. With `crop`, a
-    /// rectangle dragged on it becomes the camera's crop (see `crop_to`).
-    fn preview(&mut self, ui: &mut egui::Ui, crop: bool) {
+    /// The preview scaled to fill the available space. With `sensor_view`
+    /// the canvas is the whole sensor, the (possibly cropped) frame sits at
+    /// its offset, and the edited crop is drawn on it; with `crop` the
+    /// selection can be moved, resized by its edges and corners, or drawn
+    /// anew (see `crop_to`).
+    fn preview(&mut self, ui: &mut egui::Ui, sensor_view: bool, crop: bool) {
         let Some(t) = &self.texture else {
             ui.label("Nincs kép.");
             return;
         };
+        let (tex, ts) = (t.id(), t.size_vec2());
         let area = ui.available_rect_before_wrap();
-        let ts = t.size_vec2();
-        let scale = (area.width() / ts.x).min(area.height() / ts.y).max(0.01);
-        let rect = egui::Rect::from_center_size(area.center(), ts * scale);
-        let sense = if crop { egui::Sense::drag() } else { egui::Sense::hover() };
-        let resp = ui.allocate_rect(rect, sense);
+        let fs = egui::vec2(self.frame_size.0 as f32, self.frame_size.1 as f32);
+        let geo = self.geometry();
+        let sensor_view = sensor_view && fs.x > 0.0 && geo.is_some();
+        // Canvas size and where the frame lies on it, in camera pixels: the
+        // sensor stays the canvas even while the camera is not running.
+        let (canvas, img) = match geo {
+            Some(g) if sensor_view => {
+                let off = egui::pos2(self.frame_pos.0 as f32, self.frame_pos.1 as f32);
+                let sensor = egui::vec2(g.sensor.0 as f32, g.sensor.1 as f32);
+                (sensor, egui::Rect::from_min_size(off, fs).intersect(egui::Rect::from_min_size(egui::Pos2::ZERO, sensor)))
+            }
+            _ => (ts, egui::Rect::from_min_size(egui::Pos2::ZERO, ts)),
+        };
+        let scale = (area.width() / canvas.x).min(area.height() / canvas.y).max(1e-4);
+        let rect = egui::Rect::from_center_size(area.center(), canvas * scale);
+        let to_screen = |p: egui::Pos2| rect.min + p.to_vec2() * scale;
+        let to_cam = |p: egui::Pos2| ((p - rect.min) / scale).to_pos2().clamp(egui::Pos2::ZERO, canvas.to_pos2());
+        let resp = ui.allocate_rect(rect, if crop { egui::Sense::drag() } else { egui::Sense::hover() });
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
-        if !crop || self.frame_size.0 == 0 {
+        painter.image(tex, egui::Rect::from_min_max(to_screen(img.min), to_screen(img.max)), uv, egui::Color32::WHITE);
+        if !sensor_view {
             return;
         }
-        // Screen <-> camera pixels of the shown frame.
-        let fs = egui::vec2(self.frame_size.0 as f32, self.frame_size.1 as f32);
-        let to_cam = |p: egui::Pos2| ((p - rect.min) / rect.size() * fs).to_pos2().clamp(egui::Pos2::ZERO, fs.to_pos2());
-        let to_screen = |p: egui::Pos2| rect.min + p.to_vec2() / fs * rect.size();
-        let resp = resp.on_hover_text("Húzással kijelölt terület: a kamera csak ezt olvassa ki (kisebb magasság = több fps).");
-        if resp.drag_started() {
-            self.crop_start = resp.interact_pointer_pos().map(to_cam);
+
+        // The selection: the edited scenario's crop, or the one being dragged.
+        let c = match (self.page, &self.engine.scenario) {
+            (Page::Main, Some(a)) => &a.camera,
+            _ => &self.edit.camera,
+        };
+        let roi = egui::Rect::from_min_size(
+            egui::pos2(c.offset_x as f32, c.offset_y as f32),
+            egui::vec2(c.width as f32, c.height as f32),
+        )
+        .intersect(egui::Rect::from_min_size(egui::Pos2::ZERO, canvas));
+        let sel = self.crop_drag.as_ref().map_or(roi, |d| d.sel);
+        let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+        let shade = egui::Color32::from_black_alpha(150);
+        for r in [
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, s.min.y)),
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, s.max.y), rect.max),
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, s.min.y), egui::pos2(s.min.x, s.max.y)),
+            egui::Rect::from_min_max(egui::pos2(s.max.x, s.min.y), egui::pos2(rect.max.x, s.max.y)),
+        ] {
+            painter.rect_filled(r, 0.0, shade);
         }
-        if let (Some(a), Some(b)) = (self.crop_start, resp.interact_pointer_pos().map(to_cam)) {
-            let sel = egui::Rect::from_two_pos(to_screen(a), to_screen(b));
-            ui.painter().rect_stroke(sel, 0.0, (2.0, egui::Color32::YELLOW), egui::StrokeKind::Middle);
-            if resp.drag_stopped() {
-                self.crop_start = None;
-                self.crop_to(egui::Rect::from_two_pos(a, b));
+        painter.rect_stroke(s, 0.0, (2.0, egui::Color32::YELLOW), egui::StrokeKind::Middle);
+        for p in [s.left_top(), s.right_top(), s.left_bottom(), s.right_bottom()] {
+            painter.rect_filled(egui::Rect::from_center_size(p, egui::vec2(9.0, 9.0)), 0.0, egui::Color32::YELLOW);
+        }
+        painter.text(
+            s.left_top() + egui::vec2(6.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("{}×{}  ({}, {})", sel.width().round(), sel.height().round(), sel.min.x.round(), sel.min.y.round()),
+            egui::FontId::proportional(14.0),
+            egui::Color32::YELLOW,
+        );
+        if !crop {
+            return;
+        }
+
+        // Smallest selection: the camera's minimum size, on its steps.
+        let (step, min) = self.geometry().map_or(([8, 2, 8, 8], (8, 8)), |g| (g.step, g.min_size));
+        let min = egui::vec2(min.0.div_ceil(step[0]) as f32 * step[0] as f32, min.1.div_ceil(step[1]) as f32 * step[1] as f32);
+        // Which part of the selection is under the pointer (screen pixels).
+        let hit = |p: egui::Pos2| -> Option<Grab> {
+            const M: f32 = 8.0;
+            if !s.expand(M).contains(p) {
+                return None;
+            }
+            let (dl, dr, dt, db) = ((p.x - s.min.x).abs(), (p.x - s.max.x).abs(), (p.y - s.min.y).abs(), (p.y - s.max.y).abs());
+            let g = Grab { l: dl <= M && dl <= dr, r: dr <= M && dr < dl, t: dt <= M && dt <= db, b: db <= M && db < dt };
+            if g.l || g.r || g.t || g.b {
+                Some(g)
+            } else {
+                s.contains(p).then_some(Grab { l: true, r: true, t: true, b: true })
+            }
+        };
+        if let Some(p) = resp.hover_pos().filter(|_| self.crop_drag.is_none()) {
+            ui.ctx().set_cursor_icon(match hit(p) {
+                None => egui::CursorIcon::Crosshair,
+                Some(Grab { l: true, r: true, .. }) => egui::CursorIcon::Move,
+                Some(Grab { l: true, t: true, .. } | Grab { r: true, b: true, .. }) => egui::CursorIcon::ResizeNwSe,
+                Some(Grab { r: true, t: true, .. } | Grab { l: true, b: true, .. }) => egui::CursorIcon::ResizeNeSw,
+                Some(Grab { l: true, .. } | Grab { r: true, .. }) => egui::CursorIcon::ResizeHorizontal,
+                Some(_) => egui::CursorIcon::ResizeVertical,
+            });
+        }
+        let Some(p) = resp.interact_pointer_pos() else { return };
+        if resp.drag_started() {
+            // Outside the selection: draw a new one.
+            self.crop_drag = Some(CropDrag { grab: hit(p), from: to_cam(p), start: sel, sel });
+        }
+        let Some(d) = &mut self.crop_drag else { return };
+        let q = to_cam(p);
+        let delta = q - d.from;
+        let a = d.start;
+        d.sel = match d.grab {
+            None => egui::Rect::from_two_pos(d.from, q),
+            Some(Grab { l: true, r: true, .. }) => a.translate(egui::vec2(
+                delta.x.clamp(-a.min.x, canvas.x - a.max.x),
+                delta.y.clamp(-a.min.y, canvas.y - a.max.y),
+            )),
+            Some(g) => {
+                let mut r = a;
+                if g.l {
+                    r.min.x = (a.min.x + delta.x).clamp(0.0, (a.max.x - min.x).max(0.0));
+                }
+                if g.r {
+                    r.max.x = (a.max.x + delta.x).clamp(a.min.x + min.x, canvas.x);
+                }
+                if g.t {
+                    r.min.y = (a.min.y + delta.y).clamp(0.0, (a.max.y - min.y).max(0.0));
+                }
+                if g.b {
+                    r.max.y = (a.max.y + delta.y).clamp(a.min.y + min.y, canvas.y);
+                }
+                r
+            }
+        };
+        if resp.drag_stopped() {
+            let d = self.crop_drag.take().unwrap();
+            // A click (no real drag) does not change the crop.
+            if d.grab.is_some() || d.sel.width() * scale >= 5.0 && d.sel.height() * scale >= 5.0 {
+                self.crop_to(d.sel, step, min, canvas);
             }
         }
     }
 
-    /// Crop the edited scenario to `sel` (pixels of the shown frame, which
-    /// may already be cropped) and try it right away.
-    fn crop_to(&mut self, sel: egui::Rect) {
-        if sel.width() < 16.0 || sel.height() < 16.0 {
+    /// Set the edited scenario's crop to `sel` (sensor pixels, after
+    /// ReverseX/Y as SFNC counts offsets), snapped to the camera's steps and
+    /// at least `min`, and try it right away.
+    fn crop_to(&mut self, sel: egui::Rect, step: [u32; 4], min: egui::Vec2, sensor: egui::Vec2) {
+        let snap = |v: f32, st: u32| ((v.max(0.0) / st as f32).round() as u32) * st;
+        let down = |v: f32, st: u32| (v.max(0.0) as u32) / st * st;
+        let (min_w, min_h) = (min.x as u32, min.y as u32);
+        let (sw, sh) = (down(sensor.x, step[0]), down(sensor.y, step[1]));
+        let w = snap(sel.width(), step[0]).clamp(min_w.min(sw), sw);
+        let h = snap(sel.height(), step[1]).clamp(min_h.min(sh), sh);
+        let x = snap(sel.min.x, step[2]).min(down(sensor.x - w as f32, step[2]));
+        let y = snap(sel.min.y, step[3]).min(down(sensor.y - h as f32, step[3]));
+        // Main page: the running scenario only, nothing is saved. Settings:
+        // the edited scenario (saved with it).
+        let main = self.page == Page::Main;
+        let Some(mut s) = (if main { self.engine.scenario.clone() } else { self.edited() }) else { return };
+        let before = self.engine.scenario.clone();
+        let c = &mut s.camera;
+        if (c.width, c.height, c.offset_x, c.offset_y) == (w, h, x, y) {
             return;
         }
-        let Some(active) = self.engine.scenario.as_ref().map(|a| a.camera.clone()) else { return };
-        let (step, min, sensor) = match self.current_limits() {
-            Some(l) => (l.step, l.min_size, l.sensor),
-            None => ([8, 2, 8, 8], (8, 8), (u32::MAX, u32::MAX)),
-        };
-        let snap = |v: u32, st: u32| v / st * st;
-        let c = &mut self.edit.camera;
-        // The offsets count in the output image, after ReverseX/Y (SFNC).
-        c.offset_x = snap(active.offset_x + sel.min.x as u32, step[2]);
-        c.offset_y = snap(active.offset_y + sel.min.y as u32, step[3]);
-        c.width = snap((active.offset_x + sel.max.x as u32 - c.offset_x).clamp(min.0, sensor.0 - c.offset_x), step[0]);
-        c.height = snap((active.offset_y + sel.max.y as u32 - c.offset_y).clamp(min.1, sensor.1 - c.offset_y), step[1]);
-        if let Some(s) = self.edited() {
-            self.apply(&s);
+        (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
+        match self.engine.apply(&s) {
+            Ok(()) => {
+                if !main {
+                    let c = &mut self.edit.camera;
+                    (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
+                }
+                self.message = format!("Kivágás: {w}×{h} ({x}, {y})");
+            }
+            Err(e) => {
+                // Back to the crop that worked, so the camera keeps running.
+                if let Some(b) = before {
+                    self.apply(&b);
+                }
+                self.message = format!("A kamera nem fogadta el a {w}×{h} kivágást: {e}. Visszaállítva.");
+            }
+        }
+    }
+
+    /// The camera the page works with: the running one on the main page,
+    /// the edited scenario's on the settings page.
+    fn page_device(&self) -> &Device {
+        match (self.page, &self.engine.scenario) {
+            (Page::Main, Some(a)) => &a.device,
+            _ => &self.edit.device,
+        }
+    }
+
+    /// Sensor size, smallest size and steps of the page's camera.
+    fn geometry(&self) -> Option<Geometry> {
+        match &self.geometry {
+            Some((d, g)) if d == self.page_device() => Some(*g),
+            _ => self.current_limits().map(|l| Geometry { sensor: l.sensor, min_size: l.min_size, step: l.step }),
         }
     }
 
     /// Limits read from the edited scenario's camera, if any.
     fn current_limits(&self) -> Option<&Limits> {
-        self.limits.as_ref().filter(|(d, _)| *d == self.edit.device).and_then(|(_, l)| l.as_ref().ok())
+        self.limits.as_ref().filter(|(d, _)| d == self.page_device()).and_then(|(_, l)| l.as_ref().ok())
     }
 
     /// Read the limits (stops the camera ~2-3 s), then restart the camera
@@ -397,6 +545,18 @@ impl App {
                 }
             });
         });
+        // A crop made on the preview lasts until the scenario is reloaded.
+        let saved = self.scenarios.iter().find(|s| s.name == current).cloned();
+        if let (Some(a), Some(saved)) = (&self.engine.scenario, &saved) {
+            let roi = |c: &crate::scenario::CameraSettings| (c.width, c.height, c.offset_x, c.offset_y);
+            if roi(&a.camera) != roi(&saved.camera) {
+                let (w, h, x, y) = roi(&a.camera);
+                ui.label(format!("Kivágás: {w}×{h} ({x}, {y}), nincs mentve"));
+                if ui.add_enabled(!recording, egui::Button::new("A szcenárió kivágása")).clicked() {
+                    chosen = Some(saved.clone());
+                }
+            }
+        }
         if let Some(s) = chosen {
             self.apply(&s);
         }
@@ -443,7 +603,7 @@ impl App {
     fn status_line(&mut self, ui: &mut egui::Ui) {
         let st = self.engine.stats();
         let mut lines = vec![
-            self.engine.camera_name(),
+            if self.engine.waiting_for_camera() { "⚠ várakozás a kamerára…".into() } else { self.engine.camera_name() },
             format!(
                 "fogadott: {} · kameránál elveszett: {} · hibás kép: {}",
                 st.received.load(Relaxed),
@@ -515,6 +675,7 @@ impl App {
         ui.separator();
 
         let limits = self.current_limits().cloned();
+        let geo = self.geometry();
         let mut load = None;
         ui.add_enabled_ui(!recording, |ui| {
             egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
@@ -545,16 +706,14 @@ impl App {
                 ui.end_row();
 
                 let c = &mut e.camera;
-                let (step, sensor) = limits.as_ref().map_or(([1; 4], (16384, 16384)), |l| (l.step, l.sensor));
+                let (step, sensor, min) = geo.map_or(([1; 4], (16384, 16384), (8, 8)), |g| (g.step, g.sensor, g.min_size));
                 ui.label("Kivágás: méret");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut c.width).range(8..=sensor.0).speed(step[0]));
+                    ui.add(egui::DragValue::new(&mut c.width).range(min.0..=sensor.0).speed(step[0]));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut c.height).range(8..=sensor.1).speed(step[1]));
-                    if let Some(l) = &limits {
-                        if ui.button("Teljes").on_hover_text(format!("{}×{}", l.sensor.0, l.sensor.1)).clicked() {
-                            (c.width, c.height, c.offset_x, c.offset_y) = (l.sensor.0, l.sensor.1, 0, 0);
-                        }
+                    ui.add(egui::DragValue::new(&mut c.height).range(min.1..=sensor.1).speed(step[1]));
+                    if geo.is_some() && ui.button("Teljes").on_hover_text(format!("{}×{}", sensor.0, sensor.1)).clicked() {
+                        (c.width, c.height, c.offset_x, c.offset_y) = (sensor.0, sensor.1, 0, 0);
                     }
                 });
                 ui.end_row();
@@ -563,14 +722,14 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut c.offset_x).range(0..=sensor.0.saturating_sub(c.width)).speed(step[2]));
                     ui.add(egui::DragValue::new(&mut c.offset_y).range(0..=sensor.1.saturating_sub(c.height)).speed(step[3]));
-                    if limits.is_some() && ui.button("Középre").clicked() {
+                    if geo.is_some() && ui.button("Középre").clicked() {
                         c.offset_x = sensor.0.saturating_sub(c.width) / 2;
                         c.offset_y = sensor.1.saturating_sub(c.height) / 2;
                     }
                 });
                 ui.end_row();
                 // The camera only takes multiples of its steps.
-                if limits.is_some() {
+                if geo.is_some() {
                     c.width = (c.width / step[0] * step[0]).min(sensor.0);
                     c.height = (c.height / step[1] * step[1]).min(sensor.1);
                     c.offset_x = (c.offset_x / step[2] * step[2]).min(sensor.0 - c.width);
@@ -1288,8 +1447,8 @@ impl eframe::App for App {
                     Page::Settings | Page::Recordings => self.settings_page(ui),
                 });
             });
-        let crop = self.page == Page::Settings && self.recording.is_none() && self.test.is_none();
-        egui::CentralPanel::default().show(ui, |ui| self.preview(ui, crop));
+        let crop = self.recording.is_none() && self.test.is_none();
+        egui::CentralPanel::default().show(ui, |ui| self.preview(ui, true, crop));
         ctx.request_repaint_after(PREVIEW_INTERVAL);
     }
 

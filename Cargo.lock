@@ -4203,6 +4203,7 @@ dependencies = [
  "fs4",
  "nokhwa",
  "rayon",
+ "rusb",
  "serde",
  "serde_json",
  "zune-jpeg",

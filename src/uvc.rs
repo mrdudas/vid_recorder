@@ -78,12 +78,14 @@ pub struct UvcCamera {
     name: String,
     settings: Option<CameraSettings>,
     running: Arc<AtomicBool>,
+    /// Not found, or frames fail continuously (unplugged).
+    lost: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl UvcCamera {
     pub fn new(name: &str) -> Self {
-        UvcCamera { name: name.into(), settings: None, running: Arc::new(AtomicBool::new(false)), thread: None }
+        UvcCamera { name: name.into(), settings: None, running: Arc::new(AtomicBool::new(false)), lost: Arc::new(AtomicBool::new(false)), thread: None }
     }
 }
 
@@ -147,7 +149,9 @@ impl Camera for UvcCamera {
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {
         self.stop();
         let s = self.settings.clone().ok_or("no settings applied")?;
-        let indices = find_indices(&self.name)?;
+        let indices = find_indices(&self.name).inspect_err(|_| self.lost.store(true, Relaxed))?;
+        self.lost.store(false, Relaxed);
+        let lost = self.lost.clone();
         let fourcc = to_fourcc(s.pixel_format)?;
         self.running.store(true, Relaxed);
         let running = self.running.clone();
@@ -178,14 +182,26 @@ impl Camera for UvcCamera {
                 let _ = ready_tx.send(Ok(()));
                 let start = Instant::now();
                 let mut id = 0u64;
+                let mut failing: Option<Instant> = None;
                 while running.load(Relaxed) {
                     let buf = match cam.frame() {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!("uvc frame: {e}");
+                            // Failing for a second: unplugged.
+                            let since = *failing.get_or_insert_with(Instant::now);
+                            if since.elapsed().as_secs_f64() > 1.0 {
+                                eprintln!("uvc: camera lost ({e})");
+                                lost.store(true, Relaxed);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                             continue;
                         }
                     };
+                    failing = None;
+                    if !running.load(Relaxed) {
+                        break;
+                    }
                     let res = buf.resolution();
                     let Some(format) = from_fourcc(buf.source_frame_format()) else { continue };
                     let bytes = buf.buffer();
@@ -221,9 +237,22 @@ impl Camera for UvcCamera {
 
     fn stop(&mut self) {
         self.running.store(false, Relaxed);
+        // Wait at most 2 s for a thread stuck on a gone device.
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                eprintln!("warning: uvc capture thread did not stop, left behind");
+            }
         }
+    }
+
+    fn disconnected(&self) -> bool {
+        self.lost.load(Relaxed)
     }
 }
 
