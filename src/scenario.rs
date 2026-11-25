@@ -82,6 +82,13 @@ pub struct CameraSettings {
     /// Camera's own automatic exposure and gain (changes the recording).
     #[serde(default)]
     pub auto_exposure: bool,
+    /// Range the auto exposure may use [µs]; clamped to the camera's range
+    /// and to one frame period.
+    #[serde(default = "auto_exposure_range")]
+    pub auto_exposure_range: (f64, f64),
+    /// Range the auto gain may use [dB]; clamped to the camera's range.
+    #[serde(default = "auto_gain_range")]
+    pub auto_gain_range: (f64, f64),
     /// Mirror the image on the camera (both = rotated by 180°).
     #[serde(default)]
     pub reverse_x: bool,
@@ -90,6 +97,14 @@ pub struct CameraSettings {
     /// Any other GenICam feature, written as is (name -> number/string/bool).
     #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+fn auto_exposure_range() -> (f64, f64) {
+    (0.0, 1_000_000.0)
+}
+
+fn auto_gain_range() -> (f64, f64) {
+    (0.0, 48.0)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -114,6 +129,8 @@ impl Default for Scenario {
                 exposure_us: 10_000.0,
                 gain_db: 0.0,
                 auto_exposure: false,
+                auto_exposure_range: auto_exposure_range(),
+                auto_gain_range: auto_gain_range(),
                 reverse_x: false,
                 reverse_y: false,
                 extra: BTreeMap::new(),

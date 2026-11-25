@@ -130,6 +130,25 @@ pub fn ffmpeg_path() -> PathBuf {
 }
 
 /// ffprobe next to the ffmpeg binary.
+/// Command for `program` at lower CPU priority, so it never takes time
+/// from the camera's USB reading (the camera drops frames it cannot send).
+pub fn low_priority(program: &std::path::Path) -> std::process::Command {
+    #[cfg(unix)]
+    {
+        let mut c = std::process::Command::new("nice");
+        c.args(["-n", "10"]).arg(program);
+        c
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+        let mut c = std::process::Command::new(program);
+        c.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+        c
+    }
+}
+
 pub fn ffprobe_path() -> PathBuf {
     ffmpeg_path().with_file_name(if cfg!(windows) { "ffprobe.exe" } else { "ffprobe" })
 }

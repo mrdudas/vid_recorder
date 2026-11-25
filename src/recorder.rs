@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -179,22 +179,7 @@ impl Writer {
         }
         let encoder: &Profile = encoder::resolve(&self.encoder_id, f.format)?;
         *self.stats.encoder.lock().unwrap() = Some(encoder.label);
-        // The encoder runs at lower priority so it never takes CPU time from
-        // the camera's USB reading (the camera drops frames it cannot send).
-        #[cfg(unix)]
-        let mut cmd = {
-            let mut c = Command::new("nice");
-            c.args(["-n", "10"]).arg(encoder::ffmpeg_path());
-            c
-        };
-        #[cfg(windows)]
-        let mut cmd = {
-            use std::os::windows::process::CommandExt;
-            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
-            let mut c = Command::new(encoder::ffmpeg_path());
-            c.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
-            c
-        };
+        let mut cmd = encoder::low_priority(&encoder::ffmpeg_path());
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
         if f.format == PixelFormat::Mjpeg {
             // Concatenated JPEG frames, copied into the MKV unchanged.

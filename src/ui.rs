@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::camera::Limits;
 use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
 use crate::probe::{self, Level, Verdict};
 use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
+use crate::recordings::{self, ExportSettings, Job, JobState, MediaInfo, Recording, Still};
 use crate::scenario::{self, Device, Scenario, View};
 
 /// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
@@ -28,6 +30,53 @@ const PREVIEW_MAX_WIDTH: usize = 960;
 enum Page {
     Main,
     Settings,
+    Recordings,
+}
+
+/// Magnification methods of `export` and their labels.
+const MAGNIFY: [(&str, &str); 5] = [
+    ("phase", "Fázisalapú mozgás (pulzus, légzés)"),
+    ("tremor", "Tremor (3–5, 5–8, 8–12 Hz)"),
+    ("linear", "Lineáris Euler-mozgás (pulzus, légzés)"),
+    ("broadband", "Szélessávú mozgás (szűretlen)"),
+    ("colour", "Színváltozás a bőrön (pulzus)"),
+];
+
+/// Recordings page state.
+#[derive(Default)]
+struct RecPage {
+    list: Vec<Recording>,
+    selected: std::collections::BTreeSet<PathBuf>,
+    export: ExportSettings,
+    /// Magnification methods ticked (when `export.method` is not archive/native).
+    magnify: std::collections::BTreeSet<&'static str>,
+    /// Waiting exports, the running one, and finished ones' results.
+    queue: std::collections::VecDeque<(PathBuf, ExportSettings)>,
+    job: Option<Job>,
+    log: Vec<(bool, String)>,
+    confirm_delete: bool,
+    loaded: bool,
+    /// Folders added by hand (besides the scenarios' output folders).
+    folders: Vec<PathBuf>,
+    new_folder: String,
+    viewer: Option<Viewer>,
+}
+
+/// Extra folders on the recordings page, one path per line.
+const FOLDERS_FILE: &str = "recording_folders.txt";
+
+/// Browses one video: the frame at `t` is decoded on a worker thread.
+struct Viewer {
+    path: PathBuf,
+    info: MediaInfo,
+    t: f64,
+    /// Time of the frame on screen / being decoded.
+    shown: Option<f64>,
+    busy: Option<std::sync::mpsc::Receiver<Result<egui::ColorImage, String>>>,
+    texture: Option<egui::TextureHandle>,
+    error: Option<String>,
+    /// Real frame rate from the timestamp CSV (the container's may differ).
+    real_fps: Option<f64>,
 }
 
 pub struct App {
@@ -61,6 +110,15 @@ pub struct App {
     levels: (f32, f32),
     /// Scenario to reopen while its camera is unplugged, and the last try.
     reconnect: Option<(Scenario, Instant)>,
+    /// Camera limits for the device they were read from (or why not).
+    limits: Option<(Device, Result<Limits, String>)>,
+    /// Read the limits on the next frame (after the message is shown).
+    limits_pending: bool,
+    /// Size of the last preview frame (camera pixels).
+    frame_size: (u32, u32),
+    /// Crop selection being dragged on the preview: start, in camera pixels.
+    crop_start: Option<egui::Pos2>,
+    rec: RecPage,
 }
 
 /// USB3 Vision (if one is connected), every UVC camera, and the simulator.
@@ -106,6 +164,11 @@ impl App {
             wb_gains: [1.0; 3],
             levels: (0.0, 1.0),
             reconnect: None,
+            limits: None,
+            limits_pending: false,
+            frame_size: (0, 0),
+            crop_start: None,
+            rec: RecPage::default(),
         };
         let first = app.scenarios[0].clone();
         app.apply(&first);
@@ -183,6 +246,7 @@ impl App {
     fn update_preview(&mut self, ctx: &egui::Context) {
         self.sync_lut();
         if let Some(frame) = self.engine.take_preview() {
+            self.frame_size = (frame.width, frame.height);
             let view = self.engine.scenario.as_ref().map(|s| s.view.clone()).unwrap_or_default();
             let wb = view.auto_white_balance.then_some(self.wb_gains);
             let levels = view.auto_levels.then_some(self.levels);
@@ -220,106 +284,188 @@ impl App {
     fn view_controls(&mut self, ui: &mut egui::Ui) {
         let Some(s) = self.engine.scenario.as_mut() else { return };
         let v = &mut s.view;
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut v.auto_white_balance, "Automatikus fehéregyensúly");
-            ui.checkbox(&mut v.auto_levels, "Automatikus fényerő");
+        ui.strong("Élőkép");
+        ui.checkbox(&mut v.auto_white_balance, "Automatikus fehéregyensúly");
+        ui.checkbox(&mut v.auto_levels, "Automatikus fényerő");
+        egui::Grid::new("view").num_columns(2).show(ui, |ui| {
             ui.label("Fényerő");
             ui.add(egui::Slider::new(&mut v.brightness, -0.5..=0.5).fixed_decimals(2));
+            ui.end_row();
             ui.label("Kontraszt");
             ui.add(egui::Slider::new(&mut v.contrast, 0.25..=4.0).logarithmic(true).fixed_decimals(2));
-            if ui.button("Alaphelyzet").clicked() {
-                *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, ..View::default() };
-            }
+            ui.end_row();
         });
-        ui.label("Csak az élőképre hat, a felvétel nyers marad.");
+        if ui.button("Alaphelyzet").clicked() {
+            *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, ..View::default() };
+        }
+        ui.small("Csak az élőképre hat, a felvétel nyers marad.");
     }
 
-    fn preview(&self, ui: &mut egui::Ui) {
-        match &self.texture {
-            Some(t) => {
-                ui.add(egui::Image::new(t).shrink_to_fit());
+    /// The preview scaled to fill the available space. With `crop`, a
+    /// rectangle dragged on it becomes the camera's crop (see `crop_to`).
+    fn preview(&mut self, ui: &mut egui::Ui, crop: bool) {
+        let Some(t) = &self.texture else {
+            ui.label("Nincs kép.");
+            return;
+        };
+        let area = ui.available_rect_before_wrap();
+        let ts = t.size_vec2();
+        let scale = (area.width() / ts.x).min(area.height() / ts.y).max(0.01);
+        let rect = egui::Rect::from_center_size(area.center(), ts * scale);
+        let sense = if crop { egui::Sense::drag() } else { egui::Sense::hover() };
+        let resp = ui.allocate_rect(rect, sense);
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+        if !crop || self.frame_size.0 == 0 {
+            return;
+        }
+        // Screen <-> camera pixels of the shown frame.
+        let fs = egui::vec2(self.frame_size.0 as f32, self.frame_size.1 as f32);
+        let to_cam = |p: egui::Pos2| ((p - rect.min) / rect.size() * fs).to_pos2().clamp(egui::Pos2::ZERO, fs.to_pos2());
+        let to_screen = |p: egui::Pos2| rect.min + p.to_vec2() / fs * rect.size();
+        let resp = resp.on_hover_text("Húzással kijelölt terület: a kamera csak ezt olvassa ki (kisebb magasság = több fps).");
+        if resp.drag_started() {
+            self.crop_start = resp.interact_pointer_pos().map(to_cam);
+        }
+        if let (Some(a), Some(b)) = (self.crop_start, resp.interact_pointer_pos().map(to_cam)) {
+            let sel = egui::Rect::from_two_pos(to_screen(a), to_screen(b));
+            ui.painter().rect_stroke(sel, 0.0, (2.0, egui::Color32::YELLOW), egui::StrokeKind::Middle);
+            if resp.drag_stopped() {
+                self.crop_start = None;
+                self.crop_to(egui::Rect::from_two_pos(a, b));
             }
-            None => {
-                ui.label("Nincs kép.");
+        }
+    }
+
+    /// Crop the edited scenario to `sel` (pixels of the shown frame, which
+    /// may already be cropped) and try it right away.
+    fn crop_to(&mut self, sel: egui::Rect) {
+        if sel.width() < 16.0 || sel.height() < 16.0 {
+            return;
+        }
+        let Some(active) = self.engine.scenario.as_ref().map(|a| a.camera.clone()) else { return };
+        let (step, min, sensor) = match self.current_limits() {
+            Some(l) => (l.step, l.min_size, l.sensor),
+            None => ([8, 2, 8, 8], (8, 8), (u32::MAX, u32::MAX)),
+        };
+        let snap = |v: u32, st: u32| v / st * st;
+        let c = &mut self.edit.camera;
+        // The offsets count in the output image, after ReverseX/Y (SFNC).
+        c.offset_x = snap(active.offset_x + sel.min.x as u32, step[2]);
+        c.offset_y = snap(active.offset_y + sel.min.y as u32, step[3]);
+        c.width = snap((active.offset_x + sel.max.x as u32 - c.offset_x).clamp(min.0, sensor.0 - c.offset_x), step[0]);
+        c.height = snap((active.offset_y + sel.max.y as u32 - c.offset_y).clamp(min.1, sensor.1 - c.offset_y), step[1]);
+        if let Some(s) = self.edited() {
+            self.apply(&s);
+        }
+    }
+
+    /// Limits read from the edited scenario's camera, if any.
+    fn current_limits(&self) -> Option<&Limits> {
+        self.limits.as_ref().filter(|(d, _)| *d == self.edit.device).and_then(|(_, l)| l.as_ref().ok())
+    }
+
+    /// Read the limits (stops the camera ~2-3 s), then restart the camera
+    /// with the scenario that ran before.
+    fn read_limits(&mut self) {
+        let Some(s) = self.edited() else { return };
+        let before = self.engine.scenario.clone();
+        let l = self.engine.limits(&s);
+        self.message = match &l {
+            Ok(_) => "Kamera határai felmérve.".into(),
+            Err(e) => format!("A határok nem olvashatók: {e}"),
+        };
+        self.limits = Some((s.device.clone(), l));
+        if let Some(b) = before.or(Some(s)) {
+            if let Err(e) = self.engine.apply(&b) {
+                self.message = format!("Hiba: {e}");
             }
         }
     }
 
     fn main_page(&mut self, ui: &mut egui::Ui) {
         let recording = self.recording.is_some();
-        ui.horizontal(|ui| {
-            ui.label("Szcenárió:");
-            let current = self.engine.scenario.as_ref().map(|s| s.name.clone()).unwrap_or_default();
-            let mut chosen = None;
-            ui.add_enabled_ui(!recording, |ui| {
-                egui::ComboBox::from_id_salt("scenario")
-                    .selected_text(&current)
-                    .show_ui(ui, |ui| {
-                        for s in &self.scenarios {
-                            if ui.selectable_label(s.name == current, &s.name).clicked() && s.name != current {
-                                chosen = Some(s.clone());
-                            }
-                        }
-                    });
-            });
-            if let Some(s) = chosen {
-                self.apply(&s);
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Felvétel neve:");
-            ui.add_enabled(
-                !recording,
-                egui::TextEdit::singleline(&mut self.rec_name).hint_text("üresen: automatikus (dátum, idő)"),
-            );
-            if !recording {
-                if ui.button("⏺ Record Start").clicked() {
-                    let name = if self.rec_name.trim().is_empty() {
-                        chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string()
-                    } else {
-                        self.rec_name.trim().to_string()
-                    };
-                    match self.engine.start_recording(&name) {
-                        Ok(info) => {
-                            self.message = format!("Felvétel: {}", info.video);
-                            self.recording = Some((info, Instant::now()));
-                        }
-                        Err(e) => self.message = format!("Hiba: {e}"),
+        ui.label("Szcenárió:");
+        let current = self.engine.scenario.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+        let mut chosen = None;
+        ui.add_enabled_ui(!recording, |ui| {
+            egui::ComboBox::from_id_salt("scenario").selected_text(&current).show_ui(ui, |ui| {
+                for s in &self.scenarios {
+                    if ui.selectable_label(s.name == current, &s.name).clicked() && s.name != current {
+                        chosen = Some(s.clone());
                     }
                 }
-            } else if ui.button("⏹ Record End").clicked() {
-                self.engine.stop_recording();
-                if let Some((info, _)) = self.recording.take() {
-                    self.message = format!(
-                        "Felvétel leállítva: {} – {} képkocka, {} eldobva",
-                        info.video,
-                        info.stats.queued.load(Relaxed),
-                        info.stats.dropped.load(Relaxed)
-                    );
-                }
-                self.rec_name.clear();
-            }
+            });
         });
-
+        if let Some(s) = chosen {
+            self.apply(&s);
+        }
+        ui.add_space(8.0);
+        ui.label("Felvétel neve:");
+        ui.add_enabled(
+            !recording,
+            egui::TextEdit::singleline(&mut self.rec_name).hint_text("üresen: automatikus (dátum, idő)"),
+        );
+        let big = |t: &str| egui::Button::new(egui::RichText::new(t).size(18.0)).min_size(egui::vec2(160.0, 36.0));
+        if !recording {
+            if ui.add(big("⏺ Record Start")).clicked() {
+                let name = if self.rec_name.trim().is_empty() {
+                    chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string()
+                } else {
+                    self.rec_name.trim().to_string()
+                };
+                match self.engine.start_recording(&name) {
+                    Ok(info) => {
+                        self.message = format!("Felvétel: {}", info.video);
+                        self.recording = Some((info, Instant::now()));
+                    }
+                    Err(e) => self.message = format!("Hiba: {e}"),
+                }
+            }
+        } else if ui.add(big("⏹ Record End")).clicked() {
+            self.engine.stop_recording();
+            if let Some((info, _)) = self.recording.take() {
+                self.message = format!(
+                    "Felvétel leállítva: {} – {} képkocka, {} eldobva",
+                    info.video,
+                    info.stats.queued.load(Relaxed),
+                    info.stats.dropped.load(Relaxed)
+                );
+            }
+            self.rec_name.clear();
+        }
+        ui.separator();
         self.status_line(ui);
         ui.separator();
         self.view_controls(ui);
-        self.preview(ui);
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
         let st = self.engine.stats();
-        let mut line = format!(
-            "{} · fogadott: {} · kameránál elveszett: {} · hibás kép: {}",
+        let mut lines = vec![
             self.engine.camera_name(),
-            st.received.load(Relaxed),
-            st.lost_at_camera.load(Relaxed),
-            self.engine.camera_errors()
-        );
+            format!(
+                "fogadott: {} · kameránál elveszett: {} · hibás kép: {}",
+                st.received.load(Relaxed),
+                st.lost_at_camera.load(Relaxed),
+                self.engine.camera_errors()
+            ),
+        ];
+        if let Some(c) = self.engine.scenario.as_ref().map(|s| &s.camera) {
+            let max = self.engine.max_fps().map_or(String::new(), |m| format!(" (a kamera max. {m:.1})"));
+            lines.push(format!(
+                "{}x{}+{}+{} {} · {} fps{max}",
+                c.width,
+                c.height,
+                c.offset_x,
+                c.offset_y,
+                c.pixel_format.name(),
+                c.frame_rate
+            ));
+        }
         if let Some((info, started)) = &self.recording {
-            line += &format!(
-                " · ⏺ {:.0} s · írva: {} · sorban: {} · eldobva: {}",
+            let mut line = format!(
+                "⏺ {:.0} s · írva: {} · sorban: {} · eldobva: {}",
                 started.elapsed().as_secs_f64(),
                 info.stats.written.load(Relaxed),
                 info.stats.queued.load(Relaxed) - info.stats.written.load(Relaxed),
@@ -334,21 +480,24 @@ impl App {
             if let Some(e) = info.stats.error.lock().unwrap().as_ref() {
                 line += &format!(" · HIBA: {e}");
             }
+            lines.push(line);
         }
         let fin = self.engine.finalizing();
         if fin > 0 {
-            line += &format!(" · lezárás alatt: {fin}");
+            lines.push(format!("lezárás alatt: {fin}"));
         }
-        ui.label(line);
+        for l in lines {
+            ui.label(l);
+        }
         if !self.message.is_empty() {
-            ui.label(&self.message);
+            ui.label(egui::RichText::new(&self.message).strong());
         }
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         let recording = self.recording.is_some() || self.test.is_some();
-        egui::Panel::left("scenario_list").resizable(false).show(ui, |ui| {
-            ui.heading("Szcenáriók");
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Szcenáriók:");
             let mut pick = None;
             for s in &self.scenarios {
                 if ui.selectable_label(s.name == self.edit.name, &s.name).clicked() {
@@ -359,12 +508,14 @@ impl App {
                 self.extra_json = extra_to_json(&s);
                 self.edit = s;
             }
-            ui.separator();
             if ui.button("Új").clicked() {
                 self.edit = Scenario { name: "uj_szcenario".into(), ..self.edit.clone() };
             }
         });
+        ui.separator();
 
+        let limits = self.current_limits().cloned();
+        let mut load = None;
         ui.add_enabled_ui(!recording, |ui| {
             egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
                 let e = &mut self.edit;
@@ -393,45 +544,98 @@ impl App {
                 });
                 ui.end_row();
 
-                ui.label("Szélesség × magasság");
+                let c = &mut e.camera;
+                let (step, sensor) = limits.as_ref().map_or(([1; 4], (16384, 16384)), |l| (l.step, l.sensor));
+                ui.label("Kivágás: méret");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut e.camera.width).range(8..=16384));
-                    ui.add(egui::DragValue::new(&mut e.camera.height).range(8..=16384));
+                    ui.add(egui::DragValue::new(&mut c.width).range(8..=sensor.0).speed(step[0]));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut c.height).range(8..=sensor.1).speed(step[1]));
+                    if let Some(l) = &limits {
+                        if ui.button("Teljes").on_hover_text(format!("{}×{}", l.sensor.0, l.sensor.1)).clicked() {
+                            (c.width, c.height, c.offset_x, c.offset_y) = (l.sensor.0, l.sensor.1, 0, 0);
+                        }
+                    }
                 });
                 ui.end_row();
 
-                ui.label("Eltolás X, Y");
+                ui.label("Kivágás: eltolás X, Y");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut e.camera.offset_x));
-                    ui.add(egui::DragValue::new(&mut e.camera.offset_y));
+                    ui.add(egui::DragValue::new(&mut c.offset_x).range(0..=sensor.0.saturating_sub(c.width)).speed(step[2]));
+                    ui.add(egui::DragValue::new(&mut c.offset_y).range(0..=sensor.1.saturating_sub(c.height)).speed(step[3]));
+                    if limits.is_some() && ui.button("Középre").clicked() {
+                        c.offset_x = sensor.0.saturating_sub(c.width) / 2;
+                        c.offset_y = sensor.1.saturating_sub(c.height) / 2;
+                    }
                 });
                 ui.end_row();
+                // The camera only takes multiples of its steps.
+                if limits.is_some() {
+                    c.width = (c.width / step[0] * step[0]).min(sensor.0);
+                    c.height = (c.height / step[1] * step[1]).min(sensor.1);
+                    c.offset_x = (c.offset_x / step[2] * step[2]).min(sensor.0 - c.width);
+                    c.offset_y = (c.offset_y / step[3] * step[3]).min(sensor.1 - c.height);
+                }
 
                 ui.label("Kép tükrözése (kamerán)");
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut e.camera.reverse_x, "vízszintesen");
-                    ui.checkbox(&mut e.camera.reverse_y, "függőlegesen");
+                    ui.checkbox(&mut c.reverse_x, "vízszintesen");
+                    ui.checkbox(&mut c.reverse_y, "függőlegesen");
                 })
                 .response
                 .on_hover_text("Mindkettő: 180°-os forgatás. A felvételre is hat.");
                 ui.end_row();
 
                 ui.label("Képfrekvencia [fps]");
-                ui.add(egui::DragValue::new(&mut e.camera.frame_rate).range(0.1..=1000.0).speed(0.5));
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut c.frame_rate).range(0.1..=1000.0).speed(0.5));
+                    if let Some(m) = limits.as_ref().and_then(|l| l.max_fps) {
+                        if ui.button(format!("max. {m:.1}")).on_hover_text("A kamera legnagyobb fps-e ezzel a formátummal, kivágással és expozícióval (felméréskor).").clicked() {
+                            c.frame_rate = m;
+                        }
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Automatikus expozíció");
-                ui.checkbox(&mut e.camera.auto_exposure, "a kamera állítja az expozíciót és az erősítést")
+                ui.checkbox(&mut c.auto_exposure, "a kamera állítja az expozíciót és az erősítést")
                     .on_hover_text("A felvételre is hat: a nyers jel fényessége menet közben változhat.");
                 ui.end_row();
 
-                let manual = !e.camera.auto_exposure;
+                let auto = c.auto_exposure;
+                let (exp, gain) = limits.as_ref().map_or(((1.0, 10_000_000.0), (0.0, 48.0)), |l| (l.exposure_us, l.gain_db));
                 ui.label("Expozíció [µs]");
-                ui.add_enabled(manual, egui::DragValue::new(&mut e.camera.exposure_us).range(1.0..=10_000_000.0).speed(10.0));
+                ui.add_enabled(!auto, egui::DragValue::new(&mut c.exposure_us).range(exp.0..=exp.1).speed(10.0));
                 ui.end_row();
 
                 ui.label("Erősítés [dB]");
-                ui.add_enabled(manual, egui::DragValue::new(&mut e.camera.gain_db).range(0.0..=48.0).speed(0.1));
+                ui.add_enabled(!auto, egui::DragValue::new(&mut c.gain_db).range(gain.0..=gain.1).speed(0.1));
+                ui.end_row();
+
+                let period = 1e6 / c.frame_rate;
+                ui.label("Auto expozíció min–max [µs]");
+                ui.add_enabled_ui(auto, |ui| {
+                    ui.horizontal(|ui| {
+                        let (lo, hi) = &mut c.auto_exposure_range;
+                        ui.add(egui::DragValue::new(lo).range(0.0..=*hi).speed(10.0));
+                        ui.add(egui::DragValue::new(hi).range(*lo..=exp.1).speed(10.0));
+                        ui.label(format!("(képkocka: {period:.0})"));
+                    })
+                    .response
+                    .on_hover_text("Ezen belül állíthat az automatika. A felső határ legfeljebb a képkocka ideje lehet, hogy az fps tartható legyen; a kamera az alsó határnál nézi, bírja-e az fps-t.");
+                });
+                ui.end_row();
+
+                ui.label("Auto erősítés min–max [dB]");
+                ui.add_enabled_ui(auto, |ui| {
+                    ui.horizontal(|ui| {
+                        let (lo, hi) = &mut c.auto_gain_range;
+                        ui.add(egui::DragValue::new(lo).range(0.0..=*hi).speed(0.1));
+                        ui.add(egui::DragValue::new(hi).range(*lo..=gain.1).speed(0.1));
+                    })
+                    .response
+                    .on_hover_text("Nagyobb erősítés: világosabb, de zajosabb kép.");
+                });
                 ui.end_row();
 
                 ui.label("Kódoló");
@@ -461,9 +665,10 @@ impl App {
                 ui.end_row();
 
                 ui.label("További kamerabeállítások\n(JSON: név → érték)");
-                ui.add(egui::TextEdit::multiline(&mut self.extra_json).code_editor().desired_rows(3));
+                ui.add(egui::TextEdit::multiline(&mut self.extra_json).code_editor().desired_rows(2));
                 ui.end_row();
             });
+            ui.small("Kivágás: húzz ki egy téglalapot az élőképen.");
 
             ui.horizontal(|ui| {
                 if ui.button("Kipróbálás").clicked()
@@ -489,7 +694,16 @@ impl App {
                 }
             });
 
-            ui.horizontal(|ui| {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("Határok felmérése")
+                    .on_hover_text("Felvétel nélkül, pár másodperc alatt kiolvassa a kamerából: szenzorméret, expozíció- és erősítéstartomány, legnagyobb fps formátumonként és magasságonként (a szerkesztett szélességgel és expozícióval).")
+                    .clicked()
+                {
+                    self.message = "Kamera határainak felmérése…".into();
+                    self.limits_pending = true;
+                }
                 if ui
                     .button("Felvételi teszt")
                     .on_hover_text("Rögzít a megadott ideig, ellenőrzi, hogy nem veszett-e el képkocka, és hogy a kódoló bírja-e a tempót. A tesztfájlokat utána törli.")
@@ -504,7 +718,7 @@ impl App {
                 }
                 if ui
                     .button("Kamera felderítése")
-                    .on_hover_text("Lekérdezi a kamerától, milyen formátumokat, méreteket és legnagyobb fps-t tud, és mindegyiket lefuttatja a felvételi teszttel (a kamera, expozíció, erősítés és extra beállítások innen jönnek). Ha a kódoló nem bírja, tömörítetlenül is kipróbálja.")
+                    .on_hover_text("Minden módot felvételi teszttel is kipróbál (lassú). A legtöbbször elég a Határok felmérése.")
                     .clicked()
                     && let Some(s) = self.edited()
                 {
@@ -512,7 +726,23 @@ impl App {
                 }
                 ui.add(egui::DragValue::new(&mut self.test_secs).range(2.0..=600.0).suffix(" s / teszt"));
             });
+            match self.limits.as_ref().filter(|(d, _)| *d == self.edit.device).map(|(_, l)| l) {
+                Some(Ok(l)) => load = limits_table(ui, l),
+                Some(Err(e)) => {
+                    ui.label(e);
+                }
+                None => {}
+            }
         });
+        if let Some((f, h, fps)) = load {
+            let (l, c) = (limits.as_ref().unwrap(), &mut self.edit.camera);
+            c.pixel_format = f;
+            c.width = c.width.min(l.sensor.0) / l.step[0] * l.step[0];
+            c.height = h;
+            c.offset_x = (l.sensor.0 - c.width) / 2 / l.step[2] * l.step[2];
+            c.offset_y = (l.sensor.1 - h) / 2 / l.step[3] * l.step[3];
+            c.frame_rate = fps;
+        }
         if let Some((t, s)) = &self.test {
             ui.horizontal(|ui| {
                 let left = self.probe_queue.len();
@@ -528,10 +758,384 @@ impl App {
         }
         self.probe_table(ui);
 
+        ui.separator();
         self.status_line(ui);
         ui.separator();
         self.view_controls(ui);
-        self.preview(ui);
+    }
+
+    /// Every scenario's output folder (once each).
+    fn recording_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self.scenarios.iter().map(|s| s.recording.output_dir.clone()).collect();
+        dirs.extend(self.rec.folders.iter().cloned());
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    fn save_folders(&self) {
+        let text: String = self.rec.folders.iter().map(|f| format!("{}\n", f.display())).collect();
+        let _ = std::fs::write(FOLDERS_FILE, text);
+    }
+
+    fn open_viewer(&mut self, path: PathBuf) {
+        let real_fps = self.rec.list.iter().find(|r| r.video == path).and_then(|r| Some(r.frames? as f64 / r.seconds?));
+        self.rec.viewer = Some(match recordings::media_info(&path) {
+            Ok(info) => Viewer { path, info, t: 0.0, shown: None, busy: None, texture: None, error: None, real_fps },
+            Err(e) => Viewer {
+                path,
+                info: MediaInfo { width: 0, height: 0, duration: 0.0, fps: 25.0, pix_fmt: String::new(), format: None },
+                t: 0.0,
+                shown: Some(0.0),
+                busy: None,
+                texture: None,
+                error: Some(e),
+                real_fps,
+            },
+        });
+    }
+
+    /// The browsed video: frame, time slider and step buttons.
+    fn viewer(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = &mut self.rec.viewer else {
+            ui.label("Kattints egy felvétel nevére a megtekintéshez.");
+            return;
+        };
+        // Collect a finished decode, start the next if the time moved.
+        if let Some(rx) = &v.busy {
+            match rx.try_recv() {
+                Ok(Ok(img)) => {
+                    match &mut v.texture {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => v.texture = Some(ui.ctx().load_texture("viewer", img, egui::TextureOptions::LINEAR)),
+                    }
+                    v.error = None;
+                    v.busy = None;
+                }
+                Ok(Err(e)) => {
+                    v.error = Some(e);
+                    v.busy = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => v.busy = None,
+            }
+        }
+        if v.busy.is_none() && v.shown != Some(v.t) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (path, info, t) = (v.path.clone(), v.info.clone(), v.t);
+            std::thread::spawn(move || {
+                let _ = tx.send(recordings::decode_frame(&path, &info, t, PREVIEW_MAX_WIDTH as u32).and_then(still_image));
+            });
+            v.busy = Some(rx);
+            v.shown = Some(v.t);
+        }
+
+        let name = v.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let fmt = v.info.format.map_or(v.info.pix_fmt.clone(), |f| f.name().to_string());
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(&name);
+            ui.label(format!("{}×{} {fmt} · {:.1} s · {:.2} fps", v.info.width, v.info.height, v.info.duration, v.info.fps));
+            if v.busy.is_some() {
+                ui.spinner();
+            }
+        });
+        let dt = 1.0 / v.info.fps;
+        let end = (v.info.duration - dt).max(0.0);
+        ui.horizontal(|ui| {
+            let mut step = |ui: &mut egui::Ui, label: &str, d: f64| {
+                if ui.button(label).clicked() {
+                    v.t = (v.t + d).clamp(0.0, end);
+                }
+            };
+            step(ui, "⏮ 1 s", -1.0);
+            step(ui, "◀", -dt);
+            step(ui, "▶", dt);
+            step(ui, "1 s ⏭", 1.0);
+            let n = (v.t * v.info.fps).round() as u64;
+            match v.real_fps {
+                Some(f) => ui.label(format!("képkocka {n} · valós idő {:.3} s ({f:.2} fps)", n as f64 / f)),
+                None => ui.label(format!("képkocka {n}")),
+            };
+        });
+        ui.spacing_mut().slider_width = ui.available_width() - 80.0;
+        ui.add(egui::Slider::new(&mut v.t, 0.0..=end).suffix(" s").fixed_decimals(2));
+        if let Some(e) = &v.error {
+            ui.colored_label(egui::Color32::from_rgb(200, 60, 50), e);
+        }
+        if let Some(t) = &v.texture {
+            let area = ui.available_rect_before_wrap();
+            let ts = t.size_vec2();
+            let scale = (area.width() / ts.x).min(area.height() / ts.y).max(0.01);
+            let rect = egui::Rect::from_center_size(area.center(), ts * scale);
+            ui.allocate_rect(rect, egui::Sense::hover());
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+        }
+    }
+
+    fn refresh_recordings(&mut self) {
+        self.rec.list = recordings::list(&self.recording_dirs());
+        let names: std::collections::BTreeSet<_> = self.rec.list.iter().map(|r| r.video.clone()).collect();
+        self.rec.selected.retain(|p| names.contains(p));
+        self.rec.loaded = true;
+    }
+
+    /// Recordings that must not be touched: being recorded or exported.
+    fn busy(&self, video: &std::path::Path) -> bool {
+        let recording = self.recording.as_ref().is_some_and(|(i, _)| std::path::Path::new(&i.video) == video);
+        recording || self.rec.job.as_ref().is_some_and(|j| j.video == video) || self.rec.queue.iter().any(|(v, _)| v == video)
+    }
+
+    /// Advance the export queue: finish the running job, start the next.
+    fn poll_export(&mut self) {
+        if let Some(job) = &mut self.rec.job {
+            let state = job.poll();
+            let name = job.video.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            match state {
+                JobState::Running => return,
+                JobState::Done => {
+                    let deleted = if job.settings.delete_after { ", nyers felvétel törölve" } else { "" };
+                    let secs = job.started.elapsed().as_secs_f64();
+                    self.rec.log.push((true, format!("{name} → {} ({secs:.0} s){deleted}", job.output.display())));
+                }
+                JobState::Failed(e) => self.rec.log.push((false, format!("{name}: {e}"))),
+            }
+            self.rec.job = None;
+            self.refresh_recordings();
+        }
+        while let Some((video, settings)) = self.rec.queue.pop_front() {
+            match Job::start(&video, &settings) {
+                Ok(j) => {
+                    self.rec.job = Some(j);
+                    break;
+                }
+                Err(e) => self.rec.log.push((false, format!("{}: {e}", video.display()))),
+            }
+        }
+    }
+
+    fn recordings_page(&mut self, ui: &mut egui::Ui) {
+        if !self.rec.loaded {
+            self.rec.folders = std::fs::read_to_string(FOLDERS_FILE)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| PathBuf::from(l.trim()))
+                .collect();
+            self.refresh_recordings();
+        }
+        let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("⟳ Frissítés").clicked() {
+                self.refresh_recordings();
+            }
+        });
+        let mut remove = None;
+        for d in self.recording_dirs() {
+            ui.horizontal(|ui| {
+                let free = recordings::free_space(&d).map_or("?".into(), gb);
+                ui.label(format!("📁 {} – {free} szabad", d.display()));
+                if self.rec.folders.contains(&d) && ui.small_button("✖").on_hover_text("Mappa eltávolítása a listából (a fájlok maradnak)").clicked() {
+                    remove = Some(d.clone());
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.rec.new_folder).hint_text("további mappa elérési útja").desired_width(320.0));
+            let path = PathBuf::from(self.rec.new_folder.trim());
+            if ui.add_enabled(path.is_dir(), egui::Button::new("Mappa hozzáadása")).clicked() {
+                if !self.rec.folders.contains(&path) {
+                    self.rec.folders.push(path);
+                }
+                self.rec.new_folder.clear();
+                self.save_folders();
+                self.refresh_recordings();
+            }
+        });
+        if let Some(d) = remove {
+            self.rec.folders.retain(|f| *f != d);
+            self.save_folders();
+            self.refresh_recordings();
+        }
+        ui.separator();
+
+        // Table of recordings.
+        let mut toggle = None;
+        let mut open = None;
+        let current = self.rec.viewer.as_ref().map(|v| v.path.clone());
+        egui::Grid::new("recordings").striped(true).num_columns(7).show(ui, |ui| {
+            let all = !self.rec.list.is_empty() && self.rec.list.iter().all(|r| self.rec.selected.contains(&r.video));
+            let mut all_now = all;
+            ui.checkbox(&mut all_now, "");
+            if all_now != all {
+                toggle = Some(None);
+            }
+            for h in ["Felvétel", "Fajta", "Mappa", "Időpont", "Méret", "Hossz"] {
+                ui.strong(h);
+            }
+            ui.end_row();
+            for r in &self.rec.list {
+                let mut on = self.rec.selected.contains(&r.video);
+                if ui.checkbox(&mut on, "").changed() {
+                    toggle = Some(Some(r.video.clone()));
+                }
+                if ui.selectable_label(current.as_ref() == Some(&r.video), r.name()).on_hover_text("Megtekintés").clicked() {
+                    open = Some(r.video.clone());
+                }
+                ui.label(if r.export { "export" } else { "nyers" });
+                ui.label(r.video.parent().map(|p| p.display().to_string()).unwrap_or_default());
+                ui.label(chrono::DateTime::<chrono::Local>::from(r.modified).format("%Y-%m-%d %H:%M").to_string());
+                ui.label(gb(r.bytes));
+                ui.label(match (r.seconds, r.frames) {
+                    (Some(s), Some(f)) => format!("{s:.1} s, {f} kép ({:.1} fps)", f as f64 / s),
+                    (_, Some(f)) => format!("{f} kép"),
+                    _ => "nincs CSV".into(),
+                });
+                ui.end_row();
+            }
+        });
+        if self.rec.list.is_empty() {
+            ui.label("Nincs felvétel.");
+        }
+        if let Some(p) = open {
+            self.open_viewer(p);
+        }
+        match toggle {
+            Some(None) => {
+                if self.rec.selected.len() == self.rec.list.len() {
+                    self.rec.selected.clear();
+                } else {
+                    self.rec.selected = self.rec.list.iter().map(|r| r.video.clone()).collect();
+                }
+            }
+            Some(Some(p)) => {
+                if !self.rec.selected.remove(&p) {
+                    self.rec.selected.insert(p);
+                }
+            }
+            None => {}
+        }
+        let chosen: Vec<PathBuf> = self.rec.list.iter().filter(|r| self.rec.selected.contains(&r.video)).map(|r| r.video.clone()).collect();
+        let chosen_bytes: u64 = self.rec.list.iter().filter(|r| self.rec.selected.contains(&r.video)).map(|r| r.bytes).sum();
+        ui.separator();
+
+        // Export settings.
+        ui.heading("Export");
+        let x = &mut self.rec.export;
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut x.method, "archive".into(), "Archív")
+                .on_hover_text("A nyers felvétel veszteségmentesen, FFV1-gyel (bitre pontos, kb. 20%-kal kisebb). Az időbélyeg-CSV is mellé kerül. Csak akkor sikeres, ha minden képkocka átkerült.");
+            ui.radio_value(&mut x.method, "native".into(), "Natív videó")
+                .on_hover_text("Demozaikolt (színes) videó, feldolgozás nélkül, a választott tömörítéssel.");
+            let magnify = x.method != "archive" && x.method != "native";
+            if ui.radio(magnify, "Mozgás- és színnagyítás").clicked() && !magnify {
+                x.method = "magnify".into();
+            }
+        });
+        let magnify = x.method != "archive" && x.method != "native";
+        if magnify {
+            ui.indent("magnify", |ui| {
+                for (id, label) in MAGNIFY {
+                    let mut on = self.rec.magnify.contains(id);
+                    if ui.checkbox(&mut on, label).changed() {
+                        if on {
+                            self.rec.magnify.insert(id);
+                        } else {
+                            self.rec.magnify.remove(id);
+                        }
+                    }
+                }
+                ui.small("A kimenet rács: az eredeti, majd sávonként egy panel. A nagyítás lassú, kisebb feldolgozási szélességgel gyorsabb.");
+            });
+            x.method = MAGNIFY.iter().filter(|(id, _)| self.rec.magnify.contains(id)).map(|(id, _)| *id).collect::<Vec<_>>().join(",");
+            if x.method.is_empty() {
+                x.method = "magnify".into();
+            }
+        }
+        if x.method != "archive" {
+            egui::Grid::new("export_opts").num_columns(2).show(ui, |ui| {
+                ui.label("Tömörítés");
+                egui::ComboBox::from_id_salt("codec").selected_text(&x.codec).show_ui(ui, |ui| {
+                    for (c, l) in [("h264", "H.264 (kicsi, veszteséges)"), ("hevc", "HEVC 10 bit (kisebb, veszteséges)"), ("prores", "ProRes 422 HQ (vágáshoz)"), ("ffv1", "FFV1 (veszteségmentes, nagy)")] {
+                        ui.selectable_value(&mut x.codec, c.to_string(), l);
+                    }
+                });
+                ui.end_row();
+                ui.label("Lassítás");
+                ui.checkbox(&mut x.slow, "minden képkocka, 25 fps-sel lejátszva");
+                ui.end_row();
+                ui.label("Feldolgozási szélesség");
+                ui.add(egui::DragValue::new(&mut x.width).range(0..=8192).speed(16).custom_formatter(|v, _| if v == 0.0 { "teljes".into() } else { format!("{v}") }));
+                ui.end_row();
+                ui.label("Kezdet, hossz [s]");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut x.start).range(0.0..=1e6).speed(0.5));
+                    ui.add(egui::DragValue::new(&mut x.dur).range(0.0..=1e6).speed(0.5).custom_formatter(|v, _| if v == 0.0 { "végig".into() } else { format!("{v}") }));
+                });
+                ui.end_row();
+            });
+        }
+        ui.checkbox(&mut x.delete_after, "Sikeres export után a nyers felvétel törlése (hely felszabadítása)")
+            .on_hover_text("Csak akkor töröl, ha az export hibátlanul elkészült. A nyers felvétel nem állítható vissza.");
+        ui.label(format!("Kimenet: a felvétel mappájában az {}/ almappa.", recordings::EXPORT_DIR));
+
+        let usable: Vec<PathBuf> = chosen.iter().filter(|v| !self.busy(v)).cloned().collect();
+        ui.horizontal(|ui| {
+            let ok = !usable.is_empty() && self.rec.export.method != "magnify";
+            if ui.add_enabled(ok, egui::Button::new(format!("Export indítása ({} felvétel)", usable.len()))).clicked() {
+                for v in &usable {
+                    self.rec.queue.push_back((v.clone(), self.rec.export.clone()));
+                }
+            }
+            if !self.rec.confirm_delete {
+                if ui.add_enabled(!usable.is_empty(), egui::Button::new(format!("Kijelöltek törlése ({})", gb(chosen_bytes)))).clicked() {
+                    self.rec.confirm_delete = true;
+                }
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 50), format!("{} felvétel végleges törlése?", usable.len()));
+                if ui.button("Igen, törlöm").clicked() {
+                    for v in &usable {
+                        if let Err(e) = recordings::delete(v) {
+                            self.rec.log.push((false, format!("{}: {e}", v.display())));
+                        }
+                    }
+                    self.rec.confirm_delete = false;
+                    self.refresh_recordings();
+                }
+                if ui.button("Mégse").clicked() {
+                    self.rec.confirm_delete = false;
+                }
+            }
+        });
+
+        // Running and finished exports.
+        if let Some(j) = &mut self.rec.job {
+            ui.separator();
+            let name = j.video.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("{name} → {} · {:.0} s", j.output.display(), j.started.elapsed().as_secs_f64()));
+                cancel = ui.button("Megszakítás").clicked();
+            });
+            ui.small(j.last_line.lock().unwrap().clone());
+            if !self.rec.queue.is_empty() {
+                ui.label(format!("Még {} export vár.", self.rec.queue.len()));
+            }
+            if cancel {
+                j.cancel();
+                self.rec.log.push((false, format!("{name}: megszakítva")));
+                self.rec.job = None;
+                self.rec.queue.clear();
+            }
+        }
+        if !self.rec.log.is_empty() {
+            ui.separator();
+            for (ok, l) in self.rec.log.iter().rev() {
+                let c = if *ok { egui::Color32::from_rgb(40, 160, 70) } else { egui::Color32::from_rgb(200, 60, 50) };
+                ui.colored_label(c, l);
+            }
+        }
     }
 
     fn start_probe(&mut self, base: Scenario) {
@@ -646,16 +1250,53 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.page, Page::Main, "Főoldal");
                 ui.selectable_value(&mut self.page, Page::Settings, "Beállítások");
+                ui.selectable_value(&mut self.page, Page::Recordings, "Felvételek és export");
             });
         });
-        egui::CentralPanel::default().show(ui, |ui| match self.page {
-            Page::Main => self.main_page(ui),
-            Page::Settings => self.settings_page(ui),
-        });
+        if self.page == Page::Settings {
+            // First visit with a camera: read its limits once.
+            if self.limits.as_ref().is_none_or(|(d, _)| *d != self.edit.device)
+                && self.edit.device != Device::Sim
+                && !self.limits_pending
+                && self.recording.is_none()
+                && self.test.is_none()
+            {
+                self.message = "Kamera határainak felmérése…".into();
+                self.limits_pending = true;
+            } else if self.limits_pending {
+                // A frame later, so the message is on screen during the wait.
+                self.limits_pending = false;
+                self.read_limits();
+            }
+        }
+        self.poll_export();
+        if self.page == Page::Recordings {
+            egui::Panel::left("recordings_list").resizable(true).default_size(760.0).show(ui, |ui| {
+                egui::ScrollArea::both().show(ui, |ui| self.recordings_page(ui));
+            });
+            egui::CentralPanel::default().show(ui, |ui| self.viewer(ui));
+            ctx.request_repaint_after(PREVIEW_INTERVAL);
+            return;
+        }
+        let width = if self.page == Page::Main { 360.0 } else { 560.0 };
+        egui::Panel::left(if self.page == Page::Main { "main_controls" } else { "settings_controls" })
+            .resizable(true)
+            .default_size(width)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| match self.page {
+                    Page::Main => self.main_page(ui),
+                    Page::Settings | Page::Recordings => self.settings_page(ui),
+                });
+            });
+        let crop = self.page == Page::Settings && self.recording.is_none() && self.test.is_none();
+        egui::CentralPanel::default().show(ui, |ui| self.preview(ui, crop));
         ctx.request_repaint_after(PREVIEW_INTERVAL);
     }
 
     fn on_exit(&mut self) {
+        if let Some(j) = &mut self.rec.job {
+            j.cancel();
+        }
         self.engine.finish_recording();
     }
 }
@@ -800,4 +1441,66 @@ fn to_color_image(
     }
     let means = (n > 0).then(|| sum.map(|c| c as f64 / n as f64));
     Some((egui::ColorImage::from_rgb([ow, oh], &rgb), means, hist))
+}
+
+/// Camera limits; a click on a frame rate returns (format, height, fps) to
+/// load into the editor.
+fn limits_table(ui: &mut egui::Ui, l: &Limits) -> Option<(PixelFormat, u32, f64)> {
+    ui.label(format!(
+        "Szenzor {}×{} · lépés: szél. {}, mag. {}, eltolás {}/{} · expozíció {:.0}–{:.0} µs · erősítés {:.0}–{:.0} dB",
+        l.sensor.0, l.sensor.1, l.step[0], l.step[1], l.step[2], l.step[3], l.exposure_us.0, l.exposure_us.1, l.gain_db.0, l.gain_db.1
+    ));
+    if let Some(m) = l.max_fps {
+        ui.label(format!("A szerkesztett beállítással legfeljebb {m:.1} fps."));
+    }
+    ui.label("Legnagyobb fps magasság szerint (kattintás: betöltés, középre vágva):");
+    let mut pick = None;
+    egui::ScrollArea::horizontal().id_salt("limits").show(ui, |ui| {
+        egui::Grid::new("limits_grid").striped(true).show(ui, |ui| {
+            ui.label("");
+            for h in &l.heights {
+                ui.strong(h.to_string());
+            }
+            ui.end_row();
+            for (f, row) in &l.table {
+                ui.label(f.name());
+                for (h, v) in l.heights.iter().zip(row) {
+                    match v {
+                        Some(v) if ui.small_button(format!("{v:.1}")).clicked() => pick = Some((*f, *h, *v)),
+                        Some(_) => {}
+                        None => {
+                            ui.label("–");
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    });
+    pick
+}
+
+/// A decoded recording frame for the viewer: raw camera data like the live
+/// preview, with one-shot grey-world white balance and auto-levels.
+fn still_image(still: Still) -> Result<egui::ColorImage, String> {
+    let f = match still {
+        Still::Rgb { width, height, data } => return Ok(egui::ColorImage::from_rgb([width, height], &data)),
+        Still::Raw(f) => f,
+    };
+    let plain = tone_table(&View::default(), None);
+    let (_, means, hist) = to_color_image(&f, PREVIEW_MAX_WIDTH, None, None, &plain).ok_or("a képkocka nem dekódolható")?;
+    let wb = means.map(|[r, g, b]| [g / r.max(1e-3), 1.0, g / b.max(1e-3)].map(|x| x.clamp(0.25, 4.0) as f32));
+    let total: u32 = hist.iter().sum();
+    let pct = |p: f32| {
+        let mut acc = 0;
+        hist.iter().position(|&h| {
+            acc += h;
+            acc as f32 >= p * total as f32
+        })
+        .unwrap_or(255) as f32
+            / 255.0
+    };
+    let (lo, hi) = (pct(0.005), pct(0.995));
+    let tone = tone_table(&View::default(), Some((lo, hi.max(lo + 0.05))));
+    to_color_image(&f, PREVIEW_MAX_WIDTH, None, wb, &tone).map(|(img, _, _)| img).ok_or_else(|| "a képkocka nem dekódolható".into())
 }

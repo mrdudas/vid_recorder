@@ -18,6 +18,9 @@ pub const USAGE: &str = "\
   vid_recorder export <recording> <output> <methods> [options]
                                export a recording; methods (comma
                                separated, one panel per band):
+                 archive       the raw recording as lossless FFV1 (bit-exact,
+                               ~20% smaller than FFVHuff), timestamp CSV
+                               copied along; fails unless all frames arrived
                  native        the recording itself (no grid, no processing)
                  phase         phase-based (Riesz) motion, pulse + breath
                  tremor        phase-based motion, 3-5, 5-8, 8-12 Hz
@@ -332,6 +335,9 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     let [input, output, methods, rest @ ..] = args else {
         return Err(format!("usage:\n{USAGE}"));
     };
+    if methods == "archive" {
+        return archive(input, output);
+    }
     let mut o = parse_options(rest)?;
     let p = probe(input)?;
     if o.bayer.is_none() && p.gray {
@@ -491,4 +497,38 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     dec.iter_mut().for_each(|c| _ = c.wait());
     eprintln!("{written} frames -> {output} ({:.0} s)", t0.elapsed().as_secs_f64());
     Ok(ok && written > 0)
+}
+
+/// Raw recording -> FFV1, unchanged samples and PIXEL_FORMAT tag, with the
+/// timestamp CSV next to it. Succeeds only if every frame is in the output.
+fn archive(input: &str, output: &str) -> Result<bool, String> {
+    let t0 = Instant::now();
+    let ok = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-y", "-nostdin", "-i", input, "-map", "0:v", "-c:v", "ffv1", "-level", "3"])
+        .args(["-slices", "16", "-g", "1", "-map_metadata:s:v", "0:s:v", output])
+        .status()
+        .map_err(|e| format!("ffmpeg: {e}"))?
+        .success();
+    if !ok {
+        return Ok(false);
+    }
+    let (a, b) = (count_frames(input)?, count_frames(output)?);
+    if a != b {
+        return Err(format!("{output}: {b} frames, the recording has {a}"));
+    }
+    let csv = Path::new(input).with_extension("csv");
+    if csv.exists() {
+        std::fs::copy(&csv, Path::new(output).with_extension("csv")).map_err(|e| format!("{}: {e}", csv.display()))?;
+    }
+    eprintln!("-> {output}: {b} frames, bit-exact ({:.0} s)", t0.elapsed().as_secs_f64());
+    Ok(true)
+}
+
+pub fn count_frames(path: &str) -> Result<u64, String> {
+    let out = Command::new(ffprobe_path())
+        .args(["-v", "error", "-select_streams", "v:0", "-count_packets"])
+        .args(["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path])
+        .output()
+        .map_err(|e| format!("ffprobe: {e}"))?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().map_err(|_| format!("{path}: frames cannot be counted"))
 }

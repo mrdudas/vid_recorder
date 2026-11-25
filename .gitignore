@@ -5,3 +5,4 @@
 # LUT files are third-party and large; only the README is versioned.
 /slog/*
 !/slog/README.md
+/recording_folders.txt

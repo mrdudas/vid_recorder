@@ -6,6 +6,7 @@ mod frame;
 mod lut;
 mod magnify;
 mod probe;
+mod recordings;
 mod recorder;
 mod scenario;
 mod u3v;
@@ -13,7 +14,7 @@ mod ui;
 mod uvc;
 
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
@@ -35,6 +36,10 @@ usage:
                                (device, exposure, gain, extra features from
                                the scenario); retries uncompressed if the
                                encoder is too slow
+  vid_recorder limits <scenario|u3v>
+                               read the camera's limits (size, exposure,
+                               gain, max fps per format and height) without
+                               recording; takes about a second
   vid_recorder encoders        list encoders that work on this machine
   vid_recorder luts            list and check the preview LUTs in slog/
   vid_recorder record-test [seconds=10] [fps=100] [WxH=1920x1200] [format=Mono8] [encoder=auto]
@@ -62,6 +67,7 @@ fn main() -> ExitCode {
         }),
         Some("camera-test") => camera_test(&args[1..]),
         Some("probe") => probe_camera(&args[1..]),
+        Some("limits") => limits(&args[1..]),
         Some("--version") => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(true)
@@ -94,7 +100,7 @@ fn scenario_dir() -> PathBuf {
 
 fn gui() -> Result<bool, String> {
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 850.0]),
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1200.0, 850.0]).with_maximized(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -173,15 +179,41 @@ fn camera_test(args: &[String]) -> Result<bool, String> {
     run_and_verify(Engine::new(), &s, seconds)
 }
 
+/// Scenario by name, or the defaults for "sim" / "u3v".
+fn scenario_or_device(name: &str) -> Result<Scenario, String> {
+    match scenario::load_all(&scenario_dir()).into_iter().find(|s| s.name == name) {
+        Some(s) => Ok(s),
+        None if name == "sim" => Ok(Scenario { device: scenario::Device::Sim, ..Scenario::default() }),
+        None if name == "u3v" => Ok(Scenario { device: scenario::Device::U3v, ..Scenario::default() }),
+        None => Err(format!("scenario {name} not found in {}", scenario_dir().display())),
+    }
+}
+
+fn limits(args: &[String]) -> Result<bool, String> {
+    let s = scenario_or_device(args.first().ok_or("usage: limits <scenario|u3v>")?)?;
+    let t = std::time::Instant::now();
+    let l = Engine::new().limits(&s)?;
+    let c = &s.camera;
+    println!("read in {:.2} s", t.elapsed().as_secs_f64());
+    println!("sensor        {}x{} (min {}x{}, steps W {} H {} X {} Y {})", l.sensor.0, l.sensor.1, l.min_size.0, l.min_size.1, l.step[0], l.step[1], l.step[2], l.step[3]);
+    println!("exposure      {:.1} .. {:.0} µs", l.exposure_us.0, l.exposure_us.1);
+    println!("gain          {:.1} .. {:.1} dB", l.gain_db.0, l.gain_db.1);
+    println!("max fps       {} ({}x{}+{}+{} {})", l.max_fps.map_or("?".into(), |f| format!("{f:.1}")), c.width, c.height, c.offset_x, c.offset_y, c.pixel_format.name());
+    print!("{:<14}", format!("width {}", c.width));
+    l.heights.iter().for_each(|h| print!("{:>8}", format!("h{h}")));
+    println!();
+    for (f, row) in &l.table {
+        print!("{:<14}", f.name());
+        row.iter().for_each(|v| print!("{:>8}", v.map_or("-".into(), |v| format!("{v:.1}"))));
+        println!();
+    }
+    Ok(true)
+}
+
 fn probe_camera(args: &[String]) -> Result<bool, String> {
     let name = args.first().ok_or("usage: probe <scenario|sim|u3v> [seconds]")?;
     let seconds: f64 = args.get(1).map_or(Ok(5.0), |s| s.parse()).map_err(|e| format!("seconds: {e}"))?;
-    let base = match scenario::load_all(&scenario_dir()).into_iter().find(|s| &s.name == name) {
-        Some(s) => s,
-        None if name == "sim" => Scenario { device: scenario::Device::Sim, ..Scenario::default() },
-        None if name == "u3v" => Scenario { device: scenario::Device::U3v, ..Scenario::default() },
-        None => return Err(format!("scenario {name} not found in {}", scenario_dir().display())),
-    };
+    let base = scenario_or_device(name)?;
     let mut engine = Engine::new();
     let modes = engine.modes(&base)?;
     eprintln!("camera: {}, {} modes, ~{:.0} s", engine.camera_name(), modes.len(), modes.len() as f64 * (seconds + 1.0));
@@ -226,7 +258,7 @@ fn run_and_verify(mut engine: Engine, s: &Scenario, seconds: f64) -> Result<bool
     let csv_rows = std::fs::read_to_string(&info.csv)
         .map(|c| c.lines().count().saturating_sub(1) as u64)
         .unwrap_or(0);
-    let video_frames = count_video_frames(&info.video);
+    let video_frames = export::count_frames(&info.video).ok();
 
     println!("encoder             {}", st.encoder.lock().unwrap().unwrap_or("-"));
     if let Some(n) = st.format_note.lock().unwrap().as_ref() {
@@ -257,12 +289,3 @@ fn run_and_verify(mut engine: Engine, s: &Scenario, seconds: f64) -> Result<bool
     Ok(ok)
 }
 
-/// Packet count of the first video stream via ffprobe (next to ffmpeg).
-fn count_video_frames(path: &str) -> Option<u64> {
-    let out = Command::new(encoder::ffprobe_path())
-        .args(["-v", "error", "-select_streams", "v:0", "-count_packets"])
-        .args(["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-}

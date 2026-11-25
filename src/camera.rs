@@ -18,6 +18,27 @@ pub struct Mode {
     pub fps: f64,
 }
 
+/// What the camera allows, read from it in well under a second instead of
+/// trying settings one by one.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Largest image (full sensor) for the scenario's pixel format.
+    pub sensor: (u32, u32),
+    /// Smallest width and height.
+    pub min_size: (u32, u32),
+    /// Steps of Width, Height, OffsetX and OffsetY.
+    pub step: [u32; 4],
+    pub exposure_us: (f64, f64),
+    pub gain_db: (f64, f64),
+    /// Highest frame rate with exactly the scenario's settings.
+    pub max_fps: Option<f64>,
+    /// Heights of the `table` columns.
+    pub heights: Vec<u32>,
+    /// Highest frame rate per available format and height, at the
+    /// scenario's width and (shortest) exposure.
+    pub table: Vec<(PixelFormat, Vec<Option<f64>>)>,
+}
+
 /// Receives every frame on the camera's acquisition thread. Must be fast.
 pub type FrameSink = Box<dyn FnMut(Frame) + Send>;
 
@@ -31,6 +52,15 @@ pub trait Camera: Send {
     /// applied first (they limit the frame rate). Only called while not
     /// streaming.
     fn modes(&mut self, s: &CameraSettings) -> Result<Vec<Mode>, String>;
+    /// Limits for `s`'s settings (see [`Limits`]). Only called while not
+    /// streaming; the camera's state is undefined afterwards (apply again).
+    fn limits(&mut self, _s: &CameraSettings) -> Result<Limits, String> {
+        Err("ez a kamera nem adja meg a határait".into())
+    }
+    /// Highest frame rate the camera allows with the applied settings.
+    fn max_fps(&self) -> Option<f64> {
+        None
+    }
     /// Frames the camera delivered broken or in an unusable format.
     fn errors(&self) -> u64 {
         0

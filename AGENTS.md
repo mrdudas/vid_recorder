@@ -48,10 +48,23 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - Itt állítjuk össze a **szcenáriókat** (kamerabeállítás-készleteket).
 - Élőképen ellenőrizhető, milyen képet ad a kamera az adott beállításokkal.
 - Minden beállítás elmenthető, **JSON** formátumban.
+- **Elrendezés:** az ablak maximalizálva indul. Bal oldalt a beállítások, jobb oldalt az élőkép, amely kitölti a rendelkezésre álló helyet.
+- **Kivágás (ROI):** az élőképen kihúzott téglalap lesz a kamera `Width/Height/OffsetX/OffsetY` értéke. A kamera lépésközeire kerekít, és azonnal kipróbálja. Kisebb magasság mellett nagyobb az elérhető fps. Az eltolás a tükrözés utáni képben értendő (SFNC).
+- **Határok felmérése:** felvétel nélkül, kb. 2–3 s alatt kiolvassa a kamerából a szenzorméretet, a lépésközöket, az expozíció- és erősítéstartományt, valamint a legnagyobb fps-t formátumonként és magasságonként (a USB-korláttal együtt). A beállítóoldal első megnyitásakor magától lefut. Parancssorból: `limits <szcenárió|u3v>`. A 12 bites és a többi formátum közti váltás az Alviumon kb. 1,5 s, ezért a formátumok csoportosítva futnak.
+- **Automatikus expozíció:** a szcenárió megadja, milyen tartományban állíthatja a kamera az expozíciót (`auto_exposure_range`, µs) és az erősítést (`auto_gain_range`, dB). A felső expozícióhatár legfeljebb a képkocka idejének 95%-a lehet. Az fps-t a program az alsó határnál ellenőrzi.
 - **Felvételi teszt:** a szerkesztett szcenáriót a megadott ideig rögzíti, és megmutatja, veszett-e el képkocka, illetve bírja-e a kódoló a tempót. A tesztfájlokat utána törli.
 - **Kamera felderítése:** a kamerától lekérdezi a módokat, és mindegyiket lefuttatja a felvételi teszttel. Ha a kódoló túl lassú, tömörítetlenül (`raw`) is kipróbálja. Parancssorból: `probe <szcenárió|sim|u3v> [mp]`.
   - **USB3 Vision:** a GenICam adja meg az elérhető pixelformátumokat, a legnagyobb méretet és formátumonként a legnagyobb fps-t, az expozíció és az extra beállítások alapján.
   - **UVC:** a rendszer listája alapján. Macen a nokhwa csak a formátumot adja meg, ezért ott a program 1080p, 720p és 480p méretet próbál 30 fps-sel.
+
+### Felvételek és export
+- A szcenáriók kimeneti mappáiban és a kézzel hozzáadott mappákban (`recording_folders.txt`, nincs verziókezelve) lévő felvételek listája, az `export/` almappák tartalmával együtt. Látszik a méret, a hossz és az fps (az időbélyeg-CSV-ből), valamint a lemez szabad helye.
+- **Megtekintés:** a név kattintására jobb oldalt megnyílik a lejátszó. Csúszkával és léptetőgombokkal böngészhető, az ffmpeg háttérszálon dekódol egy-egy képkockát. A nyers Bayer felvétel ugyanúgy jelenik meg, mint az élőkép, képenkénti automatikus fehéregyensúllyal és szintekkel. A valós időt a CSV-ből számolja, mert a konténer fps-e eltérhet.
+- **Export** a kijelölt felvételekre. Ugyanaz, mint a parancssori `export`, külön folyamatban, alacsony prioritással, egyszerre egy, sorban. A kimenet a felvétel mappájában az `export/` almappába kerül. Fajtái:
+  - **Archív** (`archive`): a nyers Bayer FFV1-gyel, bitre pontosan, kb. 20%-kal kisebb, mint az FFVHuff. A CSV is mellé kerül. Csak akkor sikeres, ha a képkockaszám egyezik.
+  - **Natív videó**: demozaikolt, választható tömörítéssel.
+  - **Mozgás- és színnagyítás**: a kiválasztott módszerek egy rácsban.
+- **Törlés** a hely felszabadítására: kézzel, megerősítéssel, vagy választhatóan sikeres export után automatikusan. Felvétel vagy export alatt álló fájl nem törölhető.
 
 ### Főoldal
 - Itt lehet kiválasztani a mentett szcenáriókat. **Szcenárióváltáskor a kamera azonnal átáll** az új beállításokra.

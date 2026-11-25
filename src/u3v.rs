@@ -10,7 +10,7 @@ use cameleon::genapi::{DefaultGenApiCtxt, ParamsCtxt};
 use cameleon::payload::PixelFormat as UPixelFormat;
 use cameleon::u3v::{self, ControlHandle, StreamHandle};
 
-use crate::camera::{Camera, FrameSink, Mode};
+use crate::camera::{Camera, FrameSink, Limits, Mode};
 use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
@@ -29,6 +29,8 @@ pub struct U3vCamera {
     stream_errors: Arc<AtomicU64>,
     /// Set by the stream thread when the camera is unplugged.
     lost: Arc<AtomicBool>,
+    /// Highest frame rate the camera allowed at the last `apply`.
+    max_fps: Option<f64>,
 }
 
 /// "vendor model (serial)" for every connected USB3 Vision camera.
@@ -107,6 +109,7 @@ impl U3vCamera {
             thread: None,
             stream_errors: Arc::new(AtomicU64::new(0)),
             lost: Arc::new(AtomicBool::new(false)),
+            max_fps: None,
         })
     }
 }
@@ -117,6 +120,7 @@ impl Camera for U3vCamera {
     }
 
     fn apply(&mut self, s: &CameraSettings) -> Result<(), String> {
+        self.max_fps = None;
         let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
         // Chunk data may be left on (e.g. by Vimba); we don't use it, and
         // cameleon fails to parse the Alvium's chunk payloads.
@@ -139,63 +143,142 @@ impl Camera for U3vCamera {
         // The camera accepts any frame rate but silently runs slower (or
         // drops frames) when the sensor or the USB link cannot keep up:
         // refuse those settings.
-        let limit_on = p
-            .node("DeviceLinkThroughputLimitMode")
-            .and_then(|n| n.as_enumeration(&p))
-            .and_then(|n| n.current_entry(&mut p).ok())
-            .is_none_or(|e| e.symbolic(&p) != "Off");
-        let limit = limit_on
-            .then(|| p.node("DeviceLinkThroughputLimit").and_then(|n| n.as_integer(&p)).and_then(|n| n.value(&mut p).ok()))
-            .flatten();
-        if let Some(limit) = limit {
-            let wire_bits = if s.pixel_format.is_packed() { s.pixel_format.bits() as f64 } else { 8.0 * s.pixel_format.bytes_per_pixel() as f64 };
-            let frame_bytes = s.width as f64 * s.height as f64 * wire_bits / 8.0;
-            let usable = limit as f64;
-            let max_fps = usable / frame_bytes;
-            if s.frame_rate > max_fps {
-                return Err(format!(
-                    "{:.0} fps needs {:.0} MB/s, the USB link carries {:.0} MB/s: at most {:.1} fps with {}x{} {}",
-                    s.frame_rate,
-                    s.frame_rate * frame_bytes / 1e6,
-                    usable / 1e6,
-                    max_fps,
-                    s.width,
-                    s.height,
-                    s.pixel_format.name()
-                ));
-            }
+        if let Some((max_fps, link)) = link_fps(&mut p, s.pixel_format, s.width, s.height)
+            && s.frame_rate > max_fps
+        {
+            return Err(format!(
+                "{:.0} fps needs {:.0} MB/s, the USB link carries {:.0} MB/s: at most {:.1} fps with {}x{} {}",
+                s.frame_rate,
+                s.frame_rate * link / max_fps / 1e6,
+                link / 1e6,
+                max_fps,
+                s.width,
+                s.height,
+                s.pixel_format.name()
+            ));
         }
         // Exposure first, with the frame rate unconstrained (the exposure
-        // range depends on the current frame rate and vice versa).
-        let _ = set_bool(&mut p, "AcquisitionFrameRateEnable", false);
-        if s.auto_exposure {
-            // Keep the exposure within one frame so the frame rate holds.
-            if let Err(e) = set_float(&mut p, "ExposureAutoMax", (1e6 / s.frame_rate * 0.95).max(100.0)) {
-                eprintln!("warning: {e}");
-            }
-            set_enum(&mut p, "ExposureAuto", "Continuous")?;
-            let _ = set_enum(&mut p, "GainAuto", "Continuous");
-        } else {
-            // Manual exposure/gain; the auto features may not exist on every model.
-            let _ = set_enum(&mut p, "ExposureAuto", "Off");
-            let _ = set_enum(&mut p, "GainAuto", "Off");
-            set_float(&mut p, "ExposureTime", s.exposure_us)?;
-            set_float(&mut p, "Gain", s.gain_db)?;
-        }
+        // range depends on the current frame rate and vice versa). With auto
+        // exposure the frame rate must hold at the shortest exposure it may
+        // use; the longest is capped to the frame period below.
+        set_exposure(&mut p, s)?;
         // The maximum now reflects format, size and exposure.
         let _ = set_bool(&mut p, "AcquisitionFrameRateEnable", true);
-        let max = p.node("AcquisitionFrameRate").and_then(|n| n.as_float(&p)).and_then(|n| n.max(&mut p).ok());
+        let max = float_max(&mut p, "AcquisitionFrameRate").ok();
+        self.max_fps = max;
         if let Some(max) = max.filter(|&m| s.frame_rate > m + 1e-3) {
             return Err(format!(
                 "the camera does at most {max:.1} fps with {}x{} {} and {}",
                 s.width,
                 s.height,
                 s.pixel_format.name(),
-                if s.auto_exposure { "auto exposure".to_string() } else { format!("{} µs exposure", s.exposure_us) }
+                if s.auto_exposure {
+                    format!("auto exposure from {} µs", s.auto_exposure_range.0)
+                } else {
+                    format!("{} µs exposure", s.exposure_us)
+                }
             ));
         }
         set_float(&mut p, "AcquisitionFrameRate", s.frame_rate)?;
+        if s.auto_exposure {
+            // Keep the exposure within one frame so the frame rate holds.
+            let period = (1e6 / s.frame_rate * 0.95).max(1.0);
+            let (lo, hi) = s.auto_exposure_range;
+            set_range(&mut p, "ExposureAutoMin", "ExposureAutoMax", lo.min(period), hi.min(period));
+            set_range(&mut p, "GainAutoMin", "GainAutoMax", s.auto_gain_range.0, s.auto_gain_range.1);
+            set_enum(&mut p, "ExposureAuto", "Continuous")?;
+            let _ = set_enum(&mut p, "GainAuto", "Continuous");
+        }
         Ok(())
+    }
+
+    fn max_fps(&self) -> Option<f64> {
+        self.max_fps
+    }
+
+    /// Only register reads and cheap writes, no streaming: the whole table
+    /// takes about a second.
+    fn limits(&mut self, s: &CameraSettings) -> Result<Limits, String> {
+        let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
+        let p = &mut p;
+        let _ = set_bool(p, "ChunkModeActive", false);
+        let _ = set_bool(p, "ReverseX", s.reverse_x);
+        let _ = set_bool(p, "ReverseY", s.reverse_y);
+        for (name, value) in &s.extra {
+            let _ = set_json(p, name, value);
+        }
+        set_exposure(p, s)?;
+        let float_range = |p: &mut Params, name| -> (f64, f64) {
+            p.node(name)
+                .and_then(|n| n.as_float(p))
+                .and_then(|n| Some((n.min(p).ok()?, n.max(p).ok()?)))
+                .unwrap_or((0.0, 0.0))
+        };
+        let exposure_us = float_range(p, "ExposureTime");
+        let gain_db = float_range(p, "Gain");
+        let _ = set_bool(p, "AcquisitionFrameRateEnable", true);
+
+        let node = p.node("PixelFormat").and_then(|n| n.as_enumeration(p)).ok_or_else(|| missing("PixelFormat", "enumeration"))?;
+        let mut formats = Vec::new();
+        for e in node.entries(p) {
+            if e.is_available(p).unwrap_or(false)
+                && let Some(f) = PixelFormat::ALL.into_iter().find(|f| f.name() == e.symbolic(p))
+            {
+                formats.push(f);
+            }
+        }
+        // Switching between 12-bit and other formats takes the Alvium
+        // ~1.5 s (sensor mode change), the rest a few ms: scenario's group first.
+        let group = |f: PixelFormat| (f.bits() == 12) != (s.pixel_format.bits() == 12);
+        formats.sort_by_key(|&f| group(f));
+        // Geometry of the scenario's format (others are the same on the
+        // Alvium, but the table re-reads the maximum per format).
+        set_enum(p, "PixelFormat", s.pixel_format.name())?;
+        set_int(p, "OffsetX", 0)?;
+        set_int(p, "OffsetY", 0)?;
+        let inc = |p: &mut Params, name| {
+            p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.inc(p).ok().flatten()).unwrap_or(1).max(1) as u32
+        };
+        let int_min = |p: &mut Params, name| p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.min(p).ok()).unwrap_or(1) as u32;
+        let sensor = (int_max(p, "Width")? as u32, int_max(p, "Height")? as u32);
+        let min_size = (int_min(p, "Width"), int_min(p, "Height"));
+        let step = [inc(p, "Width"), inc(p, "Height"), inc(p, "OffsetX"), inc(p, "OffsetY")];
+
+        let fps_at = |p: &mut Params, f: PixelFormat, w: u32, h: u32| -> Option<f64> {
+            set_int(p, "Width", w as i64).ok()?;
+            set_int(p, "Height", h as i64).ok()?;
+            let cam = float_max(p, "AcquisitionFrameRate").ok()?;
+            let link = link_fps(p, f, w, h).map_or(f64::MAX, |l| l.0);
+            Some((cam.min(link) * 10.0).floor() / 10.0)
+        };
+        let max_fps = (|| {
+            set_int(p, "Width", s.width as i64).ok()?;
+            set_int(p, "Height", s.height as i64).ok()?;
+            set_int(p, "OffsetX", s.offset_x as i64).ok()?;
+            set_int(p, "OffsetY", s.offset_y as i64).ok()?;
+            fps_at(p, s.pixel_format, s.width, s.height)
+        })();
+
+        let snap = |v: u32, step: u32, min: u32, max: u32| (v / step * step).clamp(min, max);
+        let mut heights: Vec<u32> = [s.height, sensor.1, 1080, 720, 480, 240, 120]
+            .into_iter()
+            .filter(|&h| h <= sensor.1)
+            .map(|h| snap(h, step[1], min_size.1, sensor.1))
+            .collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        heights.dedup();
+        let mut table = Vec::new();
+        for f in formats {
+            if set_enum(p, "PixelFormat", f.name()).is_err() {
+                continue;
+            }
+            let _ = set_int(p, "OffsetX", 0);
+            let _ = set_int(p, "OffsetY", 0);
+            let Ok(wmax) = int_max(p, "Width") else { continue };
+            let w = snap(s.width, step[0], min_size.0, wmax as u32);
+            table.push((f, heights.iter().map(|&h| fps_at(p, f, w, h)).collect()));
+        }
+        Ok(Limits { sensor, min_size, step, exposure_us, gain_db, max_fps, heights, table })
     }
 
     /// Every available PixelFormat we can record, at full sensor size and
@@ -353,6 +436,56 @@ fn map_format(f: &UPixelFormat) -> Option<PixelFormat> {
         UPixelFormat::YCbCr422_8_CbYCrY => PixelFormat::Uyvy,
         _ => return None,
     })
+}
+
+/// Exposure and gain for `apply` and `limits`, with the frame rate
+/// unconstrained. With auto exposure: the shortest exposure the auto may
+/// use (the frame rate must hold there); the auto is switched on later.
+fn set_exposure(p: &mut Params, s: &CameraSettings) -> Result<(), String> {
+    let _ = set_bool(p, "AcquisitionFrameRateEnable", false);
+    // The auto features may not exist on every model.
+    let _ = set_enum(p, "ExposureAuto", "Off");
+    let _ = set_enum(p, "GainAuto", "Off");
+    if s.auto_exposure {
+        set_float_clamped(p, "ExposureTime", s.auto_exposure_range.0)?;
+    } else {
+        set_float(p, "ExposureTime", s.exposure_us)?;
+        set_float(p, "Gain", s.gain_db)?;
+    }
+    Ok(())
+}
+
+/// Frame rate the USB link limit allows, and the limit [bytes/s]; `None`
+/// if the camera does not limit it.
+fn link_fps(p: &mut Params, f: PixelFormat, width: u32, height: u32) -> Option<(f64, f64)> {
+    let mode = p.node("DeviceLinkThroughputLimitMode").and_then(|n| n.as_enumeration(p));
+    if mode.and_then(|n| n.current_entry(p).ok()).is_some_and(|e| e.symbolic(p) == "Off") {
+        return None;
+    }
+    let limit = p.node("DeviceLinkThroughputLimit").and_then(|n| n.as_integer(p)).and_then(|n| n.value(p).ok())? as f64;
+    let wire_bits = if f.is_packed() { f.bits() as f64 } else { 8.0 * f.bytes_per_pixel() as f64 };
+    Some((limit / (width as f64 * height as f64 * wire_bits / 8.0), limit))
+}
+
+/// Set a Min/Max feature pair, clamped to what the camera allows. Min goes
+/// to its lowest first so any new max fits. Failures are only reported.
+fn set_range(p: &mut Params, min_name: &str, max_name: &str, lo: f64, hi: f64) {
+    let lowest = p.node(min_name).and_then(|n| n.as_float(p)).and_then(|n| n.min(p).ok());
+    if let Some(l) = lowest {
+        let _ = set_float(p, min_name, l);
+    }
+    for (name, v) in [(max_name, hi.max(lo)), (min_name, lo)] {
+        if let Err(e) = set_float_clamped(p, name, v) {
+            eprintln!("warning: {e}");
+        }
+    }
+}
+
+fn set_float_clamped(p: &mut Params, name: &str, v: f64) -> Result<(), String> {
+    let node = p.node(name).and_then(|n| n.as_float(p)).ok_or_else(|| missing(name, "float"))?;
+    let (lo, hi) = (node.min(p).unwrap_or(f64::MIN), node.max(p).unwrap_or(f64::MAX));
+    let v = v.clamp(lo, hi.max(lo));
+    node.set_value(p, v).map_err(|e| format!("{name} = {v}: {e}"))
 }
 
 fn missing(name: &str, kind: &str) -> String {

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::camera::{self, Camera, Mode};
+use crate::camera::{self, Camera, Limits, Mode};
 use crate::frame::{BufferPool, Frame};
 use crate::recorder::{RecStats, Recorder};
 use crate::scenario::{Device, Scenario};
@@ -136,6 +136,21 @@ impl Engine {
     /// Stop the camera (opening `s.device` if needed) and ask it which modes
     /// it supports. The camera stays stopped until the next `apply`.
     pub fn modes(&mut self, s: &Scenario) -> Result<Vec<Mode>, String> {
+        self.stopped_camera(s)?.modes(&s.camera)
+    }
+
+    /// Stop the camera (opening `s.device` if needed) and read its limits
+    /// for `s`. The camera stays stopped until the next `apply`.
+    pub fn limits(&mut self, s: &Scenario) -> Result<Limits, String> {
+        self.stopped_camera(s)?.limits(&s.camera)
+    }
+
+    /// Highest frame rate the camera allows with the active settings.
+    pub fn max_fps(&self) -> Option<f64> {
+        self.camera.as_ref().and_then(|(_, c)| c.max_fps())
+    }
+
+    fn stopped_camera(&mut self, s: &Scenario) -> Result<&mut Box<dyn Camera>, String> {
         if self.is_recording() {
             return Err("cannot probe while recording".into());
         }
@@ -147,7 +162,7 @@ impl Engine {
             self.camera = None;
             self.camera = Some((s.device.clone(), camera::open(&s.device)?));
         }
-        self.camera.as_mut().unwrap().1.modes(&s.camera)
+        Ok(&mut self.camera.as_mut().unwrap().1)
     }
 
     /// Take the latest preview frame, if a new one arrived.
