@@ -200,7 +200,10 @@ impl Writer {
             // Concatenated JPEG frames, copied into the MKV unchanged.
             cmd.args(["-f", "mjpeg"]);
         } else {
-            cmd.args(["-f", "rawvideo", "-pix_fmt", f.format.ffmpeg_input()])
+            // FFVHuff keeps >8-bit samples bit-exact only as plain 16-bit
+            // words; the PIXEL_FORMAT tag tells the real depth.
+            let pix_fmt = if encoder.id == "ffvhuff" && f.format.bits() > 8 { "gray16le" } else { f.format.ffmpeg_input() };
+            cmd.args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
                 .args(["-video_size", &format!("{}x{}", f.width, f.height)]);
         }
         let mut child = cmd

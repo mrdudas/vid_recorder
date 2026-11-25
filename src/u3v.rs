@@ -131,19 +131,30 @@ impl Camera for U3vCamera {
         set_int(&mut p, "Height", s.height as i64)?;
         set_int(&mut p, "OffsetX", s.offset_x as i64)?;
         set_int(&mut p, "OffsetY", s.offset_y as i64)?;
-        // The camera accepts any frame rate but silently drops frames that
-        // do not fit through its USB link: refuse those settings. Measured
-        // (Alvium 1800 U-291c, 2026-11): 373 MB/s ran clean, 415 MB/s lost
-        // frames although the reported limit is 450 MB/s, hence the margin.
-        let limit = p.node("DeviceLinkThroughputLimit").and_then(|n| n.as_integer(&p)).and_then(|n| n.value(&mut p).ok());
+        // Extra features before the frame rate checks: they may change the
+        // limits (binning, DeviceLinkThroughputLimit...).
+        for (name, value) in &s.extra {
+            set_json(&mut p, name, value)?;
+        }
+        // The camera accepts any frame rate but silently runs slower (or
+        // drops frames) when the sensor or the USB link cannot keep up:
+        // refuse those settings.
+        let limit_on = p
+            .node("DeviceLinkThroughputLimitMode")
+            .and_then(|n| n.as_enumeration(&p))
+            .and_then(|n| n.current_entry(&mut p).ok())
+            .is_none_or(|e| e.symbolic(&p) != "Off");
+        let limit = limit_on
+            .then(|| p.node("DeviceLinkThroughputLimit").and_then(|n| n.as_integer(&p)).and_then(|n| n.value(&mut p).ok()))
+            .flatten();
         if let Some(limit) = limit {
             let wire_bits = if s.pixel_format.is_packed() { s.pixel_format.bits() as f64 } else { 8.0 * s.pixel_format.bytes_per_pixel() as f64 };
             let frame_bytes = s.width as f64 * s.height as f64 * wire_bits / 8.0;
-            let usable = limit as f64 * 0.85;
+            let usable = limit as f64;
             let max_fps = usable / frame_bytes;
             if s.frame_rate > max_fps {
                 return Err(format!(
-                    "{:.0} fps needs {:.0} MB/s, the USB link reliably carries {:.0} MB/s: at most {:.1} fps with {}x{} {}",
+                    "{:.0} fps needs {:.0} MB/s, the USB link carries {:.0} MB/s: at most {:.1} fps with {}x{} {}",
                     s.frame_rate,
                     s.frame_rate * frame_bytes / 1e6,
                     usable / 1e6,
@@ -154,8 +165,9 @@ impl Camera for U3vCamera {
                 ));
             }
         }
-        let _ = set_bool(&mut p, "AcquisitionFrameRateEnable", true);
-        set_float(&mut p, "AcquisitionFrameRate", s.frame_rate)?;
+        // Exposure first, with the frame rate unconstrained (the exposure
+        // range depends on the current frame rate and vice versa).
+        let _ = set_bool(&mut p, "AcquisitionFrameRateEnable", false);
         if s.auto_exposure {
             // Keep the exposure within one frame so the frame rate holds.
             if let Err(e) = set_float(&mut p, "ExposureAutoMax", (1e6 / s.frame_rate * 0.95).max(100.0)) {
@@ -170,9 +182,19 @@ impl Camera for U3vCamera {
             set_float(&mut p, "ExposureTime", s.exposure_us)?;
             set_float(&mut p, "Gain", s.gain_db)?;
         }
-        for (name, value) in &s.extra {
-            set_json(&mut p, name, value)?;
+        // The maximum now reflects format, size and exposure.
+        let _ = set_bool(&mut p, "AcquisitionFrameRateEnable", true);
+        let max = p.node("AcquisitionFrameRate").and_then(|n| n.as_float(&p)).and_then(|n| n.max(&mut p).ok());
+        if let Some(max) = max.filter(|&m| s.frame_rate > m + 1e-3) {
+            return Err(format!(
+                "the camera does at most {max:.1} fps with {}x{} {} and {}",
+                s.width,
+                s.height,
+                s.pixel_format.name(),
+                if s.auto_exposure { "auto exposure".to_string() } else { format!("{} µs exposure", s.exposure_us) }
+            ));
         }
+        set_float(&mut p, "AcquisitionFrameRate", s.frame_rate)?;
         Ok(())
     }
 

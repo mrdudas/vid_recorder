@@ -150,6 +150,9 @@ struct Probe {
     gray: bool,
     /// PIXEL_FORMAT tag written by the recorder (e.g. "BayerRG12").
     tag: Option<String>,
+    /// Left shift that brings the samples to full 16-bit range: set when
+    /// fewer bits are stored as plain 16-bit words (FFVHuff recordings).
+    shift: u32,
 }
 
 fn probe(input: &str) -> Result<Probe, String> {
@@ -171,12 +174,19 @@ fn probe(input: &str) -> Result<Probe, String> {
         })
         .filter(|f| f.is_finite() && *f > 0.0)
         .ok_or("ffprobe: no frame rate")?;
+    let tag = field("TAG:PIXEL_FORMAT");
+    let bits = tag.as_deref().and_then(|t| crate::frame::PixelFormat::ALL.into_iter().find(|f| f.name() == t)).map(|f| f.bits());
+    let shift = match (field("pix_fmt").as_deref(), bits) {
+        (Some("gray16le"), Some(b)) if b < 16 => 16 - b,
+        _ => 0,
+    };
     Ok(Probe {
         w: num("width")?,
         h: num("height")?,
         fps,
         gray: field("pix_fmt").is_some_and(|p| p.starts_with("gray")),
-        tag: field("TAG:PIXEL_FORMAT"),
+        tag,
+        shift,
     })
 }
 
@@ -221,14 +231,19 @@ fn spawn_decoder(input: &str, p: &Probe, o: &Options, from: f64, len: Option<f64
     }
     first.args(["-an", "-f", "rawvideo"]);
     let bayer = o.bayer.as_ref().filter(|_| p.gray);
+    let expand = (p.shift > 0).then(|| format!("lut=c0=val*{}", 1u32 << p.shift));
     match bayer {
         None => {
-            if let Some(s) = &scale {
-                first.args(["-vf", s]);
+            let vf: Vec<&str> = expand.iter().chain(scale.iter()).map(String::as_str).collect();
+            if !vf.is_empty() {
+                first.args(["-vf", &vf.join(",")]);
             }
             first.args(["-pix_fmt", if colour { "rgb48le" } else { "gray16le" }]);
         }
         Some(_) => {
+            if let Some(e) = &expand {
+                first.args(["-vf", e]);
+            }
             first.args(["-pix_fmt", "gray16le"]);
         }
     }

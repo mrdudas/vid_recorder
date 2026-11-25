@@ -71,18 +71,20 @@ pub const PROFILES: &[Profile] = &[
         args: &["-c:v", "hevc_videotoolbox", "-b:v", "200M", "-allow_sw", "0"],
         container: "mkv",
     },
-    // Fast, but bit-exact only for 8 bit (higher depths are converted).
+    // Fast and bit-exact at every depth: above 8 bit the samples go in as
+    // 16-bit words unchanged (gray16le). 10-bit 1080p Bayer, 2026-11:
+    // ~380 fps vs FFV1 ~66 fps, files ~1.5x the FFV1 size.
     Profile {
         id: "ffvhuff",
-        label: "FFVHuff (veszteségmentes 8 bitig, szoftveres, gyors)",
+        label: "FFVHuff (veszteségmentes, szoftveres, gyors)",
         hardware: false,
-        lossless_bits: 8,
-        args: &["-c:v", "ffvhuff", "-pred", "median"],
+        lossless_bits: 16,
+        args: &["-c:v", "ffvhuff", "-pred", "left"],
         container: "mkv",
     },
     Profile {
         id: "ffv1",
-        label: "FFV1 (veszteségmentes, szoftveres)",
+        label: "FFV1 (veszteségmentes, kisebb fájl, lassú)",
         hardware: false,
         lossless_bits: 16,
         args: &["-c:v", "ffv1", "-level", "3", "-g", "1", "-slices", "16", "-slicecrc", "1"],
