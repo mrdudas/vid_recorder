@@ -64,6 +64,8 @@ struct RecPage {
 
 /// Extra folders on the recordings page, one path per line.
 const FOLDERS_FILE: &str = "recording_folders.txt";
+/// Name of the active scenario, loaded again at the next start.
+const ACTIVE_FILE: &str = "active_scenario.txt";
 
 /// Browses one video: the frame at `t` is decoded on a worker thread.
 struct Viewer {
@@ -228,7 +230,9 @@ impl App {
             let _ = scenario::save(&dir, &s);
             scenarios.push(s);
         }
-        let edit = scenarios[0].clone();
+        // The scenario that was active at the last exit.
+        let last = std::fs::read_to_string(ACTIVE_FILE).unwrap_or_default();
+        let edit = scenarios.iter().find(|s| s.name == last.trim()).unwrap_or(&scenarios[0]).clone();
         let mut app = App {
             engine,
             dir,
@@ -270,7 +274,7 @@ impl App {
             dark_capture: None,
             dark_frames: 32,
         };
-        let first = app.scenarios[0].clone();
+        let first = app.edit.clone();
         app.apply(&first);
         app
     }
@@ -288,7 +292,17 @@ impl App {
         self
     }
 
+    /// Make `s` the active scenario: the camera switches to it, the main
+    /// and the settings page both show it, and it is loaded at the next start.
     fn apply(&mut self, s: &Scenario) {
+        if self.edit.name != s.name || self.edit != *s {
+            self.extra_json = extra_to_json(s);
+            self.edit = s.clone();
+            self.confirm_delete_scenario = false;
+        }
+        if self.shots.is_none() {
+            let _ = std::fs::write(ACTIVE_FILE, &s.name);
+        }
         self.message = match self.engine.apply(s) {
             Ok(()) => format!("Szcenárió aktív: {}", s.name),
             Err(e) if self.engine.waiting_for_camera() => format!("Nincs kamera ({e}). Várakozás a csatlakozásra…"),
@@ -354,10 +368,8 @@ impl App {
             let name = self.engine.scenario.as_ref().map_or(String::new(), |s| s.name.clone());
             self.take_dark(&frame);
             // The dark frame, if switched on and it fits these frames.
-            let dark = self.dark_of(&name).filter(|d| {
-                view.dark
-                    && self.engine.scenario.as_ref().is_some_and(|s| d.check(&s.camera, Some((frame.format, frame.width, frame.height))).is_ok())
-            });
+            let shape = Some((frame.format, frame.width, frame.height));
+            let dark = self.dark_of(shape).filter(|d| view.dark && self.engine.scenario.as_ref().is_some_and(|s| d.check(&s.camera, shape).is_ok()));
             let img = if view.average {
                 // Restart on a new scenario or other averaging settings.
                 let settings = stack::Settings { frames: view.average_frames, align: view.align, dark: dark.is_some() };
@@ -412,11 +424,15 @@ impl App {
 
     /// White balance, brightness and contrast of the active scenario's
     /// preview. Saved with the scenario on the settings page.
-    /// The scenario's dark frame (loaded from disk once).
-    fn dark_of(&mut self, name: &str) -> Option<std::sync::Arc<Dark>> {
-        if self.dark.as_ref().is_none_or(|(n, _)| n != name) {
-            let d = Dark::load(&dark::path(name)).ok().map(std::sync::Arc::new);
-            self.dark = Some((name.to_string(), d));
+    /// The camera's dark frame that fits the running settings best
+    /// (looked up again when the camera, settings or frames change).
+    fn dark_of(&mut self, frames: Option<(PixelFormat, u32, u32)>) -> Option<std::sync::Arc<Dark>> {
+        let s = self.engine.scenario.as_ref()?;
+        let camera = self.engine.camera_name();
+        let key = format!("{camera}|{:?}|{frames:?}", s.camera);
+        if self.dark.as_ref().is_none_or(|(k, _)| *k != key) {
+            let d = dark::find(&camera, &s.camera, frames).and_then(|p| Dark::load(&p).ok()).map(std::sync::Arc::new);
+            self.dark = Some((key, d));
         }
         self.dark.as_ref().and_then(|(_, d)| d.clone())
     }
@@ -434,89 +450,123 @@ impl App {
             return;
         }
         let Some(d) = self.dark_capture.take().and_then(|c| c.finish(&s.camera)) else { return };
-        let path = dark::path(&s.name);
+        let path = dark::path(&self.engine.camera_name(), &d.meta);
         self.message = match d.save(&path) {
             Ok(()) => format!(
-                "Sötétkép mentve: {} ({} kép, átlagszint {:.2}%, {} forró pixel)",
-                path.display(),
+                "Sötétkép kész: {} kép, átlagszint {:.2}%, {} forró pixel. Most vedd le a takarást az objektívről.",
                 d.meta.frames,
                 d.meta.mean * 100.0,
                 d.meta.hot
             ),
             Err(e) => format!("A sötétkép nem menthető: {e}"),
         };
-        self.dark = Some((s.name.clone(), Some(std::sync::Arc::new(d))));
+        self.dark = None;
         if let Some(a) = self.engine.scenario.as_mut() {
             a.view.dark = true;
         }
+        self.edit.view.dark = true;
         self.stacker.reset();
     }
 
-    /// Dark calibration controls (part of the preview settings).
-    fn dark_controls(&mut self, ui: &mut egui::Ui) {
-        let Some(s) = self.engine.scenario.clone() else { return };
-        let dark = self.dark_of(&s.name);
-        let shape = (self.frame_size.0 > 0).then(|| (s.camera.pixel_format, self.frame_size.0, self.frame_size.1));
-        ui.label(egui::RichText::new("Sötétkalibráció").strong());
-        if !dark::supported(s.camera.pixel_format) {
-            ui.small(format!("{} képnél nem lehet: csak nyers (Mono, Bayer) formátumnál.", s.camera.pixel_format.name()));
-            return;
-        }
-        match &dark {
-            Some(d) => {
-                let m = &d.meta;
-                let check = d.check(&s.camera, shape);
-                let mut on = s.view.dark;
-                let r = ui.add_enabled(check.is_ok(), egui::Checkbox::new(&mut on, "Sötétkép levonása"))
-                    .on_hover_text("A sötétkép pixelenkénti értékét levonja a nyers képből: eltűnik az alapszint, a mintázat és a forró pixelek. Az élőképre, az átlagra és a mentett képre hat, a felvételre nem.");
-                if r.changed()
-                    && let Some(a) = self.engine.scenario.as_mut()
-                {
-                    a.view.dark = on;
+    /// Dark calibration of the camera: cover the lens, take, use as filter.
+    fn dark_section(&mut self, ui: &mut egui::Ui) {
+        let frames = (self.frame_size.0 > 0).then_some(()).and(self.engine.actual().format).map(|f| (f, self.frame_size.0, self.frame_size.1));
+        let dark = self.dark_of(frames);
+        let camera = self.engine.camera_name();
+        let running = self.engine.scenario.clone();
+        let mut delete = None;
+        section(ui, "Sötétkalibráció", true, |ui| {
+            let Some(s) = running else {
+                ui.label("A kamera nem fut.");
+                return;
+            };
+            if !dark::supported(s.camera.pixel_format) {
+                ui.label(format!("{} képnél nem lehet: csak nyers (Mono, Bayer) formátumnál.", s.camera.pixel_format.name()));
+                return;
+            }
+            ui.small("A szenzor minden pixele fény nélkül is ad egy alapértéket (sötétszint, mintázat, forró pixelek). A sötétkép ezt méri meg, és szűrőként levonja a képből. A kamerához tartozik, formátumonként, kivágásonként, expozíciónként és erősítésenként egy.");
+            ui.add_space(4.0);
+            match &self.dark_capture {
+                Some(c) => {
+                    let (n, target) = (c.n, c.target);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(format!("Sötétkép felvétele: {n}/{target} – az objektív maradjon letakarva!")).strong());
+                        if ui.button("Mégse").clicked() {
+                            self.dark_capture = None;
+                        }
+                    });
                 }
-                ui.small(format!(
-                    "{}, {} kép, {} µs, {} dB · átlagszint {:.2}%, {} forró pixel",
-                    m.taken, m.frames, m.exposure_us, m.gain_db, m.mean * 100.0, m.hot
-                ));
-                match check {
-                    Err(e) => {
-                        ui.colored_label(RED, format!("Nem használható: {e}. Készíts újat."));
-                    }
-                    Ok(w) if !w.is_empty() => {
-                        ui.colored_label(ORANGE, format!("{}: készíts újat.", w.join("; ")));
-                    }
-                    Ok(_) => {}
+                None => {
+                    ui.label("1. Takard le az objektívet, hogy ne érje fény.");
+                    ui.horizontal(|ui| {
+                        ui.label("2.");
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new("◼  Sötétkép felvétele").strong()).min_size(egui::vec2(180.0, 30.0)))
+                            .on_hover_text(format!(
+                                "{} kép átlaga, a mostani beállításokkal: {} {}×{}, {} µs, {} dB.",
+                                self.dark_frames, s.camera.pixel_format.name(), s.camera.width, s.camera.height, s.camera.exposure_us, s.camera.gain_db
+                            ))
+                            .clicked()
+                        {
+                            self.dark_capture = Some(dark::Capture::new(self.dark_frames));
+                            self.message = "Sötétkép felvétele…".into();
+                        }
+                        ui.add(egui::DragValue::new(&mut self.dark_frames).range(4..=1000).suffix(" kép"));
+                    });
+                    ui.label("3. Vedd le a takarást; a sötétkép szűrőként levonódik.");
                 }
             }
-            None => {
-                ui.small("Ehhez a szcenárióhoz még nincs sötétkép.");
-            }
-        }
-        match &self.dark_capture {
-            Some(c) => {
-                let (n, target) = (c.n, c.target);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Sötétkép felvétele: {n}/{target}"));
-                    if ui.button("Mégse").clicked() {
-                        self.dark_capture = None;
-                    }
-                });
-            }
-            None => {
-                ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            match &dark {
+                Some(d) => {
+                    let m = &d.meta;
+                    let mut on = s.view.dark;
                     if ui
-                        .button("Sötétkép felvétele")
-                        .on_hover_text("Előbb takard le az objektívet! A szcenárió expozíciójával és erősítésével készül; ha azok változnak, készíts újat.")
-                        .clicked()
+                        .checkbox(&mut on, egui::RichText::new("Sötétkép levonása (szűrő)").strong())
+                        .on_hover_text("Az élőképre, az átlagolásra és a mentett képre hat. A felvétel nyers marad.")
+                        .changed()
                     {
-                        self.dark_capture = Some(dark::Capture::new(self.dark_frames));
-                        self.message = "Sötétkép: az objektív legyen letakarva…".into();
+                        if let Some(a) = self.engine.scenario.as_mut() {
+                            a.view.dark = on;
+                        }
+                        self.edit.view.dark = on;
                     }
-                    ui.add(egui::DragValue::new(&mut self.dark_frames).range(4..=1000).suffix(" kép"));
-                });
-                ui.small("Takard le az objektívet, mielőtt elindítod.");
+                    ui.small(format!(
+                        "Használt sötétkép: {} {}×{}, {} µs, {} dB · {} kép, {} · átlagszint {:.2}%, {} forró pixel",
+                        m.format.name(), m.width, m.height, m.exposure_us, m.gain_db, m.frames, m.taken, m.mean * 100.0, m.hot
+                    ));
+                    if let Ok(w) = d.check(&s.camera, frames)
+                        && !w.is_empty()
+                    {
+                        ui.colored_label(ORANGE, format!("{}: érdemes újat felvenni.", w.join("; ")));
+                    }
+                }
+                None => {
+                    ui.colored_label(ORANGE, "Ehhez a beállításhoz (formátum, méret, kivágás) még nincs sötétkép.");
+                }
             }
+            let all = dark::list(&camera);
+            if !all.is_empty() {
+                egui::CollapsingHeader::new(format!("A kamera sötétképei ({})", all.len())).show(ui, |ui| {
+                    egui::Grid::new("darks").striped(true).show(ui, |ui| {
+                        for (p, m) in &all {
+                            ui.label(format!("{} {}×{} ({}, {})", m.format.name(), m.width, m.height, m.offset_x, m.offset_y));
+                            ui.label(if m.auto_exposure { "auto".into() } else { format!("{} µs, {} dB", m.exposure_us, m.gain_db) });
+                            ui.label(&m.taken);
+                            if ui.small_button("Törlés").clicked() {
+                                delete = Some(p.clone());
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(p) = delete {
+            let _ = std::fs::remove_file(&p);
+            self.dark = None;
+            self.stacker.reset();
         }
     }
 
@@ -585,9 +635,13 @@ impl App {
         if ui.button("Alaphelyzet").clicked() {
             *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, ..View::default() };
         }
-        ui.separator();
-        self.dark_controls(ui);
-        ui.separator();
+        let frames = self.engine.actual().format.map(|f| (f, self.frame_size.0, self.frame_size.1));
+        if self.dark_of(frames).is_some()
+            && let Some(s) = self.engine.scenario.as_mut()
+        {
+            ui.checkbox(&mut s.view.dark, "Sötétkép levonása").on_hover_text("A kamera sötétképe (Beállítások → Sötétkalibráció).");
+            self.edit.view.dark = s.view.dark;
+        }
         ui.small("Csak az élőképre hat, a felvétel nyers marad.");
     }
 
@@ -760,10 +814,10 @@ impl App {
         (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
         match self.engine.apply(&s) {
             Ok(()) => {
-                if !main {
-                    let c = &mut self.edit.camera;
-                    (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
-                }
+                // One active scenario: the settings page shows the crop too
+                // (saved only with Mentés).
+                let c = &mut self.edit.camera;
+                (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
                 self.message = format!("Kivágás: {w}×{h} ({x}, {y})");
             }
             Err(e) => {
@@ -818,9 +872,10 @@ impl App {
             && let Some(first) = m.first()
             && !m.iter().any(|m| m.format == s.camera.pixel_format)
         {
+            let old = s.camera.pixel_format;
             set_mode(&mut self.edit, first);
             set_mode(&mut s, first);
-            self.message += &format!(" A(z) {} formátumot nem tudja, átállítva: {}.", s.camera.pixel_format.name(), mode_label(first));
+            self.message += &format!(" A kamera nem tud {} formátumot, átállítva: {}.", old.name(), mode_label(first));
             fixed = Some(s.clone());
         }
         self.limits = Some((s.device.clone(), l));
@@ -841,7 +896,8 @@ impl App {
         let recording = self.recording.is_some();
         let w = ui.available_width();
         ui.label(egui::RichText::new("Szcenárió").strong());
-        let current = self.engine.scenario.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+        // The active scenario (also while its camera is away).
+        let current = self.engine.scenario.as_ref().map_or(self.edit.name.clone(), |s| s.name.clone());
         let mut chosen = None;
         ui.add_enabled_ui(!recording, |ui| {
             egui::ComboBox::from_id_salt("scenario")
@@ -1104,6 +1160,7 @@ impl App {
                 self.camera_section(ui);
                 self.image_section(ui);
                 self.exposure_section(ui);
+                self.dark_section(ui);
                 self.recording_section(ui);
                 self.preview_section(ui);
                 section(ui, "Haladó: további kamerabeállítások", false, |ui| {
@@ -1128,10 +1185,9 @@ impl App {
                         }
                     }
                 });
+                // The chosen one becomes the active scenario everywhere.
                 if let Some(s) = pick {
-                    self.extra_json = extra_to_json(&s);
-                    self.edit = s;
-                    self.confirm_delete_scenario = false;
+                    self.apply(&s);
                 }
                 if ui.button("Új").on_hover_text("Új szcenárió a mostani beállításokból").clicked() {
                     self.edit = Scenario { name: "uj_szcenario".into(), ..self.edit.clone() };
@@ -1151,11 +1207,23 @@ impl App {
             if ui.button("Mentés").clicked()
                 && let Some(s) = self.edited()
             {
-                self.message = match scenario::save(&self.dir, &s) {
-                    Ok(p) => format!("Mentve: {}", p.display()),
+                let saved = scenario::save(&self.dir, &s);
+                self.reload();
+                // The saved version is the active one (new name or settings
+                // not yet tried: the camera switches to it).
+                if saved.is_ok() && self.engine.scenario.as_ref() != Some(&s) {
+                    self.apply(&s);
+                }
+                self.message = match saved {
+                    Ok(p) => format!("Mentve és aktív: {}", p.display()),
                     Err(e) => format!("Hiba mentéskor: {e}"),
                 };
-                self.reload();
+            }
+            // Unsaved changes of the active scenario.
+            let stored = self.scenarios.iter().find(|x| x.name == self.edit.name);
+            let differs = stored.is_none_or(|x| x.camera != self.edit.camera || x.recording != self.edit.recording || x.export != self.edit.export || x.preview_lut != self.edit.preview_lut || x.device != self.edit.device);
+            if differs {
+                ui.colored_label(ORANGE, "● nem mentett módosítás");
             }
             if !self.confirm_delete_scenario {
                 if ui.button("Törlés").clicked() {
@@ -1170,6 +1238,9 @@ impl App {
                     };
                     self.confirm_delete_scenario = false;
                     self.reload();
+                    // Another scenario becomes active.
+                    let next = self.scenarios.first().cloned().unwrap_or_default();
+                    self.apply(&next);
                 }
                 if ui.button("Mégse").clicked() {
                     self.confirm_delete_scenario = false;

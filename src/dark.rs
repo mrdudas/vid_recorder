@@ -7,8 +7,11 @@
 //! format, size, crop and mirroring; exposure, gain and temperature change
 //! it, so a mismatch is reported.
 //!
-//! File: `darks/<scenario>.dark`: one JSON line (the settings it was taken
-//! with), then the levels as little-endian f32 (0..1 of the full scale).
+//! Dark frames belong to the camera: `darks/<camera>/<settings>.dark`, one
+//! per format, size, crop, mirroring, exposure and gain. The best fitting
+//! one is used: same format, size, crop and mirroring, nearest exposure
+//! and gain. File: one JSON line (the settings it was taken with), then
+//! the levels as little-endian f32 (0..1 of the full scale).
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,8 +53,56 @@ pub fn supported(f: PixelFormat) -> bool {
     f.is_bayer() || matches!(f, PixelFormat::Mono8 | PixelFormat::Mono10 | PixelFormat::Mono12 | PixelFormat::Mono16)
 }
 
-pub fn path(scenario: &str) -> PathBuf {
-    Path::new(DIR).join(format!("{scenario}.dark"))
+/// Folder of a camera's dark frames (camera name made file-safe).
+pub fn camera_dir(camera: &str) -> PathBuf {
+    let safe: String = camera.chars().map(|c| if c.is_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect();
+    Path::new(DIR).join(safe)
+}
+
+/// File of a dark frame in its camera's folder.
+pub fn path(camera: &str, m: &Meta) -> PathBuf {
+    let rev = match (m.reverse_x, m.reverse_y) {
+        (false, false) => "",
+        (true, false) => "_rx",
+        (false, true) => "_ry",
+        (true, true) => "_rxy",
+    };
+    let exposure = if m.auto_exposure { "auto".to_string() } else { format!("{}us_{}dB", m.exposure_us, m.gain_db) };
+    camera_dir(camera).join(format!("{}_{}x{}_{}_{}{rev}_{exposure}.dark", m.format.name(), m.width, m.height, m.offset_x, m.offset_y))
+}
+
+fn read_meta(path: &Path) -> Result<Meta, String> {
+    let mut r = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    let mut head = String::new();
+    r.read_line(&mut head).map_err(|e| e.to_string())?;
+    serde_json::from_str(&head).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The camera's dark frames (settings only, not the data), newest first.
+pub fn list(camera: &str) -> Vec<(PathBuf, Meta)> {
+    let Ok(dir) = std::fs::read_dir(camera_dir(camera)) else { return Vec::new() };
+    let mut v: Vec<(PathBuf, Meta)> = dir
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "dark"))
+        .filter_map(|p| read_meta(&p).ok().map(|m| (p, m)))
+        .collect();
+    v.sort_by(|a, b| b.1.taken.cmp(&a.1.taken));
+    v
+}
+
+/// The camera's dark frame that fits these settings and frames best:
+/// usable at all, then fewest warnings, then nearest exposure and gain.
+pub fn find(camera: &str, c: &CameraSettings, frames: Option<(PixelFormat, u32, u32)>) -> Option<PathBuf> {
+    list(camera)
+        .into_iter()
+        .filter_map(|(p, meta)| {
+            let warn = Dark { meta: meta.clone(), data: Vec::new() }.check(c, frames).ok()?;
+            let dist = (c.exposure_us.max(1.0) / meta.exposure_us.max(1.0)).ln().abs() + (c.gain_db - meta.gain_db).abs() / 6.0;
+            Some((warn.len(), dist, p))
+        })
+        .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+        .map(|(_, _, p)| p)
 }
 
 impl Dark {

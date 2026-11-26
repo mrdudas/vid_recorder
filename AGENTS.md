@@ -81,6 +81,10 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - **Mozgás- és színnagyítás**: a kiválasztott módszerek egy rácsban.
 - **Törlés** a hely felszabadítására: kézzel, megerősítéssel, vagy választhatóan sikeres export után automatikusan. Felvétel vagy export alatt álló fájl nem törölhető.
 
+### Egy aktív szcenárió
+- A rendszerben egyszerre egy szcenárió aktív: a főoldal és a beállítóoldal is ugyanazt mutatja. Bármelyik oldalon választott szcenárió aktív lesz, és a kamera átáll rá. A beállítóoldal ennek a munkapéldányát szerkeszti; a „Mentés” elmenti és aktívvá teszi, a nem mentett módosítást narancs jelzi.
+- A program az `active_scenario.txt` fájlba írja (nincs verziókezelve), melyik szcenárió aktív, és induláskor azt tölti be.
+
 ### Főoldal
 - Itt lehet kiválasztani a mentett szcenáriókat. **Szcenárióváltáskor a kamera azonnal átáll** az új beállításokra.
 - Nagy **REC** gomb. Felvétel közben **Szünet/Folytatás** és **Stop**.
@@ -95,8 +99,8 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - **Igazítás** (ki-be kapcsolható): minden képet eltolással és forgatással az átlaghoz igazít (képpiramis, Gauss–Newton, durva eltoláskereséssel), pl. csillagvizsgálónál. 1080p színes képen kb. 44 ms/kép, külön szálon; ha nem bírja, képeket hagy ki az átlagból.
   - Az átlag a beérkező élőkép-képekből (max. 25 fps) készül, nem minden kamerakockából.
   - Ha 10 kép egymás után nem igazítható (pl. teljesen megváltozott a jelenet), az átlag újraindul. Periodikus mintánál (csíkok) a legkisebb elmozdulást választja.
-- **Sötétkalibráció** (ugyanott; csak nyers Mono és Bayer formátumnál): letakart objektívvel N képet (alapból 32) pixelenként átlagol, és `darks/<szcenárió>.dark` fájlba menti (JSON fejléc + f32 értékek, nincs verziókezelve). Bekapcsolva a nyers pixelekből vonja le, a demozaikolás előtt: az élőképre, az átlagra és a mentett PNG-re hat, a felvételre nem.
-  - Csak azonos formátumú, méretű, kivágású és tükrözésű képhez használható. Ha az expozíció, az erősítés eltér, vagy automatikus az expozíció, figyelmeztet, hogy újat kell készíteni.
+- **Sötétkalibráció** (Beállítások → saját rész, lépésenként; csak nyers Mono és Bayer formátumnál): letakart objektívvel N képet (alapból 32) pixelenként átlagol. **A kamerához tartozik**, nem a szcenárióhoz: `darks/<kamera>/<formátum>_<méret>_<eltolás>[_tükrözés]_<expozíció>us_<erősítés>dB.dark` (JSON fejléc + f32 értékek, nincs verziókezelve). Szűrőként („Sötétkép levonása”, a szcenárió élőkép-beállítása) a nyers pixelekből vonja le, a demozaikolás előtt: az élőképre, az átlagra és a mentett PNG-re hat, a felvételre nem.
+  - Mindig a legjobban illő sötétképet használja: azonos formátum, méret, kivágás és tükrözés, legközelebbi expozíció és erősítés. Ha az expozíció vagy az erősítés eltér, vagy automatikus az expozíció, figyelmeztet, hogy újat kell felvenni. A kamera sötétképei listázhatók és törölhetők.
   - Kiírja a sötétszint átlagát és a forró pixelek számát (átlag + 6σ fölött).
   - **Átlagolt kép mentése:** 16 bites lineáris PNG (`atlag_<dátum>.png`) a szcenárió mappájába, LUT, fehéregyensúly és szintek nélkül. A Bayer-kép 2×2-es szuperpixelekből áll, ezért fél felbontású.
 - **Kivágás a főoldalon is**, ugyanúgy, mint a beállítóoldalon, de csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy „A szcenárió kivágása” gombig marad meg. Felvétel közben nem változtatható.
