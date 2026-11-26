@@ -35,6 +35,9 @@ usage:
                                is up or Enter is pressed (no GUI, e.g. over
                                ssh); waits for a missing camera and keeps
                                recording across unplug / replug
+  vid_recorder screenshots [dir=screenshots]
+                               walk through the GUI pages with the simulated
+                               camera and save each page as PNG
   vid_recorder probe <scenario|sim|u3v> [seconds=5]
                                ask the camera which formats, sizes and max
                                frame rates it supports and record-test each
@@ -73,6 +76,7 @@ fn main() -> ExitCode {
         Some("camera-test") => camera_test(&args[1..]),
         Some("record") => record(&args[1..]),
         Some("probe") => probe_camera(&args[1..]),
+        Some("screenshots") => screenshots(&args[1..]),
         Some("limits") => limits(&args[1..]),
         Some("--version") => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -102,6 +106,24 @@ fn main() -> ExitCode {
 
 fn scenario_dir() -> PathBuf {
     PathBuf::from("scenarios")
+}
+
+/// Walk through the GUI pages with the simulated camera and save each as
+/// PNG (for checking the layout without a camera or a screen at hand).
+fn screenshots(args: &[String]) -> Result<bool, String> {
+    let dir = PathBuf::from(args.first().map_or("screenshots", String::as_str));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "vid_recorder",
+        options,
+        Box::new(move |_cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog")).screenshots(dir)))),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 fn gui() -> Result<bool, String> {

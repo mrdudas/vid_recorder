@@ -4202,6 +4202,7 @@ dependencies = [
  "eframe",
  "fs4",
  "nokhwa",
+ "png",
  "rayon",
  "rusb",
  "serde",

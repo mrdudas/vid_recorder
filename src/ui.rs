@@ -121,6 +121,8 @@ pub struct App {
     /// Crop selection being dragged on the preview.
     crop_drag: Option<CropDrag>,
     rec: RecPage,
+    /// Screenshot mode (`vid_recorder screenshots`).
+    shots: Option<Shots>,
 }
 
 /// A running recording on the main page.
@@ -239,10 +241,24 @@ impl App {
             frame_pos: (0, 0),
             crop_drag: None,
             rec: RecPage::default(),
+            shots: None,
         };
         let first = app.scenarios[0].clone();
         app.apply(&first);
         app
+    }
+
+    /// Screenshot mode: every scenario runs on the simulated camera (not
+    /// saved), the pages are walked through and saved as PNG into `dir`.
+    pub fn screenshots(mut self, dir: PathBuf) -> Self {
+        for s in &mut self.scenarios {
+            s.device = Device::Sim;
+        }
+        self.edit.device = Device::Sim;
+        let first = self.scenarios[0].clone();
+        self.apply(&first);
+        self.shots = Some(Shots { dir, step: 0, started: None, pending: None });
+        self
     }
 
     fn apply(&mut self, s: &Scenario) {
@@ -628,19 +644,7 @@ impl App {
         let red = egui::Color32::from_rgb(200, 30, 30);
         if !recording {
             if ui.add(big("⏺  REC", red, w)).clicked() {
-                let name = if self.rec_name.trim().is_empty() {
-                    chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string()
-                } else {
-                    self.rec_name.trim().to_string()
-                };
-                match self.engine.start_recording(&name) {
-                    Ok(info) => {
-                        self.message = format!("Felvétel: {}", info.video);
-                        self.recording =
-                            Some(Rec { info, started: Instant::now(), paused_since: None, paused_total: Duration::ZERO });
-                    }
-                    Err(e) => self.message = format!("Hiba: {e}"),
-                }
+                self.start_recording();
             }
         } else {
             let paused = self.recording.as_ref().is_some_and(|r| r.paused_since.is_some());
@@ -666,6 +670,21 @@ impl App {
         self.status_line(ui);
         ui.separator();
         self.view_controls(ui);
+    }
+
+    fn start_recording(&mut self) {
+        let name = if self.rec_name.trim().is_empty() {
+            chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string()
+        } else {
+            self.rec_name.trim().to_string()
+        };
+        match self.engine.start_recording(&name) {
+            Ok(info) => {
+                self.message = format!("Felvétel: {}", info.video);
+                self.recording = Some(Rec { info, started: Instant::now(), paused_since: None, paused_total: Duration::ZERO });
+            }
+            Err(e) => self.message = format!("Hiba: {e}"),
+        }
     }
 
     fn stop_recording(&mut self) {
@@ -1485,6 +1504,13 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if let Some(mut sh) = self.shots.take() {
+            if sh.tick(self, &ctx) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.shots = Some(sh);
+            }
+        }
         self.watch_camera();
         self.update_preview(&ctx);
         self.poll_test();
@@ -1546,6 +1572,88 @@ impl eframe::App for App {
         }
         self.engine.finish_recording();
     }
+}
+
+/// Screenshot steps: file name and what to do before the picture.
+const SHOTS: [(&str, fn(&mut App)); 5] = [
+    ("1_fooldal", |a| a.page = Page::Main),
+    ("2_fooldal_felvetel", |a| {
+        a.rec_name = "_kepernyokep".into();
+        a.start_recording();
+    }),
+    ("3_fooldal_leallitva", |a| a.stop_recording()),
+    ("4_beallitasok", |a| a.page = Page::Settings),
+    ("5_felvetelek", |a| {
+        a.page = Page::Recordings;
+        a.refresh_recordings();
+        if let Some(r) = a.rec.list.first() {
+            let v = r.video.clone();
+            a.open_viewer(v);
+        }
+    }),
+];
+
+/// How long each screenshot step runs before the picture (preview, decode).
+const SHOT_WAIT: Duration = Duration::from_millis(2000);
+
+struct Shots {
+    dir: PathBuf,
+    step: usize,
+    started: Option<Instant>,
+    pending: Option<std::sync::mpsc::Receiver<std::sync::Arc<egui::ColorImage>>>,
+}
+
+impl Shots {
+    /// Run the current step; returns true when all pictures are saved.
+    fn tick(&mut self, app: &mut App, ctx: &egui::Context) -> bool {
+        ctx.request_repaint();
+        if let Some(rx) = &self.pending {
+            let Ok(img) = rx.try_recv() else { return false };
+            let path = self.dir.join(format!("{}.png", SHOTS[self.step].0));
+            if let Err(e) = save_png(&path, &img) {
+                eprintln!("{}: {e}", path.display());
+            } else {
+                println!("{}", path.display());
+            }
+            self.pending = None;
+            self.started = None;
+            self.step += 1;
+        }
+        if self.step >= SHOTS.len() {
+            // The recording made for the pictures.
+            if let Some(sc) = &app.engine.scenario {
+                for ext in ["mkv", "nut", "csv"] {
+                    let _ = std::fs::remove_file(sc.recording.output_dir.join(format!("_kepernyokep.{ext}")));
+                }
+            }
+            return true;
+        }
+        match self.started {
+            None => {
+                (SHOTS[self.step].1)(app);
+                self.started = Some(Instant::now());
+            }
+            Some(t) if t.elapsed() >= SHOT_WAIT => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                ctx.request_screenshot(move |img| {
+                    let _ = tx.send(img);
+                });
+                self.pending = Some(rx);
+            }
+            Some(_) => {}
+        }
+        false
+    }
+}
+
+fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> Result<(), String> {
+    let file = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+    let mut enc = png::Encoder::new(file, img.size[0] as u32, img.size[1] as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().map_err(|e| e.to_string())?;
+    let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+    w.write_image_data(&rgba).map_err(|e| e.to_string())
 }
 
 fn level_color(l: Level) -> egui::Color32 {
