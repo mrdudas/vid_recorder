@@ -84,6 +84,8 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - Nagy **REC** gomb. Felvétel közben **Szünet/Folytatás** és **Stop**.
   - Szünet alatt nem íródik kép. A CSV-ben a szünet a `frameID` és az időbélyeg ugrásaként látszik. A felvétel hossza és a valós fps a medián képközből számolódik, ezért a szünet nem torzítja.
 - Felvétel közben az élőkép bal felső sarkában villogó piros **● REC** látszik, szünetben sárga **⏸ PAUSE**, mellette a rögzített idő (a szünetek nélkül), mint egy videokamerán.
+- Labor operátoroknak készül: szcenárió, felvétel, Stop, aztán **Export** a leállított felvételre. Az export módját a szcenárió adja meg (`export`: archív, natív videó vagy nagyítás).
+- Alul állapotsor minden oldalon: egy lámpa mutatja, rendben van-e a kamera és a felvétel. A technikai részletek és az élőkép beállításai csukott részben vannak.
 - **Felvétel közben csak a főoldal érhető el**, a Beállítások és a Felvételek menü le van tiltva.
 - Élőkép (max. 25 fps).
 - **Kivágás a főoldalon is**, ugyanúgy, mint a beállítóoldalon, de csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy „A szcenárió kivágása” gombig marad meg. Felvétel közben nem változtatható.
