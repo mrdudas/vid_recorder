@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -88,7 +88,7 @@ pub struct App {
     edit: Scenario,
     extra_json: String,
     rec_name: String,
-    recording: Option<(RecordingInfo, Instant)>,
+    recording: Option<Rec>,
     /// Running recording test (settings page) and its last result.
     test: Option<(probe::Test, Scenario)>,
     test_secs: f64,
@@ -121,6 +121,55 @@ pub struct App {
     /// Crop selection being dragged on the preview.
     crop_drag: Option<CropDrag>,
     rec: RecPage,
+}
+
+/// A running recording on the main page.
+struct Rec {
+    info: RecordingInfo,
+    started: Instant,
+    paused_since: Option<Instant>,
+    paused_total: Duration,
+}
+
+impl Rec {
+    /// Recorded time, pauses excluded.
+    fn elapsed(&self) -> Duration {
+        let paused = self.paused_total + self.paused_since.map_or(Duration::ZERO, |p| p.elapsed());
+        self.started.elapsed().saturating_sub(paused)
+    }
+
+    fn set_paused(&mut self, pause: bool) {
+        match (pause, self.paused_since) {
+            (true, None) => self.paused_since = Some(Instant::now()),
+            (false, Some(p)) => {
+                self.paused_total += p.elapsed();
+                self.paused_since = None;
+            }
+            _ => return,
+        }
+        self.info.stats.paused.store(pause, Relaxed);
+    }
+}
+
+/// Camcorder-style mark in the preview's corner: blinking red "● REC" (or
+/// "⏸ PAUSE") and the recorded time.
+fn rec_badge(painter: &egui::Painter, rect: egui::Rect, r: &Rec) {
+    let t = r.elapsed().as_secs();
+    let time = format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60);
+    let blink = r.started.elapsed().as_millis() % 1000 < 600;
+    let font = egui::FontId::proportional(20.0);
+    let at = rect.left_top() + egui::vec2(14.0, 12.0);
+    let bg = egui::Rect::from_min_size(at - egui::vec2(8.0, 4.0), egui::vec2(190.0, 32.0));
+    painter.rect_filled(bg, 6.0, egui::Color32::from_black_alpha(140));
+    let (label, color) = if r.paused_since.is_some() {
+        ("⏸ PAUSE", egui::Color32::from_rgb(255, 190, 0))
+    } else {
+        ("● REC", egui::Color32::from_rgb(255, 40, 40))
+    };
+    if blink {
+        painter.text(at, egui::Align2::LEFT_TOP, label, font.clone(), color);
+    }
+    painter.text(at + egui::vec2(96.0, 0.0), egui::Align2::LEFT_TOP, time, font, egui::Color32::WHITE);
 }
 
 /// Edges of the crop selection held by the mouse (all four: moving it).
@@ -343,6 +392,9 @@ impl App {
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(tex, egui::Rect::from_min_max(to_screen(img.min), to_screen(img.max)), uv, egui::Color32::WHITE);
+        if let Some(r) = &self.recording {
+            rec_badge(&painter, rect, r);
+        }
         if !sensor_view {
             return;
         }
@@ -566,9 +618,16 @@ impl App {
             !recording,
             egui::TextEdit::singleline(&mut self.rec_name).hint_text("üresen: automatikus (dátum, idő)"),
         );
-        let big = |t: &str| egui::Button::new(egui::RichText::new(t).size(18.0)).min_size(egui::vec2(160.0, 36.0));
+        ui.add_space(8.0);
+        let w = ui.available_width();
+        let big = |t: &str, fill: egui::Color32, width: f32| {
+            egui::Button::new(egui::RichText::new(t).size(26.0).strong().color(egui::Color32::WHITE))
+                .fill(fill)
+                .min_size(egui::vec2(width, 64.0))
+        };
+        let red = egui::Color32::from_rgb(200, 30, 30);
         if !recording {
-            if ui.add(big("⏺ Record Start")).clicked() {
+            if ui.add(big("⏺  REC", red, w)).clicked() {
                 let name = if self.rec_name.trim().is_empty() {
                     chrono::Local::now().format("rec_%Y%m%d_%H%M%S").to_string()
                 } else {
@@ -577,27 +636,49 @@ impl App {
                 match self.engine.start_recording(&name) {
                     Ok(info) => {
                         self.message = format!("Felvétel: {}", info.video);
-                        self.recording = Some((info, Instant::now()));
+                        self.recording =
+                            Some(Rec { info, started: Instant::now(), paused_since: None, paused_total: Duration::ZERO });
                     }
                     Err(e) => self.message = format!("Hiba: {e}"),
                 }
             }
-        } else if ui.add(big("⏹ Record End")).clicked() {
-            self.engine.stop_recording();
-            if let Some((info, _)) = self.recording.take() {
-                self.message = format!(
-                    "Felvétel leállítva: {} – {} képkocka, {} eldobva",
-                    info.video,
-                    info.stats.queued.load(Relaxed),
-                    info.stats.dropped.load(Relaxed)
-                );
+        } else {
+            let paused = self.recording.as_ref().is_some_and(|r| r.paused_since.is_some());
+            let half = (w - ui.spacing().item_spacing.x) / 2.0;
+            let (mut pause, mut stop) = (false, false);
+            ui.horizontal(|ui| {
+                let (label, fill) = if paused {
+                    ("▶  Folytatás", egui::Color32::from_rgb(30, 130, 60))
+                } else {
+                    ("⏸  Szünet", egui::Color32::from_rgb(170, 120, 0))
+                };
+                pause = ui.add(big(label, fill, half)).clicked();
+                stop = ui.add(big("⏹  Stop", egui::Color32::from_gray(70), half)).clicked();
+            });
+            if pause && let Some(r) = &mut self.recording {
+                r.set_paused(!paused);
             }
-            self.rec_name.clear();
+            if stop {
+                self.stop_recording();
+            }
         }
         ui.separator();
         self.status_line(ui);
         ui.separator();
         self.view_controls(ui);
+    }
+
+    fn stop_recording(&mut self) {
+        self.engine.stop_recording();
+        if let Some(Rec { info, .. }) = self.recording.take() {
+            self.message = format!(
+                "Felvétel leállítva: {} – {} képkocka, {} eldobva",
+                info.video,
+                info.stats.queued.load(Relaxed),
+                info.stats.dropped.load(Relaxed)
+            );
+        }
+        self.rec_name.clear();
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui) {
@@ -623,10 +704,12 @@ impl App {
                 c.frame_rate
             ));
         }
-        if let Some((info, started)) = &self.recording {
+        if let Some(r) = &self.recording {
+            let info = &r.info;
             let mut line = format!(
-                "⏺ {:.0} s · írva: {} · sorban: {} · eldobva: {}",
-                started.elapsed().as_secs_f64(),
+                "{} {:.0} s · írva: {} · sorban: {} · eldobva: {}",
+                if r.paused_since.is_some() { "⏸" } else { "⏺" },
+                r.elapsed().as_secs_f64(),
                 info.stats.written.load(Relaxed),
                 info.stats.queued.load(Relaxed) - info.stats.written.load(Relaxed),
                 info.stats.dropped.load(Relaxed)
@@ -1041,7 +1124,7 @@ impl App {
 
     /// Recordings that must not be touched: being recorded or exported.
     fn busy(&self, video: &std::path::Path) -> bool {
-        let recording = self.recording.as_ref().is_some_and(|(i, _)| std::path::Path::new(&i.video) == video);
+        let recording = self.recording.as_ref().is_some_and(|r| std::path::Path::new(&r.info.video) == video);
         recording || self.rec.job.as_ref().is_some_and(|j| j.video == video) || self.rec.queue.iter().any(|(v, _)| v == video)
     }
 
@@ -1405,12 +1488,17 @@ impl eframe::App for App {
         self.watch_camera();
         self.update_preview(&ctx);
         self.poll_test();
+        // While recording only the main page is available.
+        let recording = self.recording.is_some();
+        if recording {
+            self.page = Page::Main;
+        }
         egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.add_enabled_ui(!recording, |ui| ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.page, Page::Main, "Főoldal");
                 ui.selectable_value(&mut self.page, Page::Settings, "Beállítások");
                 ui.selectable_value(&mut self.page, Page::Recordings, "Felvételek és export");
-            });
+            }));
         });
         if self.page == Page::Settings {
             // First visit with a camera: read its limits once.

@@ -27,6 +27,9 @@ pub struct RecStats {
     pub dropped: AtomicU64,
     pub queued: AtomicU64,
     pub finished: AtomicBool,
+    /// Paused: frames are not written (the CSV shows the gap in frame IDs
+    /// and timestamps).
+    pub paused: AtomicBool,
     pub error: Mutex<Option<String>>,
     /// Encoder actually used (chosen from the first frame's format).
     pub encoder: Mutex<Option<&'static str>>,
@@ -90,6 +93,10 @@ impl Recorder {
     /// Hand a frame to the writer. Never blocks.
     pub fn push(&self, frame: Frame, pool: &BufferPool) {
         let Some(tx) = &self.tx else { return };
+        if self.stats.paused.load(Relaxed) {
+            pool.put(frame.data);
+            return;
+        }
         match tx.try_send(frame) {
             Ok(()) => {
                 self.stats.queued.fetch_add(1, Relaxed);

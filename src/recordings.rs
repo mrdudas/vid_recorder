@@ -63,14 +63,11 @@ pub fn list(dirs: &[PathBuf]) -> Vec<Recording> {
 fn csv_info(csv: &Path) -> (Option<u64>, Option<f64>) {
     let Ok(text) = std::fs::read_to_string(csv) else { return (None, None) };
     let ts: Vec<u64> = text.lines().skip(1).filter_map(|l| l.split(',').next()?.trim().parse().ok()).collect();
-    let span = match (ts.first(), ts.last()) {
-        (Some(a), Some(b)) if b > a && ts.len() > 1 => {
-            // Span plus one frame interval: the duration the frames cover.
-            let d = (b - a) as f64 / 1e9;
-            Some(d * ts.len() as f64 / (ts.len() - 1) as f64)
-        }
-        _ => None,
-    };
+    // Frames times the median interval: pauses and camera dropouts do not
+    // count as recorded time.
+    let mut d: Vec<u64> = ts.windows(2).filter_map(|w| w[1].checked_sub(w[0])).filter(|&d| d > 0).collect();
+    d.sort_unstable();
+    let span = d.get(d.len() / 2).map(|&m| m as f64 / 1e9 * ts.len() as f64);
     (Some(ts.len() as u64), span)
 }
 
