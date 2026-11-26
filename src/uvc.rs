@@ -17,7 +17,7 @@ use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
 };
 
-use crate::camera::{Camera, FrameSink, Mode};
+use crate::camera::{Camera, FrameSink, Geometry, Mode};
 use crate::frame::{BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
@@ -74,6 +74,34 @@ fn to_fourcc(f: PixelFormat) -> Result<FrameFormat, String> {
     })
 }
 
+/// Sizes and frame rates tried when the backend does not list the modes.
+const TRY_SIZES: [(u32, u32); 7] = [(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720), (1024, 768), (800, 600), (640, 480)];
+const TRY_RATES: [f64; 3] = [60.0, 30.0, 15.0];
+
+/// Open the camera with this format and size at 30 fps and wait (up to
+/// 3 s) for one frame: what it really delivers (format, width, height).
+fn try_open(index: CameraIndex, fourcc: FrameFormat, w: u32, h: u32) -> Option<(PixelFormat, u32, u32)> {
+    let (tx, rx) = mpsc::channel();
+    // On its own thread: a hung backend must not hang the caller.
+    std::thread::spawn(move || {
+        let format = CameraFormat::new(Resolution::new(w, h), fourcc, 30);
+        let got = NCamera::new(index, RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(format))).ok().and_then(|mut c| {
+            c.open_stream().ok()?;
+            let f = c.frame().ok();
+            let _ = c.stop_stream();
+            let f = f?;
+            Some((from_fourcc(f.source_frame_format())?, f.resolution().width(), f.resolution().height()))
+        });
+        let _ = tx.send(got);
+    });
+    rx.recv_timeout(Duration::from_secs(3)).ok().flatten()
+}
+
+/// Size the camera is opened with (the engine crops from it).
+fn capture(s: &CameraSettings) -> (u32, u32) {
+    s.capture_size.unwrap_or((s.width, s.height))
+}
+
 pub struct UvcCamera {
     name: String,
     settings: Option<CameraSettings>,
@@ -100,29 +128,21 @@ impl Camera for UvcCamera {
         Ok(())
     }
 
-    /// Formats the backend lists, highest frame rate per format and size.
-    /// Sizes below 640 px wide are skipped.
+    /// The modes the backend lists: per format and size the highest frame
+    /// rate, with all listed rates. If it lists none (nokhwa on macOS gives
+    /// only the formats), every format × common size × common rate is
+    /// returned as a guess to try (`reported: false`).
     fn modes(&mut self, _: &CameraSettings) -> Result<Vec<Mode>, String> {
         let mut last = String::new();
         for index in find_indices(&self.name)? {
             let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
-            // nokhwa's AVFoundation backend lists the fourccs but no sizes or
-            // frame rates; then try common sizes at 30 fps and let the
-            // recording test show which work.
-            let list = NCamera::new(index, requested).and_then(|mut c| {
-                let mut all = c.compatible_camera_formats().unwrap_or_default();
-                if all.is_empty() {
-                    for fourcc in c.compatible_fourcc()? {
-                        for (w, h) in [(1920, 1080), (1280, 720), (640, 480)] {
-                            all.push(CameraFormat::new(Resolution::new(w, h), fourcc, 30));
-                        }
-                    }
-                }
-                Ok(all)
+            let listed = NCamera::new(index.clone(), requested).and_then(|mut c| {
+                let all = c.compatible_camera_formats().unwrap_or_default();
+                let fourccs = c.compatible_fourcc().unwrap_or_default();
+                Ok((all, fourccs))
             });
-            let list = match list {
-                Ok(l) if !l.is_empty() => l,
-                Ok(_) => continue,
+            let (list, fourccs) = match listed {
+                Ok(l) => l,
                 Err(e) => {
                     last = e.to_string();
                     continue;
@@ -132,18 +152,50 @@ impl Camera for UvcCamera {
             for f in list {
                 let Some(format) = from_fourcc(f.format()) else { continue };
                 let (width, height, fps) = (f.width(), f.height(), f.frame_rate() as f64);
-                if width < 640 {
-                    continue;
-                }
                 match modes.iter_mut().find(|m| m.format == format && m.width == width && m.height == height) {
-                    Some(m) => m.fps = m.fps.max(fps),
-                    None => modes.push(Mode { format, width, height, fps }),
+                    Some(m) => {
+                        m.fps = m.fps.max(fps);
+                        m.rates.push(fps);
+                    }
+                    None => modes.push(Mode { format, width, height, fps, reported: true, rates: vec![fps] }),
                 }
             }
-            modes.sort_by_key(|m| (m.format.name(), std::cmp::Reverse(m.width * m.height)));
+            if modes.is_empty() {
+                // Feel out what it accepts: open every format × size and
+                // keep what really arrives (format and size of a frame).
+                let mut formats: Vec<FrameFormat> = fourccs.into_iter().filter(|f| from_fourcc(*f).is_some()).collect();
+                if formats.is_empty() {
+                    formats = vec![FrameFormat::MJPEG, FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::GRAY];
+                }
+                for fourcc in formats {
+                    for (w, h) in TRY_SIZES {
+                        let Some((format, width, height)) = try_open(index.clone(), fourcc, w, h) else { continue };
+                        if (width, height) != (w, h) || modes.iter().any(|m| (m.format, m.width, m.height) == (format, width, height)) {
+                            continue;
+                        }
+                        // 30 fps worked when opened; the discovery tries the others.
+                        modes.push(Mode { format, width, height, fps: 30.0, reported: false, rates: TRY_RATES.to_vec() });
+                    }
+                }
+            }
+            for m in &mut modes {
+                m.rates.sort_by(|a, b| b.total_cmp(a));
+                m.rates.dedup();
+            }
+            modes.sort_by_key(|m| (m.format.name(), std::cmp::Reverse(m.width * m.height), std::cmp::Reverse((m.fps * 100.0) as u64)));
             return Ok(modes);
         }
-        Err(format!("no format list from \"{}\": {last}", self.name))
+        Err(format!("\"{}\" nem kérdezhető le: {last}", self.name))
+    }
+
+    /// The image is cut in software from the capture size.
+    fn hw_crop(&self) -> bool {
+        false
+    }
+
+    fn geometry(&self) -> Option<Geometry> {
+        let s = self.settings.as_ref()?;
+        Some(Geometry { sensor: capture(s), min_size: (16, 16), step: [2; 4] })
     }
 
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {
@@ -161,7 +213,8 @@ impl Camera for UvcCamera {
         let thread = std::thread::Builder::new()
             .name("uvc-camera".into())
             .spawn(move || {
-                let format = CameraFormat::new(Resolution::new(s.width, s.height), fourcc, s.frame_rate.round() as u32);
+                let (cw, ch) = capture(&s);
+                let format = CameraFormat::new(Resolution::new(cw, ch), fourcc, s.frame_rate.round() as u32);
                 let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(format));
                 let mut opened = Err(String::new());
                 for index in indices {
@@ -175,7 +228,7 @@ impl Camera for UvcCamera {
                 let mut cam = match opened {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = ready_tx.send(Err(format!("open {fourcc} {}x{} @ {}: {e}", s.width, s.height, s.frame_rate)));
+                        let _ = ready_tx.send(Err(format!("open {fourcc} {cw}x{ch} @ {}: {e}", s.frame_rate)));
                         return;
                     }
                 };

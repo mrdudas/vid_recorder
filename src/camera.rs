@@ -8,14 +8,22 @@ use std::time::{Duration, Instant};
 use crate::frame::{BufferPool, Frame, PixelFormat};
 use crate::scenario::{CameraSettings, Device};
 
-/// One way the camera can run: pixel format, size and the highest frame
-/// rate the camera reports for it.
-#[derive(Clone, Debug)]
+/// One way the camera can run: pixel format, size and frame rate (the
+/// highest the camera reports, or a candidate to try).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Mode {
     pub format: PixelFormat,
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    /// The camera reported this mode. `false`: a guess to try (the camera
+    /// did not say what it can do).
+    #[serde(default)]
+    pub reported: bool,
+    /// Every frame rate the camera lists for this format and size (UVC
+    /// cameras take only these); empty: any up to `fps`.
+    #[serde(default)]
+    pub rates: Vec<f64>,
 }
 
 /// Image geometry the camera allows, read at every `apply`.
@@ -76,6 +84,11 @@ pub trait Camera: Send {
     fn geometry(&self) -> Option<Geometry> {
         None
     }
+    /// The camera crops itself (ROI). `false`: it delivers its full image
+    /// (`capture_size` or the sensor) and the engine crops in software.
+    fn hw_crop(&self) -> bool {
+        true
+    }
     /// Frames the camera delivered broken or in an unusable format.
     fn errors(&self) -> u64 {
         0
@@ -130,7 +143,7 @@ impl Camera for SimCamera {
 
     /// Like the Alvium 1800 U-291c the project uses.
     fn modes(&mut self, _: &CameraSettings) -> Result<Vec<Mode>, String> {
-        let m = |format, fps| Mode { format, width: 1920, height: 1080, fps };
+        let m = |format, fps| Mode { format, width: 1920, height: 1080, fps, reported: true, rates: Vec::new() };
         Ok(vec![
             m(PixelFormat::BayerRG8, 155.0),
             m(PixelFormat::BayerRG10p, 155.0),

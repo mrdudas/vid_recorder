@@ -165,12 +165,30 @@ pub fn plan(base: &Scenario, modes: &[Mode]) -> Vec<Scenario> {
             s.camera.height = m.height;
             s.camera.offset_x = 0;
             s.camera.offset_y = 0;
-            s.camera.frame_rate = m.fps;
+            // From the highest rate down (see `lower_rate`).
+            s.camera.frame_rate = m.rates.first().copied().unwrap_or(m.fps).max(m.fps);
+            // Cameras that cannot crop are opened at the mode's size.
+            s.camera.capture_size = (!s.device.hw_crop()).then_some((m.width, m.height));
             s.recording.encoder = "auto".into();
             s.name = format!("{}_{}x{}_{}fps", m.format.name(), m.width, m.height, m.fps);
             s
         })
         .collect()
+}
+
+/// After a failed test that the camera failed (not the encoder): the same
+/// mode at the next lower frame rate the mode lists, if any.
+pub fn lower_rate(s: &Scenario, v: &Verdict, modes: &[Mode]) -> Option<Scenario> {
+    if v.level != Level::Fail || v.encoder_slow {
+        return None;
+    }
+    let c = &s.camera;
+    let m = modes.iter().find(|m| (m.format, m.width, m.height) == (c.pixel_format, c.width, c.height))?;
+    let fps = m.rates.iter().copied().find(|&r| r < c.frame_rate - 1e-6)?;
+    let mut r = s.clone();
+    r.camera.frame_rate = fps;
+    r.name = format!("{}_{}x{}_{}fps", c.pixel_format.name(), c.width, c.height, fps);
+    Some(r)
 }
 
 /// After a failed "auto" test: the same scenario uncompressed, if that can

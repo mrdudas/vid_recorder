@@ -68,7 +68,9 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - **Felvételi teszt:** a szerkesztett szcenáriót a megadott ideig rögzíti, és megmutatja, veszett-e el képkocka, illetve bírja-e a kódoló a tempót. A tesztfájlokat utána törli.
 - **Kamera felderítése:** a kamerától lekérdezi a módokat, és mindegyiket lefuttatja a felvételi teszttel. Ha a kódoló túl lassú, tömörítetlenül (`raw`) is kipróbálja. Parancssorból: `probe <szcenárió|sim|u3v> [mp]`.
   - **USB3 Vision:** a GenICam adja meg az elérhető pixelformátumokat, a legnagyobb méretet és formátumonként a legnagyobb fps-t, az expozíció és az extra beállítások alapján.
-  - **UVC:** a rendszer listája alapján. Macen a nokhwa csak a formátumot adja meg, ezért ott a program 1080p, 720p és 480p méretet próbál 30 fps-sel.
+  - **UVC:** a rendszer listája alapján. Ha a rendszer nem adja meg a módokat (Macen a nokhwa csak a formátumot), a program kitapogatja őket: minden formátumot és gyakori méretet megnyit, és csak azt tartja meg, amit a kamera ténylegesen küld (formátum és méret az első képből). A tesztek a legnagyobb fps-sel kezdenek, és ha a kamera nem bírja, a következő kisebbel próbálkoznak (60 → 30 → 15).
+  - A beállítóoldalon a **Kameramód** listában csak a kamera saját módjai vannak; a teszten elbukott módok és a kamerán nem létező formátumok szürkék. A **„A kamera most küld”** sor a beérkező képekből mért formátumot, méretet és fps-t mutatja, és pirossal jelzi, ha eltér a kérttől (pl. Mono8 helyett YUYV).
+- **Szoftveres kivágás:** ha a kamera nem tud vágni (UVC, vagy írhatatlan `Width/Height/Offset`), a kamera a `capture_size` méretben fut, és a program ugyanúgy kivágja a képet, mint a kamera tenné. A felvétel és az élőkép is a kivágott képet kapja. Bayer, YUYV és NV12 esetén a lépésköz 2 (megmarad a színminta); MJPEG nem vágható.
 
 ### Felvételek és export
 - A szcenáriók kimeneti mappáiban és a kézzel hozzáadott mappákban (`recording_folders.txt`, nincs verziókezelve) lévő felvételek listája, az `export/` almappák tartalmával együtt. Látszik a méret, a hossz és az fps (az időbélyeg-CSV-ből), valamint a lemez szabad helye.

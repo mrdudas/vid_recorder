@@ -22,6 +22,11 @@ pub enum Device {
 }
 
 impl Device {
+    /// The camera crops itself (UVC does not: the engine crops in software).
+    pub fn hw_crop(&self) -> bool {
+        !matches!(self, Device::Uvc { .. })
+    }
+
     pub fn label(&self) -> String {
         match self {
             Device::U3v => "USB3 Vision (első kamera)".into(),
@@ -92,6 +97,11 @@ pub struct CameraSettings {
     /// Range the auto gain may use [dB]; clamped to the camera's range.
     #[serde(default = "auto_gain_range")]
     pub auto_gain_range: (f64, f64),
+    /// Size the camera delivers, for cameras that cannot crop (UVC): the
+    /// image is then cut to width × height at the offsets in software.
+    /// `None`: the camera delivers width × height itself (hardware crop).
+    #[serde(default)]
+    pub capture_size: Option<(u32, u32)>,
     /// Mirror the image on the camera (both = rotated by 180°).
     #[serde(default)]
     pub reverse_x: bool,
@@ -134,6 +144,7 @@ impl Default for Scenario {
                 auto_exposure: false,
                 auto_exposure_range: auto_exposure_range(),
                 auto_gain_range: auto_gain_range(),
+                capture_size: None,
                 reverse_x: false,
                 reverse_y: false,
                 extra: BTreeMap::new(),

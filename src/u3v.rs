@@ -32,6 +32,8 @@ pub struct U3vCamera {
     /// Highest frame rate the camera allowed at the last `apply`.
     max_fps: Option<f64>,
     geometry: Option<Geometry>,
+    /// Width, Height and the offsets are writable (hardware crop).
+    roi: bool,
 }
 
 /// "vendor model (serial)" for every connected USB3 Vision camera.
@@ -123,7 +125,17 @@ impl U3vCamera {
             }
             let _ = set_int(&mut p, "TLParamsLocked", 0);
         }
+        let roi = cam.params_ctxt().is_ok_and(|mut p| {
+            let p = &mut p;
+            ["Width", "Height", "OffsetX", "OffsetY"].iter().all(|name| {
+                p.node(name).and_then(|n| n.as_integer(p)).is_some_and(|n| n.is_writable(p).unwrap_or(false))
+            })
+        });
+        if !roi {
+            eprintln!("the camera cannot crop (ROI), cropping in software");
+        }
         Ok(U3vCamera {
+            roi,
             name: describe(cam.info()),
             cam,
             running: Arc::new(AtomicBool::new(false)),
@@ -150,14 +162,23 @@ impl Camera for U3vCamera {
         set_enum(&mut p, "PixelFormat", s.pixel_format.name())?;
         set_bool(&mut p, "ReverseX", s.reverse_x)?;
         set_bool(&mut p, "ReverseY", s.reverse_y)?;
-        // Offsets first to 0 so any width/height fits, then the real offsets.
-        set_int(&mut p, "OffsetX", 0)?;
-        set_int(&mut p, "OffsetY", 0)?;
-        self.geometry = geometry(&mut p).ok();
-        set_int(&mut p, "Width", s.width as i64)?;
-        set_int(&mut p, "Height", s.height as i64)?;
-        set_int(&mut p, "OffsetX", s.offset_x as i64)?;
-        set_int(&mut p, "OffsetY", s.offset_y as i64)?;
+        let (width, height) = if self.roi {
+            // Offsets first to 0 so any width/height fits, then the real offsets.
+            set_int(&mut p, "OffsetX", 0)?;
+            set_int(&mut p, "OffsetY", 0)?;
+            self.geometry = geometry(&mut p).ok();
+            set_int(&mut p, "Width", s.width as i64)?;
+            set_int(&mut p, "Height", s.height as i64)?;
+            set_int(&mut p, "OffsetX", s.offset_x as i64)?;
+            set_int(&mut p, "OffsetY", s.offset_y as i64)?;
+            (s.width, s.height)
+        } else {
+            // Full image; the engine crops in software.
+            let size = |p: &mut Params, name| p.node(name).and_then(|n| n.as_integer(p)).and_then(|n| n.value(p).ok()).unwrap_or(0) as u32;
+            let full = (size(&mut p, "Width"), size(&mut p, "Height"));
+            self.geometry = Some(Geometry { sensor: full, min_size: (16, 16), step: [2; 4] });
+            full
+        };
         // Extra features before the frame rate checks: they may change the
         // limits (binning, DeviceLinkThroughputLimit...).
         for (name, value) in &s.extra {
@@ -166,7 +187,7 @@ impl Camera for U3vCamera {
         // The camera accepts any frame rate but silently runs slower (or
         // drops frames) when the sensor or the USB link cannot keep up:
         // refuse those settings.
-        if let Some((max_fps, link)) = link_fps(&mut p, s.pixel_format, s.width, s.height)
+        if let Some((max_fps, link)) = link_fps(&mut p, s.pixel_format, width, height)
             && s.frame_rate > max_fps
         {
             return Err(format!(
@@ -175,8 +196,8 @@ impl Camera for U3vCamera {
                 s.frame_rate * link / max_fps / 1e6,
                 link / 1e6,
                 max_fps,
-                s.width,
-                s.height,
+                width,
+                height,
                 s.pixel_format.name()
             ));
         }
@@ -333,17 +354,24 @@ impl Camera for U3vCamera {
             let _ = set_int(p, "OffsetY", 0);
             let (Ok(w), Ok(h)) = (int_max(p, "Width"), int_max(p, "Height")) else { continue };
             let mut sizes = vec![(w, h)];
-            if w >= 1920 && h >= 1080 && (w, h) != (1920, 1080) {
+            if self.roi && w >= 1920 && h >= 1080 && (w, h) != (1920, 1080) {
                 sizes.push((1920, 1080));
             }
             for (w, h) in sizes {
-                if set_int(p, "Width", w).is_err() || set_int(p, "Height", h).is_err() {
+                if self.roi && (set_int(p, "Width", w).is_err() || set_int(p, "Height", h).is_err()) {
                     continue;
                 }
                 let _ = set_bool(p, "AcquisitionFrameRateEnable", true);
                 let Ok(fps) = float_max(p, "AcquisitionFrameRate") else { continue };
                 // Rounded down: the exact maximum may not be settable.
-                modes.push(Mode { format, width: w as u32, height: h as u32, fps: (fps * 100.0).floor() / 100.0 });
+                modes.push(Mode {
+                    format,
+                    width: w as u32,
+                    height: h as u32,
+                    fps: (fps * 100.0).floor() / 100.0,
+                    reported: true,
+                    rates: Vec::new(),
+                });
             }
         }
         Ok(modes)
@@ -413,6 +441,10 @@ impl Camera for U3vCamera {
             .map_err(|e| e.to_string())?;
         self.thread = Some(thread);
         Ok(())
+    }
+
+    fn hw_crop(&self) -> bool {
+        self.roi
     }
 
     fn errors(&self) -> u64 {

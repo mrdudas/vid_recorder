@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::camera::{Geometry, Limits};
+use crate::camera::{Geometry, Limits, Mode};
 use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
 use crate::probe::{self, Level, Verdict};
@@ -110,6 +110,8 @@ pub struct App {
     limits: Option<(Device, Result<Limits, String>)>,
     /// Read the limits on the next frame (after the message is shown).
     limits_pending: bool,
+    /// Modes the camera reported or accepted when opened (or why not).
+    modes: Option<(Device, Result<Vec<Mode>, String>)>,
     /// Geometry of the camera last applied (kept while it is away).
     geometry: Option<(Device, Geometry)>,
     /// Size of the last preview frame (camera pixels).
@@ -241,6 +243,7 @@ impl App {
             levels: (0.0, 1.0),
             limits: None,
             limits_pending: false,
+            modes: None,
             geometry: None,
             frame_size: (0, 0),
             frame_pos: (0, 0),
@@ -592,15 +595,34 @@ impl App {
     /// Read the limits (stops the camera ~2-3 s), then restart the camera
     /// with the scenario that ran before.
     fn read_limits(&mut self) {
-        let Some(s) = self.edited() else { return };
+        let Some(mut s) = self.edited() else { return };
         let before = self.engine.scenario.clone();
-        let l = self.engine.limits(&s);
-        self.message = match &l {
-            Ok(_) => "Kamera határai felmérve.".into(),
-            Err(e) => format!("A határok nem olvashatók: {e}"),
+        let modes = self.engine.modes(&s);
+        // Only USB3 Vision cameras tell their limits.
+        let l = if s.device == Device::U3v { self.engine.limits(&s) } else { Err("a kamera nem adja meg a határait".into()) };
+        self.message = match (&modes, &l) {
+            (Err(e), _) => format!("A kamera nem kérdezhető le: {e}"),
+            (Ok(m), _) if m.is_empty() => "A kamera nem adott rögzíthető módot.".into(),
+            (Ok(m), Ok(_)) => format!("Kamera felmérve: {} mód, határok kiolvasva.", m.len()),
+            (Ok(m), Err(_)) => format!("Kamera felmérve: {} mód.", m.len()),
         };
+        // The edited format is one the camera does not have: take its first mode.
+        let mut fixed = None;
+        if let Ok(m) = &modes
+            && let Some(first) = m.first()
+            && !m.iter().any(|m| m.format == s.camera.pixel_format)
+        {
+            set_mode(&mut self.edit, first);
+            set_mode(&mut s, first);
+            self.message += &format!(" A(z) {} formátumot nem tudja, átállítva: {}.", s.camera.pixel_format.name(), mode_label(first));
+            fixed = Some(s.clone());
+        }
         self.limits = Some((s.device.clone(), l));
-        if let Some(b) = before.or(Some(s)) {
+        self.modes = Some((s.device.clone(), modes));
+        // Restart what ran before; the edited scenario if it was fixed
+        // (or nothing ran).
+        let before = before.filter(|b| fixed.is_none() || b.name != s.name);
+        if let Some(b) = before.or(fixed).or(Some(s)) {
             if let Err(e) = self.engine.apply(&b) {
                 self.message = format!("Hiba: {e}");
             }
@@ -827,6 +849,11 @@ impl App {
     fn details(&mut self, ui: &mut egui::Ui) {
         let st = self.engine.stats();
         egui::Grid::new("details").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            if let Some(a) = self.engine.scenario.clone() {
+                ui.label("A kamera küld");
+                actual_mode(ui, &a, &self.engine.actual(), !self.engine.hw_crop());
+                ui.end_row();
+            }
             let mut row = |k: &str, v: String| {
                 ui.label(k);
                 ui.label(v);
@@ -837,7 +864,7 @@ impl App {
             row("Kameránál elveszett", st.lost_at_camera.load(Relaxed).to_string());
             row("Hibás kép", self.engine.camera_errors().to_string());
             if let Some(c) = self.engine.scenario.as_ref().map(|s| &s.camera) {
-                row("Kép", format!("{}×{} ({}, {}) {}", c.width, c.height, c.offset_x, c.offset_y, c.pixel_format.name()));
+                row("Kért kép", format!("{}×{} ({}, {}) {}", c.width, c.height, c.offset_x, c.offset_y, c.pixel_format.name()));
                 let max = self.engine.max_fps().map_or(String::new(), |m| format!(" (max. {m:.1})"));
                 row("Képfrekvencia", format!("{} fps{max}", c.frame_rate));
             }
@@ -945,8 +972,49 @@ impl App {
         });
     }
 
+    /// Modes of the edited scenario's camera, if read.
+    fn known_modes(&self) -> &[Mode] {
+        match &self.modes {
+            Some((d, Ok(m))) if *d == self.edit.device => m,
+            _ => &[],
+        }
+    }
+
+    /// Best discovery result for a format and size on the edited camera:
+    /// `None` not tested.
+    fn tested(&self, f: PixelFormat, w: u32, h: u32) -> Option<Level> {
+        let rank = |l: Level| match l {
+            Level::Ok => 2,
+            Level::Short => 1,
+            Level::Fail => 0,
+        };
+        self.probe_results
+            .iter()
+            .filter(|(s, _)| s.device == self.edit.device && (s.camera.pixel_format, s.camera.width, s.camera.height) == (f, w, h))
+            .map(|(_, v)| v.level)
+            .max_by_key(|&l| rank(l))
+    }
+
+    /// The edited camera crops in software (UVC, or a U3V camera without ROI).
+    fn sw_crop(&self) -> bool {
+        match &self.engine.scenario {
+            Some(a) if a.device == self.edit.device => !self.engine.hw_crop(),
+            _ => !self.edit.device.hw_crop(),
+        }
+    }
+
     fn camera_section(&mut self, ui: &mut egui::Ui) {
         let max_fps = self.current_limits().and_then(|l| l.max_fps);
+        let modes = self.known_modes().to_vec();
+        let status: Vec<Option<Level>> = modes.iter().map(|m| self.tested(m.format, m.width, m.height)).collect();
+        let modes_err = match &self.modes {
+            Some((d, Err(e))) if *d == self.edit.device => Some(e.clone()),
+            _ => None,
+        };
+        let sw_crop = self.sw_crop();
+        // What the running camera really sends, if it is the edited one.
+        let actual = self.engine.scenario.as_ref().filter(|a| a.device == self.edit.device).map(|a| (a.clone(), self.engine.actual()));
+        let mut reread = false;
         section(ui, "Kamera", true, |ui| {
             grid(ui, "cam", |ui| {
                 let e = &mut self.edit;
@@ -957,40 +1025,133 @@ impl App {
                             ui.selectable_value(&mut e.device, d.clone(), d.label());
                         }
                     });
-                    if ui.button("⟳").on_hover_text("Kameralista frissítése").clicked() {
+                    if ui.button("⟳").on_hover_text("Kameralista frissítése, és a kamera módjainak újraolvasása").clicked() {
                         self.devices = find_devices();
+                        reread = true;
                     }
                 });
                 ui.end_row();
 
+                // A mode the camera reported (or accepted): format, size, fps.
+                if !modes.is_empty() {
+                    ui.label("Kameramód");
+                    let cap = if sw_crop { e.camera.capture_size.unwrap_or((e.camera.width, e.camera.height)) } else { (0, 0) };
+                    let current = modes.iter().position(|m| m.format == e.camera.pixel_format && (!sw_crop || (m.width, m.height) == cap));
+                    let text = match current {
+                        Some(i) if sw_crop => mode_label(&modes[i]),
+                        _ => format!("{} {}×{}", e.camera.pixel_format.name(), e.camera.width, e.camera.height),
+                    };
+                    egui::ComboBox::from_id_salt("mode").width(260.0).selected_text(text).show_ui(ui, |ui| {
+                        for (m, st) in modes.iter().zip(&status) {
+                            let (mark, tip) = match (st, m.reported) {
+                                (Some(Level::Ok), _) => ("✔ ", "A felvételi teszten átment."),
+                                (Some(Level::Short), _) => ("⚠ ", "A kódoló lassabb a kameránál: rövid felvételre jó."),
+                                (Some(Level::Fail), _) => ("✖ ", "A felvételi teszten nem ment át."),
+                                (None, true) => ("", "A kamera megadta; felvételi teszttel még nincs kipróbálva."),
+                                (None, false) => ("? ", "Megnyitáskor elfogadta; felvételi teszttel még nincs kipróbálva."),
+                            };
+                            let ok = *st != Some(Level::Fail);
+                            let label = format!("{mark}{}", mode_label(m));
+                            if ui.add_enabled(ok, egui::Button::selectable(Some(m) == current.map(|i| &modes[i]), label)).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                                set_mode(e, m);
+                                e.camera.frame_rate = best_rate(&self.probe_results, &e.device, m).unwrap_or(m.fps);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+
                 ui.label("Pixelformátum");
                 egui::ComboBox::from_id_salt("pixfmt").width(260.0).selected_text(e.camera.pixel_format.name()).show_ui(ui, |ui| {
                     for f in PixelFormat::ALL {
-                        ui.selectable_value(&mut e.camera.pixel_format, f, f.name());
+                        let of: Vec<usize> = (0..modes.len()).filter(|&i| modes[i].format == f).collect();
+                        let has = modes.is_empty() || !of.is_empty();
+                        let works = of.is_empty() || of.iter().any(|&i| status[i] != Some(Level::Fail));
+                        let tip = if !has { "A kamera ezt a formátumot nem tudja." } else if !works { "Felvételi teszten nem ment át." } else { "" };
+                        let r = ui.add_enabled(has && works, egui::Button::selectable(e.camera.pixel_format == f, f.name()));
+                        if !tip.is_empty() {
+                            r.clone().on_disabled_hover_text(tip);
+                        }
+                        if r.clicked() {
+                            // The format's largest working mode, if known.
+                            match of.iter().find(|&&i| status[i] != Some(Level::Fail)) {
+                                Some(&i) => {
+                                    set_mode(e, &modes[i]);
+                                    e.camera.frame_rate = best_rate(&self.probe_results, &e.device, &modes[i]).unwrap_or(modes[i].fps);
+                                }
+                                None => e.camera.pixel_format = f,
+                            }
+                        }
                     }
                 });
                 ui.end_row();
 
                 ui.label("Képfrekvencia");
+                let mode = modes.iter().find(|m| {
+                    m.format == e.camera.pixel_format && (!sw_crop || Some((m.width, m.height)) == e.camera.capture_size)
+                });
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut e.camera.frame_rate).range(0.1..=1000.0).speed(0.5).suffix(" fps"));
-                    if let Some(m) = max_fps
-                        && ui
-                            .button(format!("max. {m:.1}"))
-                            .on_hover_text("A kamera legnagyobb fps-e ezzel a formátummal, kivágással és expozícióval (felméréskor).")
-                            .clicked()
-                    {
-                        e.camera.frame_rate = m;
+                    match mode {
+                        // A UVC camera takes only the rates it lists.
+                        Some(m) if !m.rates.is_empty() => {
+                            for &r in &m.rates {
+                                if ui.selectable_label((e.camera.frame_rate - r).abs() < 1e-3, format!("{r}")).clicked() {
+                                    e.camera.frame_rate = r;
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some(m) = max_fps.or(mode.map(|m| m.fps))
+                                && ui
+                                    .button(format!("max. {m:.1}"))
+                                    .on_hover_text("A kamera legnagyobb fps-e ezzel a formátummal, kivágással és expozícióval.")
+                                    .clicked()
+                            {
+                                e.camera.frame_rate = m;
+                            }
+                        }
                     }
                 });
                 ui.end_row();
+
+                if let Some((a, act)) = &actual {
+                    ui.label("A kamera most küld");
+                    actual_mode(ui, a, act, sw_crop);
+                    ui.end_row();
+                }
             });
+            if let Some(e) = &modes_err {
+                ui.colored_label(ORANGE, format!("A kamera módjai nem olvashatók: {e}"));
+            } else if modes.iter().any(|m| !m.reported) {
+                ui.small("A kamera nem sorolta fel a módjait: a rendszer megnyitással kitapogatta, mit fogad el (?). A Kamera felderítése felvétellel is kipróbálja őket.");
+            }
         });
+        if reread {
+            self.modes = None;
+            self.limits = None;
+        }
     }
 
     fn image_section(&mut self, ui: &mut egui::Ui) {
-        let geo = self.geometry();
+        let sw_crop = self.sw_crop();
+        let mut geo = self.geometry();
+        if sw_crop {
+            // Crop within the size the camera is opened with.
+            let c = &mut self.edit.camera;
+            let cap = *c.capture_size.get_or_insert((c.width, c.height));
+            let step = frame_crop_step(c.pixel_format);
+            geo = Some(Geometry { sensor: cap, min_size: (16, 16), step: [step; 4] });
+        }
         section(ui, "Kép és kivágás", true, |ui| {
+            if sw_crop {
+                let c = &self.edit.camera;
+                if c.pixel_format == PixelFormat::Mjpeg {
+                    ui.colored_label(ORANGE, "A kamera nem tud vágni, és az MJPEG szoftveresen sem vágható: csak a teljes kép használható.");
+                } else {
+                    ui.small("A kamera nem tud vágni: a program vágja ki szoftveresen a képből, ugyanúgy, mint a kamera.");
+                }
+            }
             grid(ui, "img", |ui| {
                 let c = &mut self.edit.camera;
                 let (step, sensor, min) = geo.map_or(([1; 4], (16384, 16384), (8, 8)), |g| (g.step, g.sensor, g.min_size));
@@ -1562,7 +1723,9 @@ impl App {
     fn start_probe(&mut self, base: Scenario) {
         self.test_result = None;
         self.probe_results.clear();
-        match self.engine.modes(&base) {
+        let modes = self.engine.modes(&base);
+        self.modes = Some((base.device.clone(), modes.clone()));
+        match modes {
             Ok(modes) if !modes.is_empty() => {
                 self.probe_queue = probe::plan(&base, &modes).into();
                 self.probe_base = Some(base);
@@ -1579,7 +1742,8 @@ impl App {
             let Some(v) = t.poll(&mut self.engine) else { return };
             let (_, s) = self.test.take().unwrap();
             if self.probe_base.is_some() {
-                if let Some(r) = probe::raw_retry(&s, &v) {
+                let modes = self.known_modes().to_vec();
+                if let Some(r) = probe::raw_retry(&s, &v).or_else(|| probe::lower_rate(&s, &v, &modes)) {
                     self.probe_queue.push_front(r);
                 }
                 self.probe_results.push((s, v));
@@ -1713,8 +1877,7 @@ impl eframe::App for App {
         });
         if self.page == Page::Settings {
             // First visit with a camera: read its limits once.
-            if self.limits.as_ref().is_none_or(|(d, _)| *d != self.edit.device)
-                && self.edit.device != Device::Sim
+            if self.modes.as_ref().is_none_or(|(d, _)| *d != self.edit.device)
                 && !self.limits_pending
                 && self.recording.is_none()
                 && self.test.is_none()
@@ -1767,6 +1930,68 @@ const BLUE: egui::Color32 = egui::Color32::from_rgb(30, 100, 190);
 
 /// Width of the label column in settings grids.
 const LABEL_W: f32 = 150.0;
+
+/// "YUYV 1280×720 · 30 fps" (largest rate).
+fn mode_label(m: &Mode) -> String {
+    format!("{} {}×{} · {} fps", m.format.name(), m.width, m.height, m.fps)
+}
+
+/// Put a camera mode into a scenario: format, frame rate, and the full
+/// size (uncropped). Cameras that crop in software are opened at it.
+fn set_mode(s: &mut Scenario, m: &Mode) {
+    let c = &mut s.camera;
+    c.pixel_format = m.format;
+    (c.width, c.height, c.offset_x, c.offset_y) = (m.width, m.height, 0, 0);
+    c.frame_rate = m.fps;
+    c.capture_size = (!s.device.hw_crop()).then_some((m.width, m.height));
+}
+
+/// Highest frame rate that passed the recording test for this mode.
+fn best_rate(results: &[(Scenario, Verdict)], device: &Device, m: &Mode) -> Option<f64> {
+    results
+        .iter()
+        .filter(|(s, v)| s.device == *device && v.level != Level::Fail)
+        .filter(|(s, _)| (s.camera.pixel_format, s.camera.width, s.camera.height) == (m.format, m.width, m.height))
+        .map(|(s, _)| s.camera.frame_rate)
+        .max_by(f64::total_cmp)
+}
+
+fn frame_crop_step(f: PixelFormat) -> u32 {
+    crate::frame::crop_step(f).unwrap_or(1)
+}
+
+/// What the camera really sends, red where it differs from the request.
+fn actual_mode(ui: &mut egui::Ui, s: &Scenario, a: &crate::engine::Actual, sw_crop: bool) {
+    let c = &s.camera;
+    let Some(f) = a.format else {
+        ui.weak("még nem érkezett kép");
+        return;
+    };
+    let want = if sw_crop { c.capture_size.unwrap_or((c.width, c.height)) } else { (c.width, c.height) };
+    let fps = a.fps.map_or("…".into(), |v| format!("{v:.1} fps"));
+    let text = format!("{} {}×{} · {fps}", f.name(), a.width, a.height);
+    let mut problems = Vec::new();
+    if f != c.pixel_format {
+        problems.push(format!("{} helyett {}-t küld, a felvétel is ilyen lesz", c.pixel_format.name(), f.name()));
+    }
+    if (a.width, a.height) != want {
+        problems.push(format!("{}×{} helyett", want.0, want.1));
+    }
+    if a.fps.is_some_and(|v| v < c.frame_rate * 0.95) && !c.extra.get("TriggerMode").is_some_and(|v| v == "On") {
+        problems.push(format!("a kért {} fps helyett", c.frame_rate));
+    }
+    ui.vertical(|ui| {
+        if problems.is_empty() {
+            ui.colored_label(GREEN, text);
+        } else {
+            ui.colored_label(RED, text);
+            ui.colored_label(RED, problems.join("; "));
+        }
+        if sw_crop && (c.width, c.height) != want {
+            ui.small(format!("szoftveresen kivágva: {}×{} ({}, {})", c.width, c.height, c.offset_x, c.offset_y));
+        }
+    });
+}
 
 /// A collapsible group of settings.
 fn section(ui: &mut egui::Ui, title: &str, open: bool, add: impl FnOnce(&mut egui::Ui)) {

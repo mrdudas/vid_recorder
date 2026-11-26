@@ -275,6 +275,9 @@ fn scenario_or_device(name: &str) -> Result<Scenario, String> {
         Some(s) => Ok(s),
         None if name == "sim" => Ok(Scenario { device: scenario::Device::Sim, ..Scenario::default() }),
         None if name == "u3v" => Ok(Scenario { device: scenario::Device::U3v, ..Scenario::default() }),
+        None if name.starts_with("uvc:") => {
+            Ok(Scenario { device: scenario::Device::Uvc { name: name[4..].to_string() }, ..Scenario::default() })
+        }
         None => Err(format!("scenario {name} not found in {}", scenario_dir().display())),
     }
 }
@@ -301,12 +304,16 @@ fn limits(args: &[String]) -> Result<bool, String> {
 }
 
 fn probe_camera(args: &[String]) -> Result<bool, String> {
-    let name = args.first().ok_or("usage: probe <scenario|sim|u3v> [seconds]")?;
+    let name = args.first().ok_or("usage: probe <scenario|sim|u3v|uvc:name> [seconds]")?;
     let seconds: f64 = args.get(1).map_or(Ok(5.0), |s| s.parse()).map_err(|e| format!("seconds: {e}"))?;
     let base = scenario_or_device(name)?;
     let mut engine = Engine::new();
     let modes = engine.modes(&base)?;
     eprintln!("camera: {}, {} modes, ~{:.0} s", engine.camera_name(), modes.len(), modes.len() as f64 * (seconds + 1.0));
+    for m in &modes {
+        let how = if m.reported { "reported" } else { "accepted when opened" };
+        eprintln!("  {:<18} {:>9}  up to {} fps  ({how})", m.format.name(), format!("{}x{}", m.width, m.height), m.fps);
+    }
     let mut queue: std::collections::VecDeque<Scenario> = probe::plan(&base, &modes).into();
     let mut any_ok = false;
     while let Some(s) = queue.pop_front() {
@@ -316,7 +323,7 @@ fn probe_camera(args: &[String]) -> Result<bool, String> {
         println!("{:<18} {:>9} {:>7} fps  {:<5} {verdict}", c.pixel_format.name(), format!("{}x{}", c.width, c.height), c.frame_rate, s.recording.encoder);
         println!("    {}", v.text.lines().nth(1).unwrap_or(""));
         any_ok |= v.level == probe::Level::Ok;
-        if let Some(r) = probe::raw_retry(&s, &v) {
+        if let Some(r) = probe::raw_retry(&s, &v).or_else(|| probe::lower_rate(&s, &v, &modes)) {
             queue.push_front(r);
         }
     }

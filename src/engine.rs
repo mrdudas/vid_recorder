@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::camera::{self, Camera, Geometry, Limits, Mode};
-use crate::frame::{BufferPool, Frame};
+use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::recorder::{RecStats, Recorder};
 use crate::scenario::{Device, Scenario};
 
@@ -28,6 +28,37 @@ pub struct Stats {
     pub received: AtomicU64,
     /// Frames missing according to the camera's frame id sequence.
     pub lost_at_camera: AtomicU64,
+}
+
+/// What the camera really delivers, measured on the incoming frames
+/// (before any software crop). May differ from what was asked for: e.g. a
+/// UVC camera that sends YUYV when asked for Mono8.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Actual {
+    pub format: Option<PixelFormat>,
+    pub width: u32,
+    pub height: u32,
+    /// Frames per second over the last second.
+    pub fps: Option<f64>,
+    /// Start of the current measuring window and frames since.
+    window: Option<(Instant, u32)>,
+}
+
+impl Actual {
+    fn note(&mut self, f: &Frame) {
+        (self.format, self.width, self.height) = (Some(f.format), f.width, f.height);
+        match &mut self.window {
+            None => self.window = Some((Instant::now(), 0)),
+            Some((t, n)) => {
+                *n += 1;
+                let dt = t.elapsed().as_secs_f64();
+                if dt >= 1.0 {
+                    self.fps = Some(*n as f64 / dt);
+                    (*t, *n) = (Instant::now(), 0);
+                }
+            }
+        }
+    }
 }
 
 /// Last frame passed on, so ids and timestamps continue after a reconnect.
@@ -45,6 +76,7 @@ struct Shared {
     pool: BufferPool,
     stats: Stats,
     continuity: Mutex<Continuity>,
+    actual: Mutex<Actual>,
     preview: Mutex<Option<Frame>>,
     recorder: Mutex<Option<Recorder>>,
 }
@@ -78,6 +110,7 @@ impl Engine {
                 pool: BufferPool::default(),
                 stats: Stats::default(),
                 continuity: Mutex::new(Continuity::default()),
+                actual: Mutex::new(Actual::default()),
                 preview: Mutex::new(None),
                 recorder: Mutex::new(None),
             }),
@@ -219,7 +252,24 @@ impl Engine {
             }
             return Err(e);
         }
+        // Software crop for cameras that cannot crop themselves.
+        let crop = {
+            let c = &s.camera;
+            let full = c.capture_size.or(cam.geometry().map(|g| g.sensor)).unwrap_or((c.width, c.height));
+            if cam.hw_crop() || (c.width, c.height, c.offset_x, c.offset_y) == (full.0, full.1, 0, 0) {
+                None
+            } else {
+                let step = frame::crop_step(c.pixel_format)
+                    .ok_or("az MJPEG kép nem vágható szoftveresen: válassz más formátumot vagy a teljes képet")?;
+                if c.offset_x + c.width > full.0 || c.offset_y + c.height > full.1 {
+                    return Err(format!("a kivágás kilóg a {}×{} képből", full.0, full.1));
+                }
+                let snap = |v: u32| v / step * step;
+                Some((snap(c.offset_x), snap(c.offset_y), snap(c.width), snap(c.height)))
+            }
+        };
         let shared = self.shared.clone();
+        *shared.actual.lock().unwrap() = Actual::default();
         if rebase {
             shared.continuity.lock().unwrap().rebase = true;
         } else {
@@ -231,6 +281,17 @@ impl Engine {
         let sink = Box::new(move |mut frame: Frame| {
             let st = &shared.stats;
             st.received.fetch_add(1, Relaxed);
+            shared.actual.lock().unwrap().note(&frame);
+            if let Some((x, y, w, h)) = crop
+                && x + w <= frame.width
+                && y + h <= frame.height
+                && frame::crop_step(frame.format).is_some()
+            {
+                let mut data = shared.pool.get(Frame::byte_size(w, h, frame.format));
+                frame::crop(&frame, x, y, w, h, &mut data);
+                shared.pool.put(std::mem::replace(&mut frame.data, data));
+                (frame.width, frame.height) = (w, h);
+            }
             {
                 let mut c = shared.continuity.lock().unwrap();
                 if c.rebase {
@@ -286,6 +347,16 @@ impl Engine {
     /// Sensor size, smallest size and steps of the active camera.
     pub fn geometry(&self) -> Option<Geometry> {
         self.camera.as_ref().and_then(|(_, c)| c.geometry())
+    }
+
+    /// What the camera really delivers (see [`Actual`]).
+    pub fn actual(&self) -> Actual {
+        *self.shared.actual.lock().unwrap()
+    }
+
+    /// The active camera crops itself (else the engine crops in software).
+    pub fn hw_crop(&self) -> bool {
+        self.camera.as_ref().is_none_or(|(_, c)| c.hw_crop())
     }
 
     /// Highest frame rate the camera allows with the active settings.

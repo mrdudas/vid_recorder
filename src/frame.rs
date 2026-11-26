@@ -149,6 +149,40 @@ impl Frame {
     }
 }
 
+/// Cut `(x, y, w, h)` out of `src` into `dst` (software crop, for cameras
+/// that cannot crop themselves). Offsets and size must be even for Bayer,
+/// YUYV/UYVY and NV12 (keeps the colour pattern); see [`crop_step`].
+/// MJPEG cannot be cropped without decoding.
+pub fn crop(src: &Frame, x: u32, y: u32, w: u32, h: u32, dst: &mut [u8]) {
+    let (x, y, w, h, sw) = (x as usize, y as usize, w as usize, h as usize, src.width as usize);
+    let copy_rows = |plane: &[u8], out: &mut [u8], bpp: usize, rows: usize, y0: usize, row_len_src: usize| {
+        for (r, line) in out.chunks_exact_mut(w * bpp).take(rows).enumerate() {
+            let start = (y0 + r) * row_len_src + x * bpp;
+            line.copy_from_slice(&plane[start..start + w * bpp]);
+        }
+    };
+    match src.format {
+        PixelFormat::Nv12 => {
+            let (luma, chroma) = src.data.split_at(sw * src.height as usize);
+            let (dl, dc) = dst.split_at_mut(w * h);
+            copy_rows(luma, dl, 1, h, y, sw);
+            // Interleaved UV at half height: same bytes per row as luma.
+            copy_rows(chroma, dc, 1, h / 2, y / 2, sw);
+        }
+        f => copy_rows(&src.data, dst, f.bytes_per_pixel(), h, y, sw * f.bytes_per_pixel()),
+    }
+}
+
+/// Step of software crop offsets and sizes for `format`; `None`: cannot be
+/// cropped in software.
+pub fn crop_step(format: PixelFormat) -> Option<u32> {
+    match format {
+        PixelFormat::Mjpeg => None,
+        f if f.is_bayer() || matches!(f, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12) => Some(2),
+        _ => Some(1),
+    }
+}
+
 /// Unpack GenICam LSB-first packed pixels (`format.is_packed()`) from `src`
 /// into little-endian u16 in `dst` (2 bytes per pixel). Bit-exact.
 pub fn unpack(format: PixelFormat, src: &[u8], dst: &mut [u8]) {
@@ -225,6 +259,26 @@ mod tests {
         unpack(format, &packed, &mut dst);
         let got: Vec<u16> = dst.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         assert_eq!(got, values, "{format:?} n={n}");
+    }
+
+    #[test]
+    fn crop_cuts_the_right_pixels() {
+        // 8x4 Mono16 and NV12 with each byte = its position.
+        for format in [PixelFormat::Mono16, PixelFormat::Yuyv, PixelFormat::Nv12, PixelFormat::Mono8] {
+            let (w, h) = (8u32, 4u32);
+            let len = Frame::byte_size(w, h, format);
+            let src = Frame { id: 0, timestamp_ns: 0, width: w, height: h, format, data: (0..len).map(|i| i as u8).collect() };
+            let mut dst = vec![0u8; Frame::byte_size(4, 2, format)];
+            crop(&src, 2, 2, 4, 2, &mut dst);
+            let bpp = if format == PixelFormat::Nv12 { 1 } else { format.bytes_per_pixel() };
+            let row = |y: usize| -> Vec<u8> { (0..4 * bpp).map(|i| ((y * 8 * bpp) + 2 * bpp + i) as u8).collect() };
+            assert_eq!(&dst[..4 * bpp], &row(2)[..], "{format:?}");
+            assert_eq!(&dst[4 * bpp..8 * bpp], &row(3)[..], "{format:?}");
+            if format == PixelFormat::Nv12 {
+                // Chroma row 1 (of 2), bytes 2..6.
+                assert_eq!(&dst[8..12], &[32 + 8 + 2, 32 + 8 + 3, 32 + 8 + 4, 32 + 8 + 5]);
+            }
+        }
     }
 
     #[test]
