@@ -15,6 +15,7 @@ use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
 use crate::recordings::{self, ExportSettings, Job, JobState, MediaInfo, Recording, Still};
 use crate::scenario::{self, Device, Scenario, View};
+use crate::stack::{self, Stacker};
 
 /// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
 struct PreviewLut {
@@ -130,6 +131,9 @@ pub struct App {
     confirm_delete_scenario: bool,
     /// Spacing set up (first frame).
     styled: bool,
+    /// Preview averaging and the settings it runs with (a change restarts it).
+    stacker: Stacker,
+    stack_settings: Option<(String, stack::Settings)>,
 }
 
 /// A running recording on the main page.
@@ -254,6 +258,8 @@ impl App {
             export_result: Default::default(),
             confirm_delete_scenario: false,
             styled: false,
+            stacker: Stacker::new(),
+            stack_settings: None,
         };
         let first = app.scenarios[0].clone();
         app.apply(&first);
@@ -335,8 +341,28 @@ impl App {
             let view = self.engine.scenario.as_ref().map(|s| s.view.clone()).unwrap_or_default();
             let wb = view.auto_white_balance.then_some(self.wb_gains);
             let levels = view.auto_levels.then_some(self.levels);
-            let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref(), wb, &tone_table(&view, levels));
-            self.engine.recycle(frame);
+            let tone = tone_table(&view, levels);
+            let img = if view.average {
+                // Restart on a new scenario or other averaging settings.
+                let name = self.engine.scenario.as_ref().map_or(String::new(), |s| s.name.clone());
+                let settings = stack::Settings { frames: view.average_frames, align: view.align };
+                if self.stack_settings.as_ref() != Some(&(name.clone(), settings)) {
+                    self.stacker.reset();
+                    self.stack_settings = Some((name, settings));
+                }
+                if let Some(f) = self.stacker.push(frame, settings) {
+                    self.engine.recycle(f);
+                }
+                match self.stacker.take() {
+                    Some(avg) => image_to_color(&avg, self.lut.as_ref(), wb, &tone),
+                    None => return,
+                }
+            } else {
+                self.stack_settings = None;
+                let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref(), wb, &tone);
+                self.engine.recycle(frame);
+                img
+            };
             let Some((img, means, hist)) = img else { return };
             // Auto-levels: 0.5 % and 99.5 % of the brightness histogram.
             let total: u32 = hist.iter().sum();
@@ -371,6 +397,55 @@ impl App {
         let v = &mut s.view;
         ui.checkbox(&mut v.auto_white_balance, "Automatikus fehéregyensúly");
         ui.checkbox(&mut v.auto_levels, "Automatikus fényerő");
+        ui.checkbox(&mut v.average, "Átlagolás (zajcsökkentés)")
+            .on_hover_text("Az élőkép több kép átlaga. A felvétel nyers marad; az átlagolt kép elmenthető.");
+        if v.average {
+            let mut restart = false;
+            let mut save = false;
+            ui.indent("average", |ui| {
+                ui.horizontal(|ui| {
+                    let mut auto = v.average_frames == 0;
+                    if ui.checkbox(&mut auto, "automatikus képszám").on_hover_text("Addig vesz hozzá képet, amíg egy újabb már alig változtat az átlagon (0,2%).").changed() {
+                        v.average_frames = if auto { 0 } else { 16 };
+                    }
+                    if !auto {
+                        ui.add(egui::DragValue::new(&mut v.average_frames).range(2..=1000).suffix(" kép"));
+                    }
+                });
+                ui.checkbox(&mut v.align, "Igazítás (elmozdulás és elfordulás kompenzálása)")
+                    .on_hover_text("Minden képet az átlaghoz igazít eltolással és forgatással (pl. csillagos ég, rezgés). Lassabb.");
+                let st = self.stacker.status();
+                let depth = if v.average_frames == 0 && !st.settled { format!("{} kép, még nő", st.depth) } else { format!("{} kép", st.depth) };
+                let mut line = format!("Átlag: {depth}");
+                if v.align {
+                    line += &format!(" · elmozdulás {:.1}, {:.1} px, {:.2}°", st.motion.0, st.motion.1, st.motion.2);
+                    if st.rejected > 0 {
+                        line += &format!(" · {} kép nem volt igazítható", st.rejected);
+                    }
+                }
+                ui.small(line);
+                ui.horizontal(|ui| {
+                    restart = ui.button("Újrakezdés").clicked();
+                    save = ui.button("Átlagolt kép mentése").on_hover_text("16 bites, lineáris PNG a teljes felbontásban (Bayer: fél felbontás), LUT, fehéregyensúly és szintek nélkül, a szcenárió mappájába.").clicked();
+                });
+                match &st.saved {
+                    Some(Ok(p)) => {
+                        ui.small(format!("Mentve: {p}"));
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(RED, format!("Mentési hiba: {e}"));
+                    }
+                    None => {}
+                }
+            });
+            if restart {
+                self.stacker.reset();
+            }
+            if save {
+                let dir = PathBuf::from(&s.recording.output_dir);
+                self.stacker.save(dir.join(chrono::Local::now().format("atlag_%Y%m%d_%H%M%S.png").to_string()));
+            }
+        }
         egui::Grid::new("view").num_columns(2).show(ui, |ui| {
             ui.label("Fényerő");
             ui.add(egui::Slider::new(&mut v.brightness, -0.5..=0.5).fixed_decimals(2));
@@ -2224,6 +2299,49 @@ fn tone_table(v: &View, levels: Option<(f32, f32)>) -> [u8; 256] {
 /// the mean R, G, B before white balance (unsaturated pixels, colour only)
 /// for the auto white balance, and a brightness histogram before the tone
 /// table for the auto-levels. `None` if the frame cannot be decoded.
+/// Preview of a linear averaged image: white balance, LUT and tone as in
+/// [`to_color_image`].
+fn image_to_color(
+    img: &stack::Image,
+    lut: Option<&PreviewLut>,
+    wb: Option<[f32; 3]>,
+    tone: &[u8; 256],
+) -> Option<(egui::ColorImage, Option<[f64; 3]>, [u32; 256])> {
+    let (w, h, ch) = (img.width, img.height, img.channels);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    let (mut sum, mut n) = ([0f64; 3], 0u64);
+    let mut hist = [0u32; 256];
+    for p in img.data.chunks_exact(ch) {
+        if ch == 1 {
+            let v = to8(p[0]);
+            let px = lut.map_or([v, v, v], |l| l.gray[v as usize]);
+            hist[px[1] as usize] += 1;
+            rgb.extend(px.map(|c| tone[c as usize]));
+            continue;
+        }
+        if p.iter().all(|&c| c < 250.0 / 255.0) {
+            (0..3).for_each(|c| sum[c] += p[c] as f64 * 255.0);
+            n += 1;
+        }
+        let mut px: [f32; 3] = [p[0], p[1], p[2]];
+        if let Some(g) = wb {
+            px = std::array::from_fn(|c| (px[c] * g[c]).min(1.0));
+        }
+        if let Some(l) = lut {
+            px = l.lut.apply(px);
+        }
+        let px = px.map(to8);
+        hist[((px[0] as u32 + 2 * px[1] as u32 + px[2] as u32) / 4) as usize] += 1;
+        rgb.extend(px.map(|c| tone[c as usize]));
+    }
+    let means = (n > 0).then(|| sum.map(|c| c / n as f64));
+    Some((egui::ColorImage::from_rgb([w, h], &rgb), means, hist))
+}
+
 fn to_color_image(
     f: &Frame,
     max_width: usize,
