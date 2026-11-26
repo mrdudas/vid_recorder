@@ -94,6 +94,10 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - Az élőkép több kép átlaga. A képszám megadható, vagy automatikus: addig vesz hozzá képet, amíg egy újabb kevesebb mint 0,2%-kal változtat az átlagon, utána ennyi kép futó átlaga (legfeljebb 1000). Szcenárióváltáskor vagy a beállítás változásakor újrakezdi.
   - **Igazítás** (ki-be kapcsolható): minden képet eltolással és forgatással az átlaghoz igazít (képpiramis, Gauss–Newton, durva eltoláskereséssel), pl. csillagvizsgálónál. 1080p színes képen kb. 44 ms/kép, külön szálon; ha nem bírja, képeket hagy ki az átlagból.
   - Az átlag a beérkező élőkép-képekből (max. 25 fps) készül, nem minden kamerakockából.
+  - Ha 10 kép egymás után nem igazítható (pl. teljesen megváltozott a jelenet), az átlag újraindul. Periodikus mintánál (csíkok) a legkisebb elmozdulást választja.
+- **Sötétkalibráció** (ugyanott; csak nyers Mono és Bayer formátumnál): letakart objektívvel N képet (alapból 32) pixelenként átlagol, és `darks/<szcenárió>.dark` fájlba menti (JSON fejléc + f32 értékek, nincs verziókezelve). Bekapcsolva a nyers pixelekből vonja le, a demozaikolás előtt: az élőképre, az átlagra és a mentett PNG-re hat, a felvételre nem.
+  - Csak azonos formátumú, méretű, kivágású és tükrözésű képhez használható. Ha az expozíció, az erősítés eltér, vagy automatikus az expozíció, figyelmeztet, hogy újat kell készíteni.
+  - Kiírja a sötétszint átlagát és a forró pixelek számát (átlag + 6σ fölött).
   - **Átlagolt kép mentése:** 16 bites lineáris PNG (`atlag_<dátum>.png`) a szcenárió mappájába, LUT, fehéregyensúly és szintek nélkül. A Bayer-kép 2×2-es szuperpixelekből áll, ezért fél felbontású.
 - **Kivágás a főoldalon is**, ugyanúgy, mint a beállítóoldalon, de csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy „A szcenárió kivágása” gombig marad meg. Felvétel közben nem változtatható.
 

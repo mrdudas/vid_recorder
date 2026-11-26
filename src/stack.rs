@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use crate::dark::Dark;
 use crate::frame::{Frame, PixelFormat};
 
 /// Relative change of the average per added frame below which the
@@ -36,6 +37,8 @@ pub struct Settings {
     /// Frames to average; 0: automatic.
     pub frames: u32,
     pub align: bool,
+    /// Dark frame subtracted (a change restarts the average).
+    pub dark: bool,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -55,7 +58,7 @@ pub struct Status {
 }
 
 enum Msg {
-    Frame(Frame, Settings),
+    Frame(Frame, Settings, Option<Arc<Dark>>),
     Save(std::path::PathBuf),
     Reset,
 }
@@ -82,8 +85,8 @@ impl Stacker {
                 let mut st = State::default();
                 for msg in rx {
                     match msg {
-                        Msg::Frame(f, s) => {
-                            if let Some(img) = to_image(&f) {
+                        Msg::Frame(f, s, dark) => {
+                            if let Some(img) = to_image(&f, dark.as_deref()) {
                                 st.add(img, s);
                                 let preview = st.mean.as_ref().map(|m| downscale(m, PREVIEW_WIDTH));
                                 let mut g = o.lock().unwrap();
@@ -110,10 +113,10 @@ impl Stacker {
     }
 
     /// Hand a frame over; returns it if the stacker is still busy.
-    pub fn push(&self, f: Frame, s: Settings) -> Option<Frame> {
-        match self.tx.as_ref()?.try_send(Msg::Frame(f, s)) {
+    pub fn push(&self, f: Frame, s: Settings, dark: Option<Arc<Dark>>) -> Option<Frame> {
+        match self.tx.as_ref()?.try_send(Msg::Frame(f, s, dark)) {
             Ok(()) => None,
-            Err(TrySendError::Full(Msg::Frame(f, _)) | TrySendError::Disconnected(Msg::Frame(f, _))) => Some(f),
+            Err(TrySendError::Full(Msg::Frame(f, _, _)) | TrySendError::Disconnected(Msg::Frame(f, _, _))) => Some(f),
             Err(_) => None,
         }
     }
@@ -173,6 +176,8 @@ struct State {
     depth: u32,
     /// Consecutive frames with a change below SETTLED.
     calm: u32,
+    /// Consecutive frames the alignment rejected.
+    misses: u32,
     motion: Motion,
     status: Status,
 }
@@ -195,6 +200,14 @@ impl State {
                 Some(m) => m,
                 None => {
                     self.status.rejected += 1;
+                    self.misses += 1;
+                    // The scene changed completely: start over from this frame.
+                    if self.misses >= 10 {
+                        let rejected = self.status.rejected;
+                        self.mean = None;
+                        self.add(img, s);
+                        self.status.rejected = rejected;
+                    }
                     return;
                 }
             }
@@ -202,6 +215,7 @@ impl State {
             Motion::default()
         };
         self.motion = m;
+        self.misses = 0;
         let limit = match s.frames {
             0 if self.status.settled => self.depth,
             0 => MAX_DEPTH,
@@ -345,7 +359,7 @@ fn luminance(img: &Image, max_w: usize) -> Gray {
     Gray { w, h, d }
 }
 
-fn downscale(img: &Image, max_w: usize) -> Image {
+pub fn downscale(img: &Image, max_w: usize) -> Image {
     let k = img.width.div_ceil(max_w).max(1);
     if k == 1 {
         return img.clone();
@@ -398,8 +412,12 @@ fn search_shift(r: &Gray, f: &Gray, m: Motion) -> Motion {
     let (cx, cy) = (r.w as f64 / 2.0, r.h as f64 / 2.0);
     let (c, s) = (m.theta.cos(), m.theta.sin());
     let mut best = (f64::MAX, m);
-    for dy in -reach..=reach {
-        for dx in -reach..=reach {
+    // Nearest shifts first; a farther one must be clearly better (periodic
+    // patterns match equally well a period away).
+    let mut offsets: Vec<(i64, i64)> = (-reach..=reach).flat_map(|dy| (-reach..=reach).map(move |dx| (dx, dy))).collect();
+    offsets.sort_by_key(|&(dx, dy)| dx * dx + dy * dy);
+    for (dx, dy) in offsets {
+        {
             let (tx, ty) = (m.tx + dx as f64, m.ty + dy as f64);
             let (mut sum, mut n) = (0.0f64, 0u32);
             for y in 0..r.h {
@@ -412,7 +430,7 @@ fn search_shift(r: &Gray, f: &Gray, m: Motion) -> Motion {
                 }
             }
             // Enough overlap to compare (a third of the image).
-            if n as usize * 3 >= r.w * r.h && sum / (n as f64) < best.0 {
+            if n as usize * 3 >= r.w * r.h && sum / (n as f64) < best.0 * 0.98 {
                 best = (sum / n as f64, Motion { tx, ty, ..m });
             }
         }
@@ -451,6 +469,12 @@ fn refine(r: &Gray, f: &Gray, mut m: Motion) -> Option<Motion> {
                 }
             }
         }
+        // Damping: a direction the image does not fix (e.g. along
+        // stripes) stays at the guess instead of making H singular.
+        let tr = (hm[0][0] + hm[1][1]) / 2.0;
+        hm[0][0] += 1e-3 * tr + 1e-9;
+        hm[1][1] += 1e-3 * tr + 1e-9;
+        hm[2][2] += 1e-3 * hm[2][2] + 1e-9;
         let d = solve3(hm, b)?;
         let (dtx, dty, dth) = (-d[0], -d[1], -d[2]);
         // m ∘ delta: t = t + R(theta) * t_delta.
@@ -483,8 +507,9 @@ fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 /// Linear image of a frame, full resolution; Bayer as 2x2 super pixels
-/// (half size), YUV converted to RGB.
-pub fn to_image(f: &Frame) -> Option<Image> {
+/// (half size), YUV converted to RGB. A dark frame of the same raw format
+/// and size is subtracted pixel by pixel (values may go below 0).
+pub fn to_image(f: &Frame, dark: Option<&Dark>) -> Option<Image> {
     let (w, h) = (f.width as usize, f.height as usize);
     let d = &f.data;
     if f.format == PixelFormat::Mjpeg {
@@ -501,10 +526,11 @@ pub fn to_image(f: &Frame) -> Option<Image> {
     }
     let max = ((1u32 << f.format.bits()) - 1) as f32;
     let bpp = f.format.bytes_per_pixel();
+    let dark = dark.filter(|k| (k.meta.format, k.meta.width, k.meta.height) == (f.format, f.width, f.height)).map(|k| &k.data);
     let mono = |x: usize, y: usize| -> f32 {
         let i = (y * w + x) * bpp;
         let v = if bpp == 1 { d[i] as f32 } else { u16::from_le_bytes([d[i], d[i + 1]]) as f32 };
-        v / max
+        v / max - dark.map_or(0.0, |k| k[y * w + x])
     };
     let yuv = |y: u8, u: u8, v: u8| -> [f32; 3] {
         let (c, dd, e) = (y as f32 - 16.0, u as f32 - 128.0, v as f32 - 128.0);
@@ -593,6 +619,20 @@ mod tests {
     }
 
     #[test]
+    fn align_stripes_does_not_fail() {
+        // Diagonal stripes (the simulated camera): only the shift across
+        // them is defined; alignment must still succeed.
+        let stripes = |off: f32| Gray {
+            w: 320,
+            h: 180,
+            d: (0..320 * 180).map(|i| (((i % 320 + i / 320) as f32 + off) / 40.0 * std::f32::consts::TAU).sin()).collect(),
+        };
+        let m = align(&stripes(0.0), &stripes(6.0), Motion::default()).expect("aligned");
+        // Frame = reference shifted by -6 along x+y: tx + ty = -6.
+        assert!((m.tx + m.ty + 6.0).abs() < 0.5, "{m:?}");
+    }
+
+    #[test]
     fn average_settles() {
         // Constant image with noise: the automatic depth stops growing.
         let mut st = State::default();
@@ -604,7 +644,7 @@ mod tests {
                     0.5 + (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.2 - 0.1
                 })
                 .collect();
-            st.add(Image { width: 64, height: 48, channels: 1, data }, Settings { frames: 0, align: false });
+            st.add(Image { width: 64, height: 48, channels: 1, data }, Settings { frames: 0, align: false, dark: false });
         }
         assert!(st.status.settled && st.status.depth > 5 && st.status.depth < 400, "{:?}", st.status);
     }
@@ -621,10 +661,10 @@ mod speed {
         let img = Image { width: w, height: h, channels: 3, data: (0..w * h * 3).map(|i| ((i * 7919) % 1000) as f32 / 1000.0).collect() };
         for align in [false, true] {
             let mut st = State::default();
-            st.add(img.clone(), Settings { frames: 0, align });
+            st.add(img.clone(), Settings { frames: 0, align, dark: false });
             let t = std::time::Instant::now();
             for _ in 0..10 {
-                st.add(img.clone(), Settings { frames: 0, align });
+                st.add(img.clone(), Settings { frames: 0, align, dark: false });
             }
             eprintln!("align {align}: {:.1} ms/frame", t.elapsed().as_secs_f64() * 100.0);
         }

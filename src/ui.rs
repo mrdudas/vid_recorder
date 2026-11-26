@@ -15,6 +15,7 @@ use crate::frame::{Frame, PixelFormat};
 use crate::lut::{self, Lut};
 use crate::recordings::{self, ExportSettings, Job, JobState, MediaInfo, Recording, Still};
 use crate::scenario::{self, Device, Scenario, View};
+use crate::dark::{self, Dark};
 use crate::stack::{self, Stacker};
 
 /// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
@@ -134,6 +135,11 @@ pub struct App {
     /// Preview averaging and the settings it runs with (a change restarts it).
     stacker: Stacker,
     stack_settings: Option<(String, stack::Settings)>,
+    /// Dark frame of a scenario (loaded once per name; `None`: has none).
+    dark: Option<(String, Option<std::sync::Arc<Dark>>)>,
+    /// Dark frames being taken, and how many to take.
+    dark_capture: Option<dark::Capture>,
+    dark_frames: u32,
 }
 
 /// A running recording on the main page.
@@ -260,6 +266,9 @@ impl App {
             styled: false,
             stacker: Stacker::new(),
             stack_settings: None,
+            dark: None,
+            dark_capture: None,
+            dark_frames: 32,
         };
         let first = app.scenarios[0].clone();
         app.apply(&first);
@@ -342,21 +351,32 @@ impl App {
             let wb = view.auto_white_balance.then_some(self.wb_gains);
             let levels = view.auto_levels.then_some(self.levels);
             let tone = tone_table(&view, levels);
+            let name = self.engine.scenario.as_ref().map_or(String::new(), |s| s.name.clone());
+            self.take_dark(&frame);
+            // The dark frame, if switched on and it fits these frames.
+            let dark = self.dark_of(&name).filter(|d| {
+                view.dark
+                    && self.engine.scenario.as_ref().is_some_and(|s| d.check(&s.camera, Some((frame.format, frame.width, frame.height))).is_ok())
+            });
             let img = if view.average {
                 // Restart on a new scenario or other averaging settings.
-                let name = self.engine.scenario.as_ref().map_or(String::new(), |s| s.name.clone());
-                let settings = stack::Settings { frames: view.average_frames, align: view.align };
+                let settings = stack::Settings { frames: view.average_frames, align: view.align, dark: dark.is_some() };
                 if self.stack_settings.as_ref() != Some(&(name.clone(), settings)) {
                     self.stacker.reset();
                     self.stack_settings = Some((name, settings));
                 }
-                if let Some(f) = self.stacker.push(frame, settings) {
+                if let Some(f) = self.stacker.push(frame, settings, dark) {
                     self.engine.recycle(f);
                 }
                 match self.stacker.take() {
                     Some(avg) => image_to_color(&avg, self.lut.as_ref(), wb, &tone),
                     None => return,
                 }
+            } else if let Some(d) = dark {
+                self.stack_settings = None;
+                let img = stack::to_image(&frame, Some(&d)).map(|i| stack::downscale(&i, PREVIEW_MAX_WIDTH));
+                self.engine.recycle(frame);
+                img.and_then(|i| image_to_color(&i, self.lut.as_ref(), wb, &tone))
             } else {
                 self.stack_settings = None;
                 let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref(), wb, &tone);
@@ -392,6 +412,114 @@ impl App {
 
     /// White balance, brightness and contrast of the active scenario's
     /// preview. Saved with the scenario on the settings page.
+    /// The scenario's dark frame (loaded from disk once).
+    fn dark_of(&mut self, name: &str) -> Option<std::sync::Arc<Dark>> {
+        if self.dark.as_ref().is_none_or(|(n, _)| n != name) {
+            let d = Dark::load(&dark::path(name)).ok().map(std::sync::Arc::new);
+            self.dark = Some((name.to_string(), d));
+        }
+        self.dark.as_ref().and_then(|(_, d)| d.clone())
+    }
+
+    /// While dark frames are being taken: add this one; save when done.
+    fn take_dark(&mut self, f: &Frame) {
+        let Some(cap) = self.dark_capture.as_mut() else { return };
+        let Some(s) = self.engine.scenario.clone() else { return };
+        if let Err(e) = cap.add(f) {
+            self.message = format!("Sötétkép: {e}");
+            self.dark_capture = None;
+            return;
+        }
+        if !cap.done() {
+            return;
+        }
+        let Some(d) = self.dark_capture.take().and_then(|c| c.finish(&s.camera)) else { return };
+        let path = dark::path(&s.name);
+        self.message = match d.save(&path) {
+            Ok(()) => format!(
+                "Sötétkép mentve: {} ({} kép, átlagszint {:.2}%, {} forró pixel)",
+                path.display(),
+                d.meta.frames,
+                d.meta.mean * 100.0,
+                d.meta.hot
+            ),
+            Err(e) => format!("A sötétkép nem menthető: {e}"),
+        };
+        self.dark = Some((s.name.clone(), Some(std::sync::Arc::new(d))));
+        if let Some(a) = self.engine.scenario.as_mut() {
+            a.view.dark = true;
+        }
+        self.stacker.reset();
+    }
+
+    /// Dark calibration controls (part of the preview settings).
+    fn dark_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = self.engine.scenario.clone() else { return };
+        let dark = self.dark_of(&s.name);
+        let shape = (self.frame_size.0 > 0).then(|| (s.camera.pixel_format, self.frame_size.0, self.frame_size.1));
+        ui.label(egui::RichText::new("Sötétkalibráció").strong());
+        if !dark::supported(s.camera.pixel_format) {
+            ui.small(format!("{} képnél nem lehet: csak nyers (Mono, Bayer) formátumnál.", s.camera.pixel_format.name()));
+            return;
+        }
+        match &dark {
+            Some(d) => {
+                let m = &d.meta;
+                let check = d.check(&s.camera, shape);
+                let mut on = s.view.dark;
+                let r = ui.add_enabled(check.is_ok(), egui::Checkbox::new(&mut on, "Sötétkép levonása"))
+                    .on_hover_text("A sötétkép pixelenkénti értékét levonja a nyers képből: eltűnik az alapszint, a mintázat és a forró pixelek. Az élőképre, az átlagra és a mentett képre hat, a felvételre nem.");
+                if r.changed()
+                    && let Some(a) = self.engine.scenario.as_mut()
+                {
+                    a.view.dark = on;
+                }
+                ui.small(format!(
+                    "{}, {} kép, {} µs, {} dB · átlagszint {:.2}%, {} forró pixel",
+                    m.taken, m.frames, m.exposure_us, m.gain_db, m.mean * 100.0, m.hot
+                ));
+                match check {
+                    Err(e) => {
+                        ui.colored_label(RED, format!("Nem használható: {e}. Készíts újat."));
+                    }
+                    Ok(w) if !w.is_empty() => {
+                        ui.colored_label(ORANGE, format!("{}: készíts újat.", w.join("; ")));
+                    }
+                    Ok(_) => {}
+                }
+            }
+            None => {
+                ui.small("Ehhez a szcenárióhoz még nincs sötétkép.");
+            }
+        }
+        match &self.dark_capture {
+            Some(c) => {
+                let (n, target) = (c.n, c.target);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Sötétkép felvétele: {n}/{target}"));
+                    if ui.button("Mégse").clicked() {
+                        self.dark_capture = None;
+                    }
+                });
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Sötétkép felvétele")
+                        .on_hover_text("Előbb takard le az objektívet! A szcenárió expozíciójával és erősítésével készül; ha azok változnak, készíts újat.")
+                        .clicked()
+                    {
+                        self.dark_capture = Some(dark::Capture::new(self.dark_frames));
+                        self.message = "Sötétkép: az objektív legyen letakarva…".into();
+                    }
+                    ui.add(egui::DragValue::new(&mut self.dark_frames).range(4..=1000).suffix(" kép"));
+                });
+                ui.small("Takard le az objektívet, mielőtt elindítod.");
+            }
+        }
+    }
+
     fn view_controls(&mut self, ui: &mut egui::Ui) {
         let Some(s) = self.engine.scenario.as_mut() else { return };
         let v = &mut s.view;
@@ -457,6 +585,9 @@ impl App {
         if ui.button("Alaphelyzet").clicked() {
             *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, ..View::default() };
         }
+        ui.separator();
+        self.dark_controls(ui);
+        ui.separator();
         ui.small("Csak az élőképre hat, a felvétel nyers marad.");
     }
 

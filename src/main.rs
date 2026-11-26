@@ -7,6 +7,7 @@ mod lut;
 mod magnify;
 mod probe;
 mod stack;
+mod dark;
 mod recordings;
 mod recorder;
 mod scenario;

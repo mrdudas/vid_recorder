@@ -73,11 +73,13 @@ pub struct View {
     pub average_frames: u32,
     /// Align the frames before averaging (shift and rotation).
     pub align: bool,
+    /// Subtract the scenario's dark frame (see `dark`).
+    pub dark: bool,
 }
 
 impl Default for View {
     fn default() -> Self {
-        View { auto_white_balance: true, auto_levels: false, brightness: 0.0, contrast: 1.0, average: false, average_frames: 0, align: false }
+        View { auto_white_balance: true, auto_levels: false, brightness: 0.0, contrast: 1.0, average: false, average_frames: 0, align: false, dark: false }
     }
 }
 
