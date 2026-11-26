@@ -387,6 +387,10 @@ impl Camera for U3vCamera {
         let thread = std::thread::Builder::new()
             .name("u3v-camera".into())
             .spawn(move || {
+                // The Alvium often discards the payload that is in flight
+                // when streaming starts (DataDiscarded): nothing has been
+                // delivered yet, so no frame of the stream is missing.
+                let mut started = false;
                 while running.load(Relaxed) {
                     // Returns an error once streaming is stopped.
                     let payload = match rx.recv_blocking() {
@@ -396,6 +400,10 @@ impl Camera for U3vCamera {
                             eprintln!("stream: camera disconnected");
                             lost.store(true, Relaxed);
                             break;
+                        }
+                        Err(e) if !started => {
+                            eprintln!("stream: before the first frame, ignored: {e}");
+                            continue;
                         }
                         Err(e) => {
                             errors.fetch_add(1, Relaxed);
@@ -431,7 +439,10 @@ impl Camera for U3vCamera {
                     });
                     rx.send_back(payload);
                     match frame {
-                        Some(f) => sink(f),
+                        Some(f) => {
+                            started = true;
+                            sink(f)
+                        }
                         None => {
                             errors.fetch_add(1, Relaxed);
                         }

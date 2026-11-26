@@ -17,6 +17,7 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
     - ha a kamera csatlakozik, de nem küld képet, előbb GenICam `DeviceReset`-et kap;
     - **a futó felvétel nem áll le**, a kamera visszatérése után ugyanabban a fájlban folytatódik. A CSV `frameID` és `timestamp` értékei a kiesésen át folytatódnak, a hiányzó képkockák sorszám-ugrásként látszanak, és elveszettnek számítanak;
     - a leállítás legfeljebb 2 s-ot vár egy beragadt kameraszálra.
+  - **DataDiscarded:** a kamera eldobta a képet, mert a gép nem olvasta ki időben (CPU-terhelés). Minden ilyen egy valódi elveszett képkocka, és sorszám-ugrásként a CSV-ben is látszik (mérve: teljes CPU-terhelés mellett 121 eldobott = 121 hiányzó sorszám). A stream indulásakor, az első kép előtt érkező eldobott csomag nem veszteség, ezt a program figyelmen kívül hagyja.
   - **Tesztelésnél tilos a USB-portot letiltani** (`usbN-portM/disable`): az Alvium ettől megakadt, és szoftveresen (vezérlő-újraindítással) sem jött vissza, csak kihúzással (2026-11-25). A kihúzást a felhasználónak kell kipróbálnia.
 - **UVC kamerák is használhatók** (webkamera, UVC-kompatibilis panelkamera) a `nokhwa` könyvtárral: Macen AVFoundation, Windowson Media Foundation, Linuxon V4L2.
   - Formátumok: MJPEG, YUYV, NV12, szürke (Mono8).
@@ -36,6 +37,11 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - **A nyers kép LUT nélkül, veszteségmentesen (bitre pontosan) kerül mentésre.** Az `auto` kódoló minden bitmélységen `ffvhuff`-ot választ. 8 bit fölött a mintákat változatlan 16 bites szavakként (`gray16le`) kapja meg, a valós bitmélységet a `PIXEL_FORMAT` címke adja meg, és az export ebből skáláz. Az FFVHuff 1080p 10 biten kb. 380 fps-sel kódol, az FFV1 csak kb. 66 fps-sel, de az FFV1 fájlja kb. harmadával kisebb. Az `ffv1` ezért csak kézzel választható, alacsonyabb adatsebességhez. A hardveres kódolók veszteségesek, ezért csak kézzel választhatók.
 - **S-Log LUT** (`.cube` fájlok a `slog/` mappában): csak az **élőképen** használjuk, ott elég a 8 bit. Később az **exportnál** is kell majd. A felvételre soha nem kerül LUT.
 - **Hardveres kódolás, ha van:** Intel (QSV), NVIDIA (NVENC) vagy AMD (AMF). Macen ezt a VideoToolbox adja (Intel Macen az Intel hardverét használja). Ha egyik sem érhető el, szoftveres kódolás az alternatíva.
+  - **Intel GPU HEVC (`hevc_qsv`), veszteséges, kézzel választható**, ha a veszteségmentes felvétel túl nagy. Mérve 2026-11, 1080p, 180 fps, BayerRG8, zajos (nagy erősítésű) jelenet: FFVHuff 19–24 GB/perc, FFV1 15,6 GB/perc (és csak 148 fps-t bír), GPU q14 7,4–9,9 GB/perc. Q14-nél a kódolási hiba kb. 2 szint (8 bit), ez a szenzorzaj (9–16 szint) mellett elhanyagolható.
+    - Csak a **low-power** (VDENC) mód elég gyors: kb. 270 fps 1080p-n, kb. 80% egy CPU-magból. A normál mód kb. 80 fps-t tud. Legfeljebb 10 bit (Main10).
+    - A nyers Bayer-mozaik változatlan elrendezésben kerül a fényerősávba, a színsávok üresek. A `scale=in_range=pc:out_range=pc` kell, különben az ffmpeg a 0–255-öt 16–235-re skálázza. A Bayer-színek szétválogatása a tömörítés előtt nem hozott javulást.
+    - Az export és a lejátszó a fényerősávot olvassa ki (`extractplanes=y`). Az archív export ezt a felvételt változatlanul másolja.
+    - Linuxon kell hozzá az `intel-media-va-driver-non-free` és a `libmfx-gen1.2` csomag.
   - A kódolást egy külön indított **ffmpeg** folyamat végzi, ennek a bemenetére írjuk a nyers képkockákat. Nem linkeljük a programba, így az ffmpeg GPL-es buildje nem érinti a licencünket.
 - **Időbélyegek:** minden képkockához tartozik időbélyeg. Ezek egy CSV-be kerülnek, amelynek a neve **megegyezik a felvétel nevével** (pl. `felvetel01.mkv` → `felvetel01.csv`).
   - Formátum: `timestamp,frameID`, soronként egy képkocka.
@@ -106,6 +112,8 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - **Kivágás a főoldalon is**, ugyanúgy, mint a beállítóoldalon, de csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy „A szcenárió kivágása” gombig marad meg. Felvétel közben nem változtatható.
 
 ## Indítás és frissítés
+
+- **Felülettesztelés képernyőképekkel:** `screenshots [mappa]` a szimulált kamerával végigjárja az oldalakat. `screenshots <mappa> camera` a valódi kamerán fut: főoldali kivágás, felvétel, szünet, folytatás, stop, export, határok, kivágás a beállítóoldalon, átlagolás, sötétkalibráció, felvételek és lejátszó. A felvételt (`_kamerateszt`) és a sötétképet nem törli, hogy ellenőrizhető legyen. Zárolt képernyőnél a Wayland nem rajzol, ilyenkor Xvfb-vel kell futtatni: `env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1440x900x24" ...` (kell hozzá az `xvfb` és a `libxkbcommon-x11-0` csomag). Xvfb alatt a CPU rajzol, és a kamera ettől képeket dobhat el, ezért ott a veszteségjelzés nem mérvadó.
 
 - **Fej nélküli felvétel** (pl. SSH-n): `record <szcenárió> [mp]`. Enterre vagy az idő leteltével áll le, és a fenti hibatűréssel fut.
 - **A programot az indítószkripttel indítjuk:** `./run.sh` (macOS/Linux) vagy `.\run.ps1` (Windows). Az argumentumokat továbbadja, pl. `./run.sh record-test 5`. Ha nincs hálózat, a frissítés nem sikerül, vagy helyi módosítás van, a meglévő verzió indul.

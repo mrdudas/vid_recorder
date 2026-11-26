@@ -37,7 +37,7 @@ usage:
                                is up or Enter is pressed (no GUI, e.g. over
                                ssh); waits for a missing camera and keeps
                                recording across unplug / replug
-  vid_recorder screenshots [dir=screenshots]
+  vid_recorder screenshots [dir=screenshots] [camera]
                                walk through the GUI pages with the simulated
                                camera and save each page as PNG
   vid_recorder probe <scenario|sim|u3v> [seconds=5]
@@ -114,6 +114,7 @@ fn scenario_dir() -> PathBuf {
 /// PNG (for checking the layout without a camera or a screen at hand).
 fn screenshots(args: &[String]) -> Result<bool, String> {
     let dir = PathBuf::from(args.first().map_or("screenshots", String::as_str));
+    let camera = args.get(1).is_some_and(|a| a == "camera");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]),
@@ -122,7 +123,7 @@ fn screenshots(args: &[String]) -> Result<bool, String> {
     eframe::run_native(
         "vid_recorder",
         options,
-        Box::new(move |_cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog")).screenshots(dir)))),
+        Box::new(move |_cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog")).screenshots(dir, camera)))),
     )
     .map_err(|e| e.to_string())?;
     Ok(true)

@@ -49,10 +49,13 @@ pub const PROFILES: &[Profile] = &[
     },
     Profile {
         id: "hevc_qsv",
-        label: "Intel QSV HEVC (veszteséges)",
+        // Low-power (VDENC) path: ~270 fps at 1080p on a Raptor Lake iGPU,
+        // the normal path only ~80 fps. q14 error ~2 levels RMS (8 bit),
+        // well under the sensor noise at high gain (2026-11). Max 10 bit.
+        label: "Intel GPU HEVC (low-power, veszteséges, max. 10 bit)",
         hardware: true,
         lossless_bits: 0,
-        args: &["-c:v", "hevc_qsv", "-preset", "veryslow", "-global_quality", "12"],
+        args: &["-c:v", "hevc_qsv", "-low_power", "1", "-preset", "veryfast", "-q", "14", "-async_depth", "8"],
         container: "mkv",
     },
     Profile {

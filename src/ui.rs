@@ -150,6 +150,8 @@ struct Rec {
     started: Instant,
     paused_since: Option<Instant>,
     paused_total: Duration,
+    /// Camera losses counted before the recording started.
+    lost_before: u64,
 }
 
 impl Rec {
@@ -281,15 +283,30 @@ impl App {
 
     /// Screenshot mode: every scenario runs on the simulated camera (not
     /// saved), the pages are walked through and saved as PNG into `dir`.
-    pub fn screenshots(mut self, dir: PathBuf) -> Self {
-        for s in &mut self.scenarios {
-            s.device = Device::Sim;
+    /// With `camera` the scenarios' own cameras are used and a longer walk
+    /// exercises crop, pause, limits, averaging and dark calibration; its
+    /// recording and dark frame are left for checking.
+    pub fn screenshots(mut self, dir: PathBuf, camera: bool) -> Self {
+        if !camera {
+            for s in &mut self.scenarios {
+                s.device = Device::Sim;
+            }
+            self.edit.device = Device::Sim;
         }
-        self.edit.device = Device::Sim;
         let first = self.scenarios[0].clone();
         self.apply(&first);
-        self.shots = Some(Shots { dir, step: 0, started: None, pending: None });
+        let steps: &'static [Shot] = if camera { &CAMERA_SHOTS } else { &SHOTS };
+        self.shots = Some(Shots { dir, steps, cleanup: !camera, step: 0, started: None, pending: None });
         self
+    }
+
+    /// Crop the page's scenario to the centre `w`×`h` (screenshot walk).
+    fn crop_centre(&mut self, w: f32, h: f32) {
+        let Some(g) = self.geometry() else { return };
+        let sensor = egui::vec2(g.sensor.0 as f32, g.sensor.1 as f32);
+        let min = egui::vec2(g.min_size.0 as f32, g.min_size.1 as f32);
+        let sel = egui::Rect::from_center_size((sensor / 2.0).to_pos2(), egui::vec2(w, h));
+        self.crop_to(sel, g.step, min, sensor);
     }
 
     /// Make `s` the active scenario: the camera switches to it, the main
@@ -680,7 +697,9 @@ impl App {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(tex, egui::Rect::from_min_max(to_screen(img.min), to_screen(img.max)), uv, egui::Color32::WHITE);
         if let Some(r) = &self.recording {
-            rec_badge(&painter, rect, r);
+            // Above the crop shading drawn later.
+            let top = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("rec_badge")));
+            rec_badge(&top.with_clip_rect(rect), rect, r);
         }
         if !sensor_view {
             return;
@@ -1036,7 +1055,9 @@ impl App {
         match self.engine.start_recording(&name) {
             Ok(info) => {
                 self.message = format!("Felvétel: {}", info.video);
-                self.recording = Some(Rec { info, started: Instant::now(), paused_since: None, paused_total: Duration::ZERO });
+                let lost_before = self.engine.stats().lost_at_camera.load(Relaxed).max(self.engine.camera_errors());
+                self.recording =
+                    Some(Rec { info, started: Instant::now(), paused_since: None, paused_total: Duration::ZERO, lost_before });
             }
             Err(e) => self.message = format!("Hiba: {e}"),
         }
@@ -1064,13 +1085,16 @@ impl App {
         if self.engine.scenario.is_none() {
             return (RED, "A kamera nem fut".into());
         }
-        let lost = self.engine.stats().lost_at_camera.load(Relaxed) + self.engine.camera_errors();
+        // A discarded payload is also a gap in the frame IDs: count it once.
+        let lost = self.engine.stats().lost_at_camera.load(Relaxed).max(self.engine.camera_errors());
         if let Some(r) = &self.recording {
             let st = &r.info.stats;
             if st.error.lock().unwrap().is_some() {
                 return (RED, "Felvételi hiba!".into());
             }
-            if st.dropped.load(Relaxed) > 0 || lost > 0 {
+            // Only what happened since the start (a pause is not a loss: the
+            // camera keeps sending, the frames are just not written).
+            if st.dropped.load(Relaxed) > 0 || lost > r.lost_before {
                 return (RED, "Képkocka veszett el a felvételből!".into());
             }
             return (GREEN, format!("Felvétel rendben · {}", self.engine.camera_name()));
@@ -2374,8 +2398,11 @@ fn export_editor(ui: &mut egui::Ui, x: &mut ExportSettings, id: &str) {
     ui.small(format!("A kimenet a felvétel mappájának {}/ almappájába kerül.", recordings::EXPORT_DIR));
 }
 
-/// Screenshot steps: file name and what to do before the picture.
-const SHOTS: [(&str, fn(&mut App)); 6] = [
+/// A screenshot step: file name and what to do before the picture.
+type Shot = (&'static str, fn(&mut App));
+
+/// Screenshot steps on the simulated camera.
+const SHOTS: [Shot; 6] = [
     ("1_fooldal", |a| a.page = Page::Main),
     ("2_fooldal_felvetel", |a| {
         a.rec_name = "_kepernyokep".into();
@@ -2398,11 +2425,71 @@ const SHOTS: [(&str, fn(&mut App)); 6] = [
     }),
 ];
 
+/// Walk on the real camera (`screenshots DIR camera`).
+const CAMERA_SHOTS: [Shot; 16] = [
+    ("01_fooldal", |a| a.page = Page::Main),
+    ("02_fooldal_kivagas", |a| a.crop_centre(960.0, 540.0)),
+    ("03_felvetel", |a| {
+        a.rec_name = "_kamerateszt".into();
+        a.start_recording();
+    }),
+    ("04_szunet", |a| {
+        if let Some(r) = &mut a.recording {
+            r.set_paused(true);
+        }
+    }),
+    ("05_folytatas", |a| {
+        if let Some(r) = &mut a.recording {
+            r.set_paused(false);
+        }
+    }),
+    ("06_leallitva", |a| a.stop_recording()),
+    ("07_export", |a| {
+        if let (Some((v, _)), Some(s)) = (a.last_rec.clone(), &a.engine.scenario) {
+            a.rec.queue.push_back((v, s.export.clone()));
+        }
+    }),
+    ("08_szcenario_kivagasa", |a| {
+        if let Some(s) = a.scenarios.iter().find(|s| Some(&s.name) == a.engine.scenario.as_ref().map(|x| &x.name)).cloned() {
+            a.apply(&s);
+        }
+    }),
+    ("09_beallitasok_hatarok", |a| a.page = Page::Settings),
+    ("10_beallitasok_kivagas", |a| a.crop_centre(1920.0, 480.0)),
+    ("11_atlagolas", |a| {
+        if let Some(s) = a.engine.scenario.as_mut() {
+            s.view.average = true;
+            s.view.align = true;
+        }
+    }),
+    ("12_sotetkep_felvetel", |a| a.dark_capture = Some(dark::Capture::new(32))),
+    ("13_sotetkep_levonas", |a| {
+        if let Some(s) = a.engine.scenario.as_mut() {
+            s.view.dark = true;
+            s.view.average = false;
+        }
+        a.edit.view.dark = true;
+    }),
+    ("14_teljes_kep", |a| a.crop_centre(1944.0, 1470.0)),
+    ("15_felvetelek", |a| {
+        a.page = Page::Recordings;
+        a.refresh_recordings();
+        if let Some(r) = a.rec.list.iter().find(|r| r.video.to_string_lossy().contains("_kamerateszt")) {
+            let v = r.video.clone();
+            a.open_viewer(v);
+        }
+    }),
+    ("16_vege", |a| a.page = Page::Main),
+];
+
 /// How long each screenshot step runs before the picture (preview, decode).
-const SHOT_WAIT: Duration = Duration::from_millis(2000);
+const SHOT_WAIT: Duration = Duration::from_millis(3000);
 
 struct Shots {
     dir: PathBuf,
+    steps: &'static [Shot],
+    /// Delete the recording made for the pictures.
+    cleanup: bool,
     step: usize,
     started: Option<Instant>,
     pending: Option<std::sync::mpsc::Receiver<std::sync::Arc<egui::ColorImage>>>,
@@ -2414,7 +2501,7 @@ impl Shots {
         ctx.request_repaint();
         if let Some(rx) = &self.pending {
             let Ok(img) = rx.try_recv() else { return false };
-            let path = self.dir.join(format!("{}.png", SHOTS[self.step].0));
+            let path = self.dir.join(format!("{}.png", self.steps[self.step].0));
             if let Err(e) = save_png(&path, &img) {
                 eprintln!("{}: {e}", path.display());
             } else {
@@ -2424,9 +2511,9 @@ impl Shots {
             self.started = None;
             self.step += 1;
         }
-        if self.step >= SHOTS.len() {
+        if self.step >= self.steps.len() {
             // The recording made for the pictures.
-            if let Some(sc) = &app.engine.scenario {
+            if let Some(sc) = app.engine.scenario.as_ref().filter(|_| self.cleanup) {
                 let dir = &sc.recording.output_dir;
                 for d in [dir.clone(), dir.join(recordings::EXPORT_DIR)] {
                     for f in std::fs::read_dir(&d).into_iter().flatten().flatten() {
@@ -2440,7 +2527,7 @@ impl Shots {
         }
         match self.started {
             None => {
-                (SHOTS[self.step].1)(app);
+                (self.steps[self.step].1)(app);
                 self.started = Some(Instant::now());
             }
             Some(t) if t.elapsed() >= SHOT_WAIT => {

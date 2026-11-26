@@ -103,6 +103,12 @@ impl PixelFormat {
     }
 
     /// Packed on the wire (unpacked to 2 bytes per pixel on arrival).
+    /// One sample per pixel (Bayer mosaic or Mono). GPU-encoded recordings
+    /// keep these in the luma plane of a YUV stream.
+    pub fn is_single_channel(self) -> bool {
+        self.is_bayer() || matches!(self, PixelFormat::Mono8 | PixelFormat::Mono10 | PixelFormat::Mono12 | PixelFormat::Mono16)
+    }
+
     pub fn is_packed(self) -> bool {
         matches!(self, PixelFormat::BayerRG10p | PixelFormat::BayerRG12p)
     }

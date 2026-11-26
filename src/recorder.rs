@@ -82,6 +82,7 @@ impl Recorder {
             requested: format,
             fps,
             ffmpeg: None,
+            dead: false,
         };
         let thread = std::thread::Builder::new()
             .name("recorder".into())
@@ -133,6 +134,7 @@ struct Writer {
     requested: PixelFormat,
     fps: f64,
     ffmpeg: Option<(Child, ChildStdin)>,
+    dead: bool,
 }
 
 impl Writer {
@@ -168,11 +170,21 @@ impl Writer {
     }
 
     fn write(&mut self, f: &Frame) -> Result<(), String> {
+        if self.dead {
+            return Ok(()); // never restart ffmpeg over the same file
+        }
         if self.ffmpeg.is_none() {
             self.ffmpeg = Some(self.spawn_ffmpeg(f)?);
         }
         let (_, stdin) = self.ffmpeg.as_mut().unwrap();
-        stdin.write_all(&f.data).map_err(|e| format!("ffmpeg input: {e}"))?;
+        if let Err(e) = stdin.write_all(&f.data) {
+            // ffmpeg quit: its own message tells why.
+            let (child, stdin) = self.ffmpeg.take().unwrap();
+            drop(stdin);
+            let why = child.wait_with_output().map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string()).unwrap_or_default();
+            self.dead = true;
+            return Err(format!("ffmpeg input: {e}: {why}"));
+        }
         writeln!(self.csv, "{},{}", f.timestamp_ns, f.id).map_err(|e| format!("csv: {e}"))?;
         self.stats.written.fetch_add(1, Relaxed);
         Ok(())
@@ -198,9 +210,19 @@ impl Writer {
             cmd.args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
                 .args(["-video_size", &format!("{}x{}", f.width, f.height)]);
         }
+        cmd.args(["-framerate", &format!("{}", self.fps)]).args(["-i", "pipe:0"]);
+        if encoder.hardware && f.format.ffmpeg_input().starts_with("gray") {
+            // GPU encoders take YUV only: the samples go into the luma plane
+            // unchanged (full range, no 0-255 -> 16-235 scaling), chroma flat.
+            let (pix, profile) = match f.format.bits() {
+                8 => ("nv12", "main"),
+                10 => ("p010le", "main10"),
+                b => return Err(format!("{}: {b} bites képet nem tud kódolni (legfeljebb 10)", encoder.label)),
+            };
+            cmd.args(["-vf", &format!("scale=in_range=pc:out_range=pc,format={pix}")])
+                .args(["-profile:v", profile, "-color_range", "pc"]);
+        }
         let mut child = cmd
-            .args(["-framerate", &format!("{}", self.fps)])
-            .args(["-i", "pipe:0"])
             .args(encoder.args)
             // Bayer is stored as grey; the tag tells the export what it is.
             .args(["-metadata:s:v:0", &format!("PIXEL_FORMAT={}", f.format.name())])

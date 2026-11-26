@@ -153,6 +153,8 @@ struct Probe {
     gray: bool,
     /// PIXEL_FORMAT tag written by the recorder (e.g. "BayerRG12").
     tag: Option<String>,
+    /// Sensor samples in the luma plane of a YUV stream (GPU encoders).
+    luma: bool,
     /// Left shift that brings the samples to full 16-bit range: set when
     /// fewer bits are stored as plain 16-bit words (FFVHuff recordings).
     shift: u32,
@@ -178,7 +180,9 @@ fn probe(input: &str) -> Result<Probe, String> {
         .filter(|f| f.is_finite() && *f > 0.0)
         .ok_or("ffprobe: no frame rate")?;
     let tag = field("TAG:PIXEL_FORMAT");
-    let bits = tag.as_deref().and_then(|t| crate::frame::PixelFormat::ALL.into_iter().find(|f| f.name() == t)).map(|f| f.bits());
+    let format = tag.as_deref().and_then(|t| crate::frame::PixelFormat::ALL.into_iter().find(|f| f.name() == t));
+    let bits = format.map(|f| f.bits());
+    let luma = format.is_some_and(|f| f.is_single_channel()) && field("pix_fmt").is_some_and(|p| p.starts_with("yuv"));
     let shift = match (field("pix_fmt").as_deref(), bits) {
         (Some("gray16le"), Some(b)) if b < 16 => 16 - b,
         _ => 0,
@@ -187,7 +191,8 @@ fn probe(input: &str) -> Result<Probe, String> {
         w: num("width")?,
         h: num("height")?,
         fps,
-        gray: field("pix_fmt").is_some_and(|p| p.starts_with("gray")),
+        gray: luma || field("pix_fmt").is_some_and(|p| p.starts_with("gray")),
+        luma,
         tag,
         shift,
     })
@@ -234,7 +239,11 @@ fn spawn_decoder(input: &str, p: &Probe, o: &Options, from: f64, len: Option<f64
     }
     first.args(["-an", "-f", "rawvideo"]);
     let bayer = o.bayer.as_ref().filter(|_| p.gray);
-    let expand = (p.shift > 0).then(|| format!("lut=c0=val*{}", 1u32 << p.shift));
+    let expand = match (p.luma, p.shift) {
+        (true, _) => Some("extractplanes=y".to_string()),
+        (false, 0) => None,
+        (false, s) => Some(format!("lut=c0=val*{}", 1u32 << s)),
+    };
     match bayer {
         None => {
             let vf: Vec<&str> = expand.iter().chain(scale.iter()).map(String::as_str).collect();
@@ -503,9 +512,12 @@ pub fn run(args: &[String]) -> Result<bool, String> {
 /// timestamp CSV next to it. Succeeds only if every frame is in the output.
 fn archive(input: &str, output: &str) -> Result<bool, String> {
     let t0 = Instant::now();
+    // A GPU (lossy) recording is already compressed: copied unchanged.
+    let codec: &[&str] = if probe(input)?.luma { &["-c:v", "copy"] } else { &["-c:v", "ffv1", "-level", "3", "-slices", "16", "-g", "1"] };
     let ok = Command::new(ffmpeg_path())
-        .args(["-v", "error", "-y", "-nostdin", "-i", input, "-map", "0:v", "-c:v", "ffv1", "-level", "3"])
-        .args(["-slices", "16", "-g", "1", "-map_metadata:s:v", "0:s:v", output])
+        .args(["-v", "error", "-y", "-nostdin", "-i", input, "-map", "0:v"])
+        .args(codec)
+        .args(["-map_metadata:s:v", "0:s:v", output])
         .status()
         .map_err(|e| format!("ffmpeg: {e}"))?
         .success();

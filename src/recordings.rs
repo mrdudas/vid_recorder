@@ -272,13 +272,23 @@ pub enum Still {
 
 /// Decode the frame at `t` seconds.
 pub fn decode_frame(path: &Path, info: &MediaInfo, t: f64, max_width: u32) -> Result<Still, String> {
-    let grey = matches!(info.pix_fmt.as_str(), "gray" | "gray10le" | "gray12le" | "gray16le");
+    // GPU recordings keep the sensor samples in the luma plane.
+    let luma = match info.pix_fmt.as_str() {
+        "yuv420p" | "yuvj420p" if info.format.is_some_and(|f| f.is_single_channel()) => Some("gray"),
+        "yuv420p10le" if info.format.is_some_and(|f| f.is_single_channel()) => Some("gray10le"),
+        _ => None,
+    };
+    let pix_fmt = luma.unwrap_or(info.pix_fmt.as_str());
+    let grey = matches!(pix_fmt, "gray" | "gray10le" | "gray12le" | "gray16le");
     let mut cmd = Command::new(ffmpeg_path());
     cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{t:.4}")]).arg("-i").arg(path);
     cmd.args(["-frames:v", "1", "-an", "-f", "rawvideo"]);
     let (w, h) = if grey {
         // Same sample layout as stored: the values stay the camera's.
-        cmd.args(["-pix_fmt", &info.pix_fmt]);
+        if luma.is_some() {
+            cmd.args(["-vf", "extractplanes=y"]);
+        }
+        cmd.args(["-pix_fmt", pix_fmt]);
         (info.width, info.height)
     } else {
         let w = info.width.min(max_width) & !1;
@@ -293,9 +303,9 @@ pub fn decode_frame(path: &Path, info: &MediaInfo, t: f64, max_width: u32) -> Re
     if !grey {
         return Ok(Still::Rgb { width: w as usize, height: h as usize, data: out.stdout });
     }
-    let wide = info.pix_fmt != "gray";
+    let wide = pix_fmt != "gray";
     let format = info.format.filter(|f| (f.bytes_per_pixel() == 2) == wide && f.bits() <= 16 && !matches!(f, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12 | PixelFormat::Mjpeg));
-    let format = format.unwrap_or(match info.pix_fmt.as_str() {
+    let format = format.unwrap_or(match pix_fmt {
         "gray" => PixelFormat::Mono8,
         "gray10le" => PixelFormat::Mono10,
         "gray12le" => PixelFormat::Mono12,
