@@ -86,8 +86,10 @@ pub fn free_space(dir: &Path) -> Option<u64> {
     dir.ancestors().find(|d| d.exists()).and_then(|d| fs4::available_space(d).ok())
 }
 
-/// What to make of a recording.
-#[derive(Clone, PartialEq)]
+/// What to make of a recording. Saved with the scenario as the operator's
+/// default export.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ExportSettings {
     /// `archive`, `native` or magnification methods (see `export::USAGE`).
     pub method: String,

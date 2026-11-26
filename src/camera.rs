@@ -114,7 +114,7 @@ impl SimCamera {
 
 impl Camera for SimCamera {
     fn name(&self) -> String {
-        "Simulated camera".into()
+        "Szimulált kamera".into()
     }
 
     fn apply(&mut self, s: &CameraSettings) -> Result<(), String> {

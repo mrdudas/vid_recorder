@@ -45,6 +45,9 @@ pub struct Scenario {
     /// Live preview look. Recordings are always raw.
     #[serde(default)]
     pub view: View,
+    /// What the main page's Export button makes of a recording.
+    #[serde(default)]
+    pub export: crate::recordings::ExportSettings,
 }
 
 /// Preview-only adjustments (applied after the LUT, if any).
@@ -138,6 +141,7 @@ impl Default for Scenario {
             recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into() },
             preview_lut: None,
             view: View::default(),
+            export: Default::default(),
         }
     }
 }
