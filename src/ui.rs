@@ -1936,6 +1936,13 @@ impl App {
                 });
                 ui.end_row();
 
+                if e.recording.encoder == "hevc_qsv" {
+                    ui.label("GPU minőség");
+                    ui.add(egui::Slider::new(&mut e.recording.gpu_q, 8..=30).text("q (kisebb = pontosabb)"))
+                        .on_hover_text("Intel GPU HEVC minőség. q8: a legpontosabb, amit a low-power mód tud (12 bites görbés felvétel, 1080p, 120 fps: kb. 3–5 GB/perc, zaj +50–60%). Nagyobb q: kisebb fájl, nagyobb hiba.");
+                    ui.end_row();
+                }
+
                 ui.label("8 bites görbe");
                 let deep = e.camera.pixel_format.is_single_channel() && e.camera.pixel_format.bits() > 8;
                 ui.add_enabled(deep, egui::Checkbox::new(&mut e.recording.curve8, "10/12 bites kép 8 biten, a zajhoz illesztett görbével"))

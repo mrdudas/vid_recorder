@@ -147,6 +147,14 @@ pub struct RecordingSettings {
     /// curve (`curve.rs`): full dynamic range in 8 bits.
     #[serde(default)]
     pub curve8: bool,
+    /// Quality of the lossy GPU encoder (Intel QSV `-q`, lower = better).
+    /// The low-power mode is no more accurate below 8.
+    #[serde(default = "default_gpu_q")]
+    pub gpu_q: u32,
+}
+
+fn default_gpu_q() -> u32 {
+    8
 }
 
 impl Default for Scenario {
@@ -172,7 +180,7 @@ impl Default for Scenario {
                 reverse_y: false,
                 extra: BTreeMap::new(),
             },
-            recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into(), curve8: false },
+            recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into(), curve8: true, gpu_q: 8 },
             preview_lut: None,
             view: View::default(),
             export: Default::default(),

@@ -53,6 +53,7 @@ impl Recorder {
         name: &str,
         encoder_id: &str,
         curve8: bool,
+        gpu_q: u32,
         format: PixelFormat,
         frame_bytes: usize,
         fps: f64,
@@ -84,6 +85,7 @@ impl Recorder {
             fps,
             ffmpeg: None,
             dead: false,
+            gpu_q,
             curve: (curve8 && format.bits() > 8).then(|| (crate::curve::encode_table(format.bits()), Vec::new())),
         };
         let thread = std::thread::Builder::new()
@@ -133,6 +135,7 @@ struct Writer {
     stats: Arc<RecStats>,
     video_path: PathBuf,
     encoder_id: String,
+    gpu_q: u32,
     requested: PixelFormat,
     fps: f64,
     ffmpeg: Option<(Child, ChildStdin)>,
@@ -246,7 +249,10 @@ impl Writer {
                 .args(["-profile:v", profile, "-color_range", "pc"]);
         }
         let mut child = cmd
-            .args(encoder.args)
+            // The scenario sets the GPU quality (`-q`, Intel QSV).
+            .args(encoder.args.iter().enumerate().map(|(i, a)| {
+                if i > 0 && encoder.args[i - 1] == "-q" { self.gpu_q.to_string() } else { a.to_string() }
+            }))
             // Bayer is stored as grey; the tag tells the export what it is.
             .args(["-metadata:s:v:0", &format!("PIXEL_FORMAT={}", f.format.name())])
             .args(if self.curve.is_some() { vec!["-metadata:s:v:0".to_string(), format!("CURVE={}", crate::curve::TAG)] } else { vec![] })

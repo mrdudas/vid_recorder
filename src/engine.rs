@@ -424,6 +424,7 @@ impl Engine {
             name,
             &s.recording.encoder,
             s.recording.curve8,
+            s.recording.gpu_q,
             c.pixel_format,
             Frame::byte_size(c.width, c.height, c.pixel_format),
             c.frame_rate,
