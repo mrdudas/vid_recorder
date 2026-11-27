@@ -155,6 +155,8 @@ struct Probe {
     tag: Option<String>,
     /// Sensor samples in the luma plane of a YUV stream (GPU encoders).
     luma: bool,
+    /// The luma plane is 10 bit.
+    luma10: bool,
     /// Left shift that brings the samples to full 16-bit range: set when
     /// fewer bits are stored as plain 16-bit words (FFVHuff recordings).
     shift: u32,
@@ -193,6 +195,7 @@ fn probe(input: &str) -> Result<Probe, String> {
         fps,
         gray: luma || field("pix_fmt").is_some_and(|p| p.starts_with("gray")),
         luma,
+        luma10: field("pix_fmt").is_some_and(|p| p.contains("p10")),
         tag,
         shift,
     })
@@ -224,10 +227,22 @@ fn bayer_from_tag(tag: &str) -> Option<String> {
     .into())
 }
 
-/// Decoder: raw 16-bit frames (grey or RGB) on stdout. A Bayer recording
-/// (stored as grey) is reinterpreted and demosaiced by a second ffmpeg.
+/// Decoder: raw 16-bit frames (grey or RGB) on stdout. Samples that need
+/// expanding to 16 bit (FFVHuff words, 10-bit GPU luma) go
+/// through a table here: ffmpeg's lut clamps 16-bit output at 65280 and
+/// swscale's 10 -> 16 bit conversion is not an exact shift. A Bayer
+/// recording (stored as grey) is then demosaiced by a second ffmpeg.
 fn spawn_decoder(input: &str, p: &Probe, o: &Options, from: f64, len: Option<f64>, size: (usize, usize), colour: bool) -> Result<Vec<Child>, String> {
     let scale = (size != (p.w, p.h)).then(|| format!("scale={}:{}:flags=area", size.0, size.1));
+    let bayer = o.bayer.as_ref().filter(|_| p.gray);
+    // Stored value -> 16-bit linear.
+    let table: Option<Vec<u16>> = if p.luma && p.luma10 {
+        Some((0..1024).map(|v| v << 6).collect())
+    } else if p.shift > 0 {
+        Some((0..1u32 << (16 - p.shift)).map(|v| (v << p.shift) as u16).collect())
+    } else {
+        None
+    };
     let mut first = Command::new(ffmpeg_path());
     first.args(["-v", "error", "-nostdin"]);
     if from > 0.0 {
@@ -238,42 +253,53 @@ fn spawn_decoder(input: &str, p: &Probe, o: &Options, from: f64, len: Option<f64
         first.args(["-t", &format!("{len}")]);
     }
     first.args(["-an", "-f", "rawvideo"]);
-    let bayer = o.bayer.as_ref().filter(|_| p.gray);
-    let expand = match (p.luma, p.shift) {
-        (true, _) => Some("extractplanes=y".to_string()),
-        (false, 0) => None,
-        (false, s) => Some(format!("lut=c0=val*{}", 1u32 << s)),
-    };
-    match bayer {
-        None => {
-            let vf: Vec<&str> = expand.iter().chain(scale.iter()).map(String::as_str).collect();
-            if !vf.is_empty() {
-                first.args(["-vf", &vf.join(",")]);
-            }
-            first.args(["-pix_fmt", if colour { "rgb48le" } else { "gray16le" }]);
+    if table.is_some() {
+        if p.luma {
+            first.args(["-vf", "extractplanes=y"]);
         }
-        Some(_) => {
-            if let Some(e) = &expand {
-                first.args(["-vf", e]);
-            }
-            first.args(["-pix_fmt", "gray16le"]);
+        first.args(["-pix_fmt", if p.luma { "gray10le" } else { "gray16le" }]);
+    } else {
+        let luma = p.luma.then_some("extractplanes=y");
+        let vf: Vec<&str> = luma.into_iter().chain(scale.iter().filter(|_| bayer.is_none()).map(String::as_str)).collect();
+        if !vf.is_empty() {
+            first.args(["-vf", &vf.join(",")]);
         }
+        first.args(["-pix_fmt", if bayer.is_none() && colour { "rgb48le" } else { "gray16le" }]);
     }
     let mut a = first.arg("-").stdout(Stdio::piped()).spawn().map_err(|e| format!("ffmpeg: {e}"))?;
-    let Some(pattern) = bayer else { return Ok(vec![a]) };
-    let mut second = Command::new(ffmpeg_path());
-    second
-        .args(["-v", "error", "-f", "rawvideo", "-pix_fmt", &format!("bayer_{pattern}16le")])
-        .args(["-s", &format!("{}x{}", p.w, p.h), "-i", "-", "-f", "rawvideo"]);
-    if let Some(s) = &scale {
-        second.args(["-vf", s]);
+    if table.is_none() && bayer.is_none() {
+        return Ok(vec![a]);
     }
-    let b = second
-        .args(["-pix_fmt", "rgb48le", "-"])
-        .stdin(a.stdout.take().unwrap())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ffmpeg (demosaic): {e}"))?;
+    let mut tail = Command::new(ffmpeg_path());
+    let in_fmt = bayer.map_or("gray16le".to_string(), |b| format!("bayer_{b}16le"));
+    tail.args(["-v", "error", "-f", "rawvideo", "-pix_fmt", &in_fmt, "-s", &format!("{}x{}", p.w, p.h), "-i", "-", "-f", "rawvideo"]);
+    if let Some(s) = &scale {
+        tail.args(["-vf", s]);
+    }
+    tail.args(["-pix_fmt", if colour { "rgb48le" } else { "gray16le" }, "-"]).stdout(Stdio::piped());
+    let src = a.stdout.take().unwrap();
+    let b = match table {
+        None => tail.stdin(src).spawn().map_err(|e| format!("ffmpeg (demosaic): {e}"))?,
+        Some(t) => {
+            let mut b = tail.stdin(Stdio::piped()).spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+            let mut sink = b.stdin.take().unwrap();
+            let frame = p.w * p.h * 2;
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut src, mask) = (src, t.len() - 1);
+                let (mut buf, mut out) = (vec![0u8; frame], vec![0u8; frame]);
+                while src.read_exact(&mut buf).is_ok() {
+                    for (o, i) in out.chunks_exact_mut(2).zip(buf.chunks_exact(2)) {
+                        o.copy_from_slice(&t[u16::from_le_bytes([i[0], i[1]]) as usize & mask].to_le_bytes());
+                    }
+                    if sink.write_all(&out).is_err() {
+                        break;
+                    }
+                }
+            });
+            b
+        }
+    };
     Ok(vec![b, a])
 }
 

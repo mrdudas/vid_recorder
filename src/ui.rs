@@ -124,6 +124,8 @@ pub struct App {
     frame_pos: (u32, u32),
     /// Crop selection being dragged on the preview.
     crop_drag: Option<CropDrag>,
+    /// Camera target brightness while its slider is dragged.
+    light_drag: Option<f64>,
     rec: RecPage,
     /// Screenshot mode (`vid_recorder screenshots`).
     shots: Option<Shots>,
@@ -264,6 +266,7 @@ impl App {
             frame_size: (0, 0),
             frame_pos: (0, 0),
             crop_drag: None,
+            light_drag: None,
             rec: RecPage::default(),
             shots: None,
             last_rec: None,
@@ -588,10 +591,13 @@ impl App {
     }
 
     fn view_controls(&mut self, ui: &mut egui::Ui) {
+        self.camera_light(ui);
         let Some(s) = self.engine.scenario.as_mut() else { return };
         let v = &mut s.view;
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Megjelenítés (csak az élőkép)").strong());
         ui.checkbox(&mut v.auto_white_balance, "Automatikus fehéregyensúly");
-        ui.checkbox(&mut v.auto_levels, "Automatikus fényerő");
+        ui.checkbox(&mut v.auto_levels, "Automatikus szintek");
         ui.checkbox(&mut v.average, "Átlagolás (zajcsökkentés)")
             .on_hover_text("Az élőkép több kép átlaga. A felvétel nyers marad; az átlagolt kép elmenthető.");
         if v.average {
@@ -659,7 +665,65 @@ impl App {
             ui.checkbox(&mut s.view.dark, "Sötétkép levonása").on_hover_text("A kamera sötétképe (Beállítások → Sötétkalibráció).");
             self.edit.view.dark = s.view.dark;
         }
-        ui.small("Csak az élőképre hat, a felvétel nyers marad.");
+        ui.small("A megjelenítés csak az élőképre hat, a felvétel nyers marad.");
+    }
+
+    /// Brightness at the source: the camera's auto exposure (longest
+    /// exposure the frame rate allows, then the least gain) aims at the
+    /// target. Applied to the camera when the slider is released.
+    fn camera_light(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = self.engine.scenario.as_ref().filter(|s| s.device == Device::U3v) else { return };
+        let mut c = s.camera.clone();
+        if let Some(t) = self.light_drag {
+            c.auto_target = t;
+        }
+        let mut commit = false;
+        ui.label(egui::RichText::new("Kamera (a forrásnál)").strong());
+        ui.add_enabled_ui(!self.engine.is_recording(), |ui| {
+            commit |= ui
+                .checkbox(&mut c.auto_exposure, "automatikus expozíció")
+                .on_hover_text("A kamera a lehető leghosszabb expozíciót használja (az fps-ből: egy képkocka ideje), és csak ha ez kevés, növeli az erősítést, a lehető legkevésbé.")
+                .changed();
+            if c.auto_exposure {
+                ui.horizontal(|ui| {
+                    ui.label("Célfényerő");
+                    let r = ui
+                        .add(egui::Slider::new(&mut c.auto_target, 5.0..=80.0).fixed_decimals(0).suffix(" %"))
+                        .on_hover_text("Erre az átlagos fényerőre állít a kamera. Ha a világos részek beégnek, csökkentsd. A felvételre is hat.");
+                    if r.dragged() {
+                        self.light_drag = Some(c.auto_target);
+                    }
+                    commit |= r.drag_stopped() || (r.changed() && !r.dragged());
+                });
+            } else {
+                ui.small(format!("Kézi: {:.0} µs, {:.1} dB (Beállítások)", c.exposure_us, c.gain_db));
+            }
+        });
+        if commit {
+            self.light_drag = None;
+            self.set_camera_light(c.auto_exposure, c.auto_target);
+        }
+    }
+
+    /// Auto exposure on/off and its target: on the main page the running
+    /// scenario only (not saved), on the settings page the edited one.
+    fn set_camera_light(&mut self, auto: bool, target: f64) {
+        let main = self.page == Page::Main;
+        let Some(mut s) = (if main { self.engine.scenario.clone() } else { self.edited() }) else { return };
+        let before = self.engine.scenario.clone();
+        (s.camera.auto_exposure, s.camera.auto_target) = (auto, target);
+        match self.engine.apply(&s) {
+            Ok(()) => {
+                (self.edit.camera.auto_exposure, self.edit.camera.auto_target) = (auto, target);
+                self.message = if auto { format!("Kamera célfényerő: {target:.0}%") } else { "Kézi expozíció".into() };
+            }
+            Err(e) => {
+                if let Some(b) = before {
+                    self.apply(&b);
+                }
+                self.message = format!("A kamera nem fogadta el: {e}. Visszaállítva.");
+            }
+        }
     }
 
     /// The preview scaled to fill the available space. With `sensor_view`
@@ -1529,6 +1593,10 @@ impl App {
                     })
                     .response
                     .on_hover_text("Nagyobb erősítés: világosabb, de zajosabb kép.");
+                    ui.end_row();
+                    ui.label("Célfényerő");
+                    ui.add(egui::Slider::new(&mut c.auto_target, 5.0..=80.0).fixed_decimals(0).suffix(" %"))
+                        .on_hover_text("Erre az átlagos fényerőre állít az automatika. Ha a világos részek beégnek, csökkentsd. A kamera alapértéke kb. 50%, ez világos ablakos jelenetnél a kép ötödét beégeti; 25%-nál kb. 1%-ot. Az élőkép automatikus fényereje a sötétebb képet is kivilágosítja.");
                     ui.end_row();
                 } else {
                     ui.label("Expozíció");

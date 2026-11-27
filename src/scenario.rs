@@ -105,6 +105,12 @@ pub struct CameraSettings {
     /// Range the auto gain may use [dB]; clamped to the camera's range.
     #[serde(default = "auto_gain_range")]
     pub auto_gain_range: (f64, f64),
+    /// Mean brightness the auto exposure aims at [% of full scale]
+    /// (Alvium `IntensityControllerTarget`). The camera's own default (~50%)
+    /// burns out the bright parts of a contrasty scene: 20% of the pixels
+    /// saturated in a room with a window, 1% at 25% (2026-11-27).
+    #[serde(default = "auto_target")]
+    pub auto_target: f64,
     /// Size the camera delivers, for cameras that cannot crop (UVC): the
     /// image is then cut to width × height at the offsets in software.
     /// `None`: the camera delivers width × height itself (hardware crop).
@@ -118,6 +124,10 @@ pub struct CameraSettings {
     /// Any other GenICam feature, written as is (name -> number/string/bool).
     #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+fn auto_target() -> f64 {
+    25.0
 }
 
 fn auto_exposure_range() -> (f64, f64) {
@@ -152,6 +162,7 @@ impl Default for Scenario {
                 auto_exposure: false,
                 auto_exposure_range: auto_exposure_range(),
                 auto_gain_range: auto_gain_range(),
+                auto_target: auto_target(),
                 capture_size: None,
                 reverse_x: false,
                 reverse_y: false,

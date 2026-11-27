@@ -230,6 +230,20 @@ impl Camera for U3vCamera {
             let (lo, hi) = s.auto_exposure_range;
             set_range(&mut p, "ExposureAutoMin", "ExposureAutoMax", lo.min(period), hi.min(period));
             set_range(&mut p, "GainAutoMin", "GainAutoMax", s.auto_gain_range.0, s.auto_gain_range.1);
+            // Only if the camera has it: reading a missing feature locks the
+            // Alvium. Its auto aims at a mean brightness; "FitRange" (no
+            // burn-out) is not available on the U-291c (firmware, 2026-11).
+            // Longest exposure first, gain only when that is not enough.
+            if p.node("IntensityAutoPrecedence").is_some() {
+                if let Err(e) = set_enum(&mut p, "IntensityAutoPrecedence", "MinimizeNoise") {
+                    eprintln!("warning: {e}");
+                }
+            }
+            if p.node("IntensityControllerTarget").is_some() {
+                if let Err(e) = set_float_clamped(&mut p, "IntensityControllerTarget", s.auto_target) {
+                    eprintln!("warning: {e}");
+                }
+            }
             set_enum(&mut p, "ExposureAuto", "Continuous")?;
             let _ = set_enum(&mut p, "GainAuto", "Continuous");
         }
