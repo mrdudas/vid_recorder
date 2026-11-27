@@ -52,6 +52,7 @@ impl Recorder {
         dir: &Path,
         name: &str,
         encoder_id: &str,
+        curve8: bool,
         format: PixelFormat,
         frame_bytes: usize,
         fps: f64,
@@ -83,6 +84,7 @@ impl Recorder {
             fps,
             ffmpeg: None,
             dead: false,
+            curve: (curve8 && format.bits() > 8).then(|| (crate::curve::encode_table(format.bits()), Vec::new())),
         };
         let thread = std::thread::Builder::new()
             .name("recorder".into())
@@ -135,6 +137,8 @@ struct Writer {
     fps: f64,
     ffmpeg: Option<(Child, ChildStdin)>,
     dead: bool,
+    /// 10/12 -> 8 bit curve table and the converted frame.
+    curve: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Writer {
@@ -176,8 +180,17 @@ impl Writer {
         if self.ffmpeg.is_none() {
             self.ffmpeg = Some(self.spawn_ffmpeg(f)?);
         }
+        let data: &[u8] = match &mut self.curve {
+            Some((table, out)) => {
+                let mask = table.len() - 1;
+                out.clear();
+                out.extend(f.data.chunks_exact(2).map(|b| table[u16::from_le_bytes([b[0], b[1]]) as usize & mask]));
+                out
+            }
+            None => &f.data,
+        };
         let (_, stdin) = self.ffmpeg.as_mut().unwrap();
-        if let Err(e) = stdin.write_all(&f.data) {
+        if let Err(e) = stdin.write_all(data) {
             // ffmpeg quit: its own message tells why.
             let (child, stdin) = self.ffmpeg.take().unwrap();
             drop(stdin);
@@ -206,7 +219,16 @@ impl Writer {
         } else {
             // FFVHuff keeps >8-bit samples bit-exact only as plain 16-bit
             // words; the PIXEL_FORMAT tag tells the real depth.
-            let pix_fmt = if encoder.id == "ffvhuff" && f.format.bits() > 8 { "gray16le" } else { f.format.ffmpeg_input() };
+            let pix_fmt = if self.curve.is_some() {
+                if !f.format.is_single_channel() || f.format.bits() <= 8 {
+                    return Err(format!("a 8 bites görbe 10/12 bites Bayer vagy Mono képhez való ({})", f.format.name()));
+                }
+                "gray"
+            } else if encoder.id == "ffvhuff" && f.format.bits() > 8 {
+                "gray16le"
+            } else {
+                f.format.ffmpeg_input()
+            };
             cmd.args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
                 .args(["-video_size", &format!("{}x{}", f.width, f.height)]);
         }
@@ -214,7 +236,8 @@ impl Writer {
         if encoder.hardware && f.format.ffmpeg_input().starts_with("gray") {
             // GPU encoders take YUV only: the samples go into the luma plane
             // unchanged (full range, no 0-255 -> 16-235 scaling), chroma flat.
-            let (pix, profile) = match f.format.bits() {
+            let bits = if self.curve.is_some() { 8 } else { f.format.bits() };
+            let (pix, profile) = match bits {
                 8 => ("nv12", "main"),
                 10 => ("p010le", "main10"),
                 b => return Err(format!("{}: {b} bites képet nem tud kódolni (legfeljebb 10)", encoder.label)),
@@ -226,6 +249,7 @@ impl Writer {
             .args(encoder.args)
             // Bayer is stored as grey; the tag tells the export what it is.
             .args(["-metadata:s:v:0", &format!("PIXEL_FORMAT={}", f.format.name())])
+            .args(if self.curve.is_some() { vec!["-metadata:s:v:0".to_string(), format!("CURVE={}", crate::curve::TAG)] } else { vec![] })
             .arg("-y")
             .arg(&self.video_path)
             .stdin(Stdio::piped())

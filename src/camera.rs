@@ -96,6 +96,11 @@ pub trait Camera: Send {
     /// Restart the device (it reconnects as if replugged). For a camera
     /// that is attached but sends nothing.
     fn reset(&mut self) {}
+    /// Change the auto exposure target [%] and/or the crop offset while the
+    /// camera streams (and records). Only what the camera allows then.
+    fn live(&mut self, _target: Option<f64>, _offset: Option<(u32, u32)>) -> Result<(), String> {
+        Err("a kamera futás közben nem állítható".into())
+    }
     /// The device went away (unplugged); it has to be opened again.
     fn disconnected(&self) -> bool {
         false

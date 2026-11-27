@@ -35,6 +35,8 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - **Élőkép legfeljebb 25 fps-sel.** A megjelenítés külön szálon fut, és nem lassíthatja vagy blokkolhatja a rögzítést. Ha kell, az élőkép dobja el a képkockákat, a felvétel soha.
 - **Formátum:** MKV vagy hasonló konténer, **minimális tömörítéssel**, mert az anyagot később dolgozzuk fel.
 - **A nyers kép LUT nélkül, veszteségmentesen (bitre pontosan) kerül mentésre.** Az `auto` kódoló minden bitmélységen `ffvhuff`-ot választ. 8 bit fölött a mintákat változatlan 16 bites szavakként (`gray16le`) kapja meg, a valós bitmélységet a `PIXEL_FORMAT` címke adja meg, és az export ebből skáláz. Az FFVHuff 1080p 10 biten kb. 380 fps-sel kódol, az FFV1 csak kb. 66 fps-sel, de az FFV1 fájlja kb. harmadával kisebb. Az `ffv1` ezért csak kézzel választható, alacsonyabb adatsebességhez. A hardveres kódolók veszteségesek, ezért csak kézzel választhatók.
+- **8 bites görbe (opció, `recording.curve8`):** a 10/12 bites Bayer/Mono mintákat a szenzor zajához illesztett görbével 8 bitre tömöríti (`curve.rs`), a felvétel `CURVE` címkét kap, az export és a lejátszó visszaalakítja lineárisra. Zajmérés (12 bit, 0 dB): σ² ≈ 1 + 0,2·v, a 0–4095 tartomány kb. 280 zajlépés, így a kerekítés a zajt csak kb. 5%-kal növeli. Ez a nyers-kép szabály tudatos kivétele: a teljes dinamikatartomány megmarad (kontrasztos jelenetnél ne égjen be és ne bukjon be), fél adatmennyiséggel.
+  - Mérés, 12 bit, 1080p, 120 fps (2026-11-27): nyers 12 bit FFVHuff 19,7 GB/perc; görbe + FFVHuff 12–13 GB/perc, nincs veszteség; görbe + FFV1 8,4 GB/perc, de 4 CPU-magot visz, **18 kép veszett el 30 s alatt**; görbe + GPU q8 kb. 3–5 GB/perc, a zaj +50–60% (a GPU low-power módja q8 alatt nem pontosabb, a hibája kb. egy kódlépés).
 - **S-Log LUT** (`.cube` fájlok a `slog/` mappában): csak az **élőképen** használjuk, ott elég a 8 bit. Később az **exportnál** is kell majd. A felvételre soha nem kerül LUT.
 - **Hardveres kódolás, ha van:** Intel (QSV), NVIDIA (NVENC) vagy AMD (AMF). Macen ezt a VideoToolbox adja (Intel Macen az Intel hardverét használja). Ha egyik sem érhető el, szoftveres kódolás az alternatíva.
   - **Intel GPU HEVC (`hevc_qsv`), veszteséges, kézzel választható**, ha a veszteségmentes felvétel túl nagy. Mérve 2026-11, 1080p, 180 fps, BayerRG8, zajos (nagy erősítésű) jelenet: FFVHuff 19–24 GB/perc, FFV1 15,6 GB/perc (és csak 148 fps-t bír), GPU q14 7,4–9,9 GB/perc. Q14-nél a kódolási hiba kb. 2 szint (8 bit), ez a szenzorzaj (9–16 szint) mellett elhanyagolható.
@@ -58,11 +60,20 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 
 ## Felhasználói felület
 
-### Beállító oldal
+### Elrendezés (2026-11-27)
+- **Bal sáv**, kártyákon, mindig látható (nem lenyíló): **Szcenárió** (választó + ⚙ a Beállítások ablakhoz), **Felvételek**, **Élőkép** (kamera a forrásnál + megjelenítés), **Részletek**, **Rendszer** (CPU, memória, a felvételi lemez sávokkal és számokkal; felvétel közben az adatsebesség és hány perc fér még el).
+- **Alsó sáv:** magnószerű, rajzolt gombok: ● felvétel, ▶ lejátszás, ⏸ szünet, ■ stop, mellettük a felvétel neve és ideje. Alatta egy sorban az állapotlámpa, az utolsó üzenet és a háttérmunka.
+  - A felvétel gomb bármilyen módból élőképre vált és felvételt indít; szünetben folytatja. Felvétel közben a szünet és a stop a felvételre hat, lejátszáskor a lejátszásra; a stop lejátszáskor visszavisz az élőképre.
+- **Felvétel közben csak a célfényerő és a kivágás helye (mérete nem) változtatható**, minden más le van tiltva (szcenárió, beállítások, felvételek). Mindkettő a futó kamerába íródik, újraindítás nélkül:
+  - célfényerő: `IntensityControllerTarget` futás közben írható, kb. 0,5 ms, nincs kiesés;
+  - kivágás helye: az eltolás streamelés közben zárolt, ezért `AcquisitionStop` → `TLParamsLocked = 0` → `OffsetX/Y` → `TLParamsLocked = 1` → `AcquisitionStart`, a stream nyitva marad. Mérve: 23 ms, a CSV-ben kb. 26 ms időbélyeg-ugrás, **sorszám-ugrás nincs** (ennyi ideig nem exponál a kamera, kép nem vész el). Az elmozdulást képkorrelációval ellenőriztük (pontosan a kért 64×32 px).
+
+### Beállítások (ablak)
+- A szcenárióválasztó melletti ⚙ nyitja. Nyitva az élőképen húzott kivágás a szerkesztett szcenárióra hat.
 - Itt állítjuk össze a **szcenáriókat** (kamerabeállítás-készleteket).
 - Élőképen ellenőrizhető, milyen képet ad a kamera az adott beállításokkal.
 - Minden beállítás elmenthető, **JSON** formátumban.
-- **Elrendezés:** az ablak maximalizálva indul. Bal oldalt a beállítások, jobb oldalt az élőkép, amely kitölti a rendelkezésre álló helyet.
+- Az ablak maximalizálva indul; az élőkép kitölti a bal sáv melletti helyet.
 - **Kivágás (ROI):** az élőkép (a beállítóoldalon és a főoldalon is) mindig a teljes szenzort mutatja, és a kamera kivágott képe a helyén látszik. A kivágás egy sárga téglalap: belsejét húzva mozgatható, oldalait és sarkait húzva átméretezhető, mellette húzva új rajzolható. Elengedéskor a program a kamera lépésközeire kerekíti, legalább a kamera legkisebb képméretére (`WidthMin/HeightMin`) állítja, és azonnal kipróbálja. Kisebb magasság mellett nagyobb az elérhető fps. Az eltolás a tükrözés utáni képben értendő (SFNC).
   - **Az Alvium 1800 U-291c kivágási szabályai** (mérve 2026-11-25, BayerRG8/10p/12p esetén azonosak):
     - szélesség 8-cal osztható, legalább 8; magasság páros, legalább 8; mindkét eltolás 8-cal osztható;
@@ -85,8 +96,9 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 - **Szoftveres kivágás:** ha a kamera nem tud vágni (UVC, vagy írhatatlan `Width/Height/Offset`), a kamera a `capture_size` méretben fut, és a program ugyanúgy kivágja a képet, mint a kamera tenné. A felvétel és az élőkép is a kivágott képet kapja. Bayer, YUYV és NV12 esetén a lépésköz 2 (megmarad a színminta); MJPEG nem vágható.
 
 ### Felvételek és export
-- A szcenáriók kimeneti mappáiban és a kézzel hozzáadott mappákban (`recording_folders.txt`, nincs verziókezelve) lévő felvételek listája, az `export/` almappák tartalmával együtt. Látszik a méret, a hossz és az fps (az időbélyeg-CSV-ből), valamint a lemez szabad helye.
-- **Megtekintés:** a név kattintására jobb oldalt megnyílik a lejátszó. Csúszkával és léptetőgombokkal böngészhető, az ffmpeg háttérszálon dekódol egy-egy képkockát. A nyers Bayer felvétel ugyanúgy jelenik meg, mint az élőkép, képenkénti automatikus fehéregyensúllyal és szintekkel. A valós időt a CSV-ből számolja, mert a konténer fps-e eltérhet.
+- A bal sáv **Felvételek** kártyáján, időrendben (legújabb felül), felvételenként egy kártya: név, időpont, hossz, képszám, fps (az időbélyeg-CSV-ből), méret. Forrás: a szcenáriók kimeneti mappái és a `recording_folders.txt` mappái (nincs verziókezelve), az `export/` almappákkal.
+- **A kártyára kattintva** kinyílik, az élőkép helyén elindul a lejátszás. A kinyílt kártyán a felvétel exportjai (a fájlnév a felvétel nevével kezdődik) szintén lejátszhatók, és itt van az **Export** gomb (a szcenárió exportbeállításával, újra is megnyomható: létező kimenetnél új nevet kap) és a **Törlés** (megerősítéssel).
+- **Lejátszás:** az ffmpeg egy menetben dekódol, másodpercenként 25 képet, valós időben (a CSV-ből számolt valós fps-sel). A csúszkával ugrani lehet; megállítva képkockánként léptethető. A nyers Bayer felvétel ugyanúgy jelenik meg, mint az élőkép, képenkénti automatikus fehéregyensúllyal és szintekkel. A valós időt a CSV-ből számolja, mert a konténer fps-e eltérhet.
 - **Export** a kijelölt felvételekre. Ugyanaz, mint a parancssori `export`, külön folyamatban, alacsony prioritással, egyszerre egy, sorban. A kimenet a felvétel mappájában az `export/` almappába kerül. Fajtái:
   - **Archív** (`archive`): a nyers Bayer FFV1-gyel, bitre pontosan, kb. 20%-kal kisebb, mint az FFVHuff. A CSV is mellé kerül. Csak akkor sikeres, ha a képkockaszám egyezik.
   - **Natív videó**: demozaikolt, választható tömörítéssel.
@@ -99,12 +111,11 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
 
 ### Főoldal
 - Itt lehet kiválasztani a mentett szcenáriókat. **Szcenárióváltáskor a kamera azonnal átáll** az új beállításokra.
-- Nagy **REC** gomb. Felvétel közben **Szünet/Folytatás** és **Stop**.
+- Felvétel az alsó sáv gombjaival (●, ⏸, ■).
   - Szünet alatt nem íródik kép. A CSV-ben a szünet a `frameID` és az időbélyeg ugrásaként látszik. A felvétel hossza és a valós fps a medián képközből számolódik, ezért a szünet nem torzítja.
 - Felvétel közben az élőkép bal felső sarkában villogó piros **● REC** látszik, szünetben sárga **⏸ PAUSE**, mellette a rögzített idő (a szünetek nélkül), mint egy videokamerán.
 - Labor operátoroknak készül: szcenárió, felvétel, Stop, aztán **Export** a leállított felvételre. Az export módját a szcenárió adja meg (`export`: archív, natív videó vagy nagyítás).
 - Alul állapotsor minden oldalon: egy lámpa mutatja, rendben van-e a kamera és a felvétel. A technikai részletek és az élőkép beállításai csukott részben vannak.
-- **Felvétel közben csak a főoldal érhető el**, a Beállítások és a Felvételek menü le van tiltva.
 - Élőkép (max. 25 fps).
 - **Átlagolás és igazítás** (az élőkép beállításaiban, az „Automatikus fényerő” alatt; csak az élőképre hat, a felvétel nyers marad):
   - Az élőkép több kép átlaga. A képszám megadható, vagy automatikus: addig vesz hozzá képet, amíg egy újabb kevesebb mint 0,2%-kal változtat az átlagon, utána ennyi kép futó átlaga (legfeljebb 1000). Szcenárióváltáskor vagy a beállítás változásakor újrakezdi.
@@ -115,7 +126,7 @@ Rögzítő alkalmazás Allied Vision kamerához. A cél, hogy a kamera jelét a 
   - Mindig a legjobban illő sötétképet használja: azonos formátum, méret, kivágás és tükrözés, legközelebbi expozíció és erősítés. Ha az expozíció vagy az erősítés eltér, vagy automatikus az expozíció, figyelmeztet, hogy újat kell felvenni. A kamera sötétképei listázhatók és törölhetők.
   - Kiírja a sötétszint átlagát és a forró pixelek számát (átlag + 6σ fölött).
   - **Átlagolt kép mentése:** 16 bites lineáris PNG (`atlag_<dátum>.png`) a szcenárió mappájába, LUT, fehéregyensúly és szintek nélkül. A Bayer-kép 2×2-es szuperpixelekből áll, ezért fél felbontású.
-- **Kivágás a főoldalon is**, ugyanúgy, mint a beállítóoldalon, de csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy „A szcenárió kivágása” gombig marad meg. Felvétel közben nem változtatható.
+- **Kivágás az élőképen**, amikor a Beállítások ablak zárva van: csak a futó szcenárióra hat, nem kerül mentésre. Szcenárióváltásig vagy a „Vissza” gombig marad meg. Felvétel közben csak a helye mozgatható, a mérete nem.
 
 ## Indítás és frissítés
 

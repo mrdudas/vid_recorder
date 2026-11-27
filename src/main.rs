@@ -1,4 +1,5 @@
 mod camera;
+mod curve;
 mod encoder;
 mod engine;
 mod export;

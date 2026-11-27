@@ -390,6 +390,25 @@ impl Engine {
         self.shared.pool.put(f.data);
     }
 
+    /// Brightness target and crop offset while running (also recording):
+    /// written to the streaming camera, no restart.
+    pub fn live(&mut self, target: Option<f64>, offset: Option<(u32, u32)>) -> Result<(), String> {
+        let (Some(s), Some((_, cam))) = (self.scenario.as_mut(), self.camera.as_mut()) else {
+            return Err("a kamera nem fut".into());
+        };
+        if !cam.hw_crop() && offset.is_some() {
+            return Err("ez a kamera futás közben nem vág".into());
+        }
+        cam.live(target, offset)?;
+        if let Some(t) = target {
+            s.camera.auto_target = t;
+        }
+        if let Some((x, y)) = offset {
+            (s.camera.offset_x, s.camera.offset_y) = (x, y);
+        }
+        Ok(())
+    }
+
     pub fn is_recording(&self) -> bool {
         self.shared.recorder.lock().unwrap().is_some()
     }
@@ -404,6 +423,7 @@ impl Engine {
             Path::new(&s.recording.output_dir),
             name,
             &s.recording.encoder,
+            s.recording.curve8,
             c.pixel_format,
             Frame::byte_size(c.width, c.height, c.pixel_format),
             c.frame_rate,

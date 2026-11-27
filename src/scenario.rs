@@ -143,6 +143,10 @@ pub struct RecordingSettings {
     /// Encoder profile id, or "auto" (first available hardware encoder).
     pub encoder: String,
     pub output_dir: PathBuf,
+    /// Store 10/12-bit sensor samples as 8-bit codes on the noise-matched
+    /// curve (`curve.rs`): full dynamic range in 8 bits.
+    #[serde(default)]
+    pub curve8: bool,
 }
 
 impl Default for Scenario {
@@ -168,7 +172,7 @@ impl Default for Scenario {
                 reverse_y: false,
                 extra: BTreeMap::new(),
             },
-            recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into() },
+            recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into(), curve8: false },
             preview_lut: None,
             view: View::default(),
             export: Default::default(),

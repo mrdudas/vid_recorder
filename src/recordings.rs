@@ -81,11 +81,6 @@ pub fn delete(video: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Free space on the disk holding `dir` (or its nearest existing parent).
-pub fn free_space(dir: &Path) -> Option<u64> {
-    dir.ancestors().find(|d| d.exists()).and_then(|d| fs4::available_space(d).ok())
-}
-
 /// What to make of a recording. Saved with the scenario as the operator's
 /// default export.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -172,10 +167,16 @@ pub enum JobState {
 
 impl Job {
     pub fn start(video: &Path, settings: &ExportSettings) -> Result<Job, String> {
-        let output = settings.output(video);
-        if output.exists() {
-            return Err(format!("{} már létezik", output.display()));
-        }
+        // Exported again: a new name next to the earlier ones (never overwritten).
+        let first = settings.output(video);
+        let output = std::iter::once(first.clone())
+            .chain((2..).map(|n| {
+                let stem = first.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = first.extension().unwrap_or_default().to_string_lossy();
+                first.with_file_name(format!("{stem}_{n}.{ext}"))
+            }))
+            .find(|p| !p.exists())
+            .unwrap();
         std::fs::create_dir_all(output.parent().unwrap()).map_err(|e| e.to_string())?;
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut child = crate::encoder::low_priority(&exe)
@@ -234,12 +235,14 @@ pub struct MediaInfo {
     pub pix_fmt: String,
     /// Camera format from the recorder's PIXEL_FORMAT tag.
     pub format: Option<PixelFormat>,
+    /// 8-bit codes on the noise-matched curve (`curve.rs`).
+    pub curve: bool,
 }
 
 pub fn media_info(path: &Path) -> Result<MediaInfo, String> {
     let out = Command::new(ffprobe_path())
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "format=duration:stream=width,height,pix_fmt,avg_frame_rate:stream_tags=PIXEL_FORMAT", "-of", "default=nw=1"])
+        .args(["-show_entries", "format=duration:stream=width,height,pix_fmt,avg_frame_rate:stream_tags=PIXEL_FORMAT,CURVE", "-of", "default=nw=1"])
         .arg(path)
         .output()
         .map_err(|e| format!("ffprobe: {e}"))?;
@@ -260,6 +263,7 @@ pub fn media_info(path: &Path) -> Result<MediaInfo, String> {
         fps,
         pix_fmt: field("pix_fmt").unwrap_or_default(),
         format: field("TAG:PIXEL_FORMAT").and_then(|t| PixelFormat::ALL.into_iter().find(|f| f.name() == t)),
+        curve: field("TAG:CURVE").as_deref() == Some(crate::curve::TAG),
     })
 }
 
@@ -272,44 +276,111 @@ pub enum Still {
 
 /// Decode the frame at `t` seconds.
 pub fn decode_frame(path: &Path, info: &MediaInfo, t: f64, max_width: u32) -> Result<Still, String> {
-    // GPU recordings keep the sensor samples in the luma plane.
-    let luma = match info.pix_fmt.as_str() {
-        "yuv420p" | "yuvj420p" if info.format.is_some_and(|f| f.is_single_channel()) => Some("gray"),
-        "yuv420p10le" if info.format.is_some_and(|f| f.is_single_channel()) => Some("gray10le"),
-        _ => None,
-    };
-    let pix_fmt = luma.unwrap_or(info.pix_fmt.as_str());
-    let grey = matches!(pix_fmt, "gray" | "gray10le" | "gray12le" | "gray16le");
-    let mut cmd = Command::new(ffmpeg_path());
-    cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{t:.4}")]).arg("-i").arg(path);
-    cmd.args(["-frames:v", "1", "-an", "-f", "rawvideo"]);
-    let (w, h) = if grey {
-        // Same sample layout as stored: the values stay the camera's.
-        if luma.is_some() {
-            cmd.args(["-vf", "extractplanes=y"]);
+    let mut d = Decoder::open(path, info, t, max_width, None, Some(1))?;
+    d.next().unwrap_or_else(|| Err(format!("nincs képkocka itt: {t:.2} s {}", d.error())))
+}
+
+/// Frames of a video from `t` on, decoded by ffmpeg in one go: every frame,
+/// or `rate` per second of video (playback).
+pub struct Decoder {
+    child: Child,
+    out: std::process::ChildStdout,
+    info: MediaInfo,
+    /// Grey samples: the camera's layout; `None`: RGB for display.
+    grey: Option<&'static str>,
+    w: u32,
+    h: u32,
+}
+
+impl Decoder {
+    pub fn open(path: &Path, info: &MediaInfo, t: f64, max_width: u32, rate: Option<f64>, frames: Option<u32>) -> Result<Decoder, String> {
+        // GPU recordings keep the sensor samples in the luma plane.
+        let single = info.format.is_some_and(|f| f.is_single_channel());
+        let (luma, grey) = match info.pix_fmt.as_str() {
+            "yuv420p" | "yuvj420p" if single => (true, Some("gray")),
+            "yuv420p10le" if single => (true, Some("gray10le")),
+            "gray" => (false, Some("gray")),
+            "gray10le" => (false, Some("gray10le")),
+            "gray12le" => (false, Some("gray12le")),
+            "gray16le" => (false, Some("gray16le")),
+            _ => (false, None),
+        };
+        let mut cmd = Command::new(ffmpeg_path());
+        cmd.args(["-v", "error", "-nostdin", "-ss", &format!("{t:.4}")]).arg("-i").arg(path);
+        if let Some(n) = frames {
+            cmd.args(["-frames:v", &n.to_string()]);
         }
-        cmd.args(["-pix_fmt", pix_fmt]);
-        (info.width, info.height)
-    } else {
-        let w = info.width.min(max_width) & !1;
-        let h = ((w as f64 * info.height as f64 / info.width as f64).round() as u32).max(2) & !1;
-        cmd.args(["-vf", &format!("scale={w}:{h}"), "-pix_fmt", "rgb24"]);
-        (w, h)
-    };
-    let out = cmd.arg("-").output().map_err(|e| format!("ffmpeg: {e}"))?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return Err(format!("nincs képkocka itt: {t:.2} s {}", String::from_utf8_lossy(&out.stderr).trim()));
+        cmd.args(["-an", "-f", "rawvideo"]);
+        let mut vf: Vec<String> = Vec::new();
+        if luma {
+            vf.push("extractplanes=y".into());
+        }
+        let (w, h) = if grey.is_some() {
+            // Same sample layout as stored: the values stay the camera's.
+            (info.width, info.height)
+        } else {
+            let w = info.width.min(max_width) & !1;
+            let h = ((w as f64 * info.height as f64 / info.width as f64).round() as u32).max(2) & !1;
+            vf.push(format!("scale={w}:{h}"));
+            (w, h)
+        };
+        if let Some(r) = rate {
+            vf.push(format!("fps={r}"));
+        }
+        if !vf.is_empty() {
+            cmd.args(["-vf", &vf.join(",")]);
+        }
+        cmd.args(["-pix_fmt", grey.unwrap_or("rgb24"), "-"]);
+        let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("ffmpeg: {e}"))?;
+        let out = child.stdout.take().unwrap();
+        Ok(Decoder { child, out, info: info.clone(), grey, w, h })
     }
-    if !grey {
-        return Ok(Still::Rgb { width: w as usize, height: h as usize, data: out.stdout });
+
+    /// ffmpeg's error output (after the stream ended).
+    fn error(&mut self) -> String {
+        let mut e = String::new();
+        if let Some(mut err) = self.child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut err, &mut e);
+        }
+        e.trim().to_string()
     }
-    let wide = pix_fmt != "gray";
-    let format = info.format.filter(|f| (f.bytes_per_pixel() == 2) == wide && f.bits() <= 16 && !matches!(f, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12 | PixelFormat::Mjpeg));
-    let format = format.unwrap_or(match pix_fmt {
-        "gray" => PixelFormat::Mono8,
-        "gray10le" => PixelFormat::Mono10,
-        "gray12le" => PixelFormat::Mono12,
-        _ => PixelFormat::Mono16,
-    });
-    Ok(Still::Raw(Frame { id: 0, timestamp_ns: 0, width: w, height: h, format, data: out.stdout }))
+
+    /// The next frame; `None` at the end.
+    pub fn next(&mut self) -> Option<Result<Still, String>> {
+        let px = (self.w * self.h) as usize;
+        let bytes = match self.grey {
+            Some("gray") => px,
+            Some(_) => px * 2,
+            None => px * 3,
+        };
+        let mut data = vec![0u8; bytes];
+        std::io::Read::read_exact(&mut self.out, &mut data).ok()?;
+        let (w, h) = (self.w, self.h);
+        let Some(pix_fmt) = self.grey else {
+            return Some(Ok(Still::Rgb { width: w as usize, height: h as usize, data }));
+        };
+        let info = &self.info;
+        if let Some(f) = info.format.filter(|f| info.curve && pix_fmt == "gray" && f.bits() > 8) {
+            // 8-bit curve codes back to the camera's linear samples.
+            let d = crate::curve::decode_table(f.bits());
+            let data = data.iter().flat_map(|&c| d[c as usize].to_le_bytes()).collect();
+            return Some(Ok(Still::Raw(Frame { id: 0, timestamp_ns: 0, width: w, height: h, format: f, data })));
+        }
+        let wide = pix_fmt != "gray";
+        let format = info.format.filter(|f| (f.bytes_per_pixel() == 2) == wide && f.bits() <= 16 && f.is_single_channel());
+        let format = format.unwrap_or(match pix_fmt {
+            "gray" => PixelFormat::Mono8,
+            "gray10le" => PixelFormat::Mono10,
+            "gray12le" => PixelFormat::Mono12,
+            _ => PixelFormat::Mono16,
+        });
+        Some(Ok(Still::Raw(Frame { id: 0, timestamp_ns: 0, width: w, height: h, format, data })))
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

@@ -31,8 +31,8 @@ const PREVIEW_MAX_WIDTH: usize = 960;
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Main,
+    /// The settings window is open (crops edit the edited scenario).
     Settings,
-    Recordings,
 }
 
 /// Magnification methods of `export` and their labels.
@@ -44,21 +44,21 @@ const MAGNIFY: [(&str, &str); 5] = [
     ("colour", "Színváltozás a bőrön (pulzus)"),
 ];
 
-/// Recordings page state.
+/// Recordings list (left panel) and exports.
 #[derive(Default)]
 struct RecPage {
     list: Vec<Recording>,
-    selected: std::collections::BTreeSet<PathBuf>,
-    export: ExportSettings,
     /// Waiting exports, the running one, and finished ones' results.
     queue: std::collections::VecDeque<(PathBuf, ExportSettings)>,
     job: Option<Job>,
     log: Vec<(bool, String)>,
-    confirm_delete: bool,
     loaded: bool,
+    refreshed: Option<Instant>,
     /// Folders added by hand (besides the scenarios' output folders).
     folders: Vec<PathBuf>,
-    new_folder: String,
+    /// The open recording card, and the one waiting for delete confirmation.
+    expanded: Option<PathBuf>,
+    confirm_delete: Option<PathBuf>,
     viewer: Option<Viewer>,
 }
 
@@ -79,6 +79,64 @@ struct Viewer {
     error: Option<String>,
     /// Real frame rate from the timestamp CSV (the container's may differ).
     real_fps: Option<f64>,
+    /// Running playback.
+    player: Option<Player>,
+}
+
+/// Plays a video at 25 pictures per second of real time: ffmpeg decodes on
+/// a worker thread, which paces the pictures.
+struct Player {
+    rx: std::sync::mpsc::Receiver<(f64, Result<egui::ColorImage, String>)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Player {
+    /// From `t0` seconds of video; `speed`: real seconds per video second.
+    fn start(path: PathBuf, info: MediaInfo, t0: f64, speed: f64) -> Player {
+        const RATE: f64 = 25.0;
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let quit = stop.clone();
+        std::thread::spawn(move || {
+            let mut d = match recordings::Decoder::open(&path, &info, t0, PREVIEW_MAX_WIDTH as u32, Some(RATE), None) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = tx.send((t0, Err(e)));
+                    return;
+                }
+            };
+            let start = Instant::now();
+            let mut n = 0u64;
+            while !quit.load(Relaxed) {
+                let Some(f) = d.next() else { break };
+                let due = start + Duration::from_secs_f64(n as f64 / RATE * speed);
+                if let Some(w) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(w);
+                }
+                if tx.send((t0 + n as f64 / RATE, f.and_then(still_image))).is_err() {
+                    break;
+                }
+                n += 1;
+            }
+        });
+        Player { rx, stop }
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+    }
+}
+
+/// CPU, memory and disk, refreshed once a second.
+struct SysInfo {
+    sys: sysinfo::System,
+    at: Option<Instant>,
+    cpu: f32,
+    mem: (u64, u64),
+    /// Free and total bytes on the recording disk.
+    disk: Option<(u64, u64)>,
 }
 
 pub struct App {
@@ -129,7 +187,8 @@ pub struct App {
     rec: RecPage,
     /// Screenshot mode (`vid_recorder screenshots`).
     shots: Option<Shots>,
-    /// The last finished recording on the main page (for its Export).
+    sys: SysInfo,
+    /// The last finished recording (closing state, losses).
     last_rec: Option<(PathBuf, std::sync::Arc<crate::recorder::RecStats>)>,
     /// Result of each export started in this session: output or error.
     export_result: std::collections::BTreeMap<PathBuf, Result<PathBuf, String>>,
@@ -270,6 +329,7 @@ impl App {
             rec: RecPage::default(),
             shots: None,
             last_rec: None,
+            sys: SysInfo { sys: sysinfo::System::new(), at: None, cpu: 0.0, mem: (0, 0), disk: None },
             export_result: Default::default(),
             confirm_delete_scenario: false,
             styled: false,
@@ -679,9 +739,10 @@ impl App {
         }
         let mut commit = false;
         ui.label(egui::RichText::new("Kamera (a forrásnál)").strong());
-        ui.add_enabled_ui(!self.engine.is_recording(), |ui| {
+        let recording = self.engine.is_recording();
+        ui.vertical(|ui| {
             commit |= ui
-                .checkbox(&mut c.auto_exposure, "automatikus expozíció")
+                .add_enabled(!recording, egui::Checkbox::new(&mut c.auto_exposure, "automatikus expozíció"))
                 .on_hover_text("A kamera a lehető leghosszabb expozíciót használja (az fps-ből: egy képkocka ideje), és csak ha ez kevés, növeli az erősítést, a lehető legkevésbé.")
                 .changed();
             if c.auto_exposure {
@@ -709,6 +770,24 @@ impl App {
     /// scenario only (not saved), on the settings page the edited one.
     fn set_camera_light(&mut self, auto: bool, target: f64) {
         let main = self.page == Page::Main;
+        // Only the target changes: written to the streaming camera (this
+        // also works while recording), else a restart with the new settings.
+        let running_auto = self.engine.scenario.as_ref().is_some_and(|s| s.camera.auto_exposure);
+        let recording = self.engine.is_recording();
+        if auto && running_auto && (main || recording) {
+            match self.engine.live(Some(target), None) {
+                Ok(()) => {
+                    self.edit.camera.auto_target = target;
+                    self.message = format!("Kamera célfényerő: {target:.0}%");
+                    return;
+                }
+                Err(e) if recording => {
+                    self.message = format!("A fényerő most nem állítható: {e}");
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
         let Some(mut s) = (if main { self.engine.scenario.clone() } else { self.edited() }) else { return };
         let before = self.engine.scenario.clone();
         (s.camera.auto_exposure, s.camera.auto_target) = (auto, target);
@@ -731,7 +810,7 @@ impl App {
     /// its offset, and the edited crop is drawn on it; with `crop` the
     /// selection can be moved, resized by its edges and corners, or drawn
     /// anew (see `crop_to`).
-    fn preview(&mut self, ui: &mut egui::Ui, sensor_view: bool, crop: bool) {
+    fn preview(&mut self, ui: &mut egui::Ui, sensor_view: bool, crop: Crop) {
         let Some(t) = &self.texture else {
             ui.centered_and_justified(|ui| ui.label(egui::RichText::new("Nincs kép").size(18.0).weak()));
             return;
@@ -755,7 +834,7 @@ impl App {
         let rect = egui::Rect::from_center_size(area.center(), canvas * scale);
         let to_screen = |p: egui::Pos2| rect.min + p.to_vec2() * scale;
         let to_cam = |p: egui::Pos2| ((p - rect.min) / scale).to_pos2().clamp(egui::Pos2::ZERO, canvas.to_pos2());
-        let resp = ui.allocate_rect(rect, if crop { egui::Sense::drag() } else { egui::Sense::hover() });
+        let resp = ui.allocate_rect(rect, if crop != Crop::Off { egui::Sense::drag() } else { egui::Sense::hover() });
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -801,7 +880,7 @@ impl App {
             egui::FontId::proportional(14.0),
             egui::Color32::YELLOW,
         );
-        if !crop {
+        if crop == Crop::Off {
             return;
         }
 
@@ -811,6 +890,9 @@ impl App {
         // Which part of the selection is under the pointer (screen pixels).
         let hit = |p: egui::Pos2| -> Option<Grab> {
             const M: f32 = 8.0;
+            if crop == Crop::Move {
+                return s.contains(p).then_some(Grab { l: true, r: true, t: true, b: true });
+            }
             if !s.expand(M).contains(p) {
                 return None;
             }
@@ -824,6 +906,7 @@ impl App {
         };
         if let Some(p) = resp.hover_pos().filter(|_| self.crop_drag.is_none()) {
             ui.ctx().set_cursor_icon(match hit(p) {
+                None if crop == Crop::Move => egui::CursorIcon::Default,
                 None => egui::CursorIcon::Crosshair,
                 Some(Grab { l: true, r: true, .. }) => egui::CursorIcon::Move,
                 Some(Grab { l: true, t: true, .. } | Grab { r: true, b: true, .. }) => egui::CursorIcon::ResizeNwSe,
@@ -833,7 +916,7 @@ impl App {
             });
         }
         let Some(p) = resp.interact_pointer_pos() else { return };
-        if resp.drag_started() {
+        if resp.drag_started() && (crop == Crop::Full || hit(p).is_some()) {
             // Outside the selection: draw a new one.
             self.crop_drag = Some(CropDrag { grab: hit(p), from: to_cam(p), start: sel, sel });
         }
@@ -885,6 +968,23 @@ impl App {
         let h = snap(sel.height(), step[1]).clamp(min_h.min(sh), sh);
         let x = snap(sel.min.x, step[2]).min(down(sensor.x - w as f32, step[2]));
         let y = snap(sel.min.y, step[3]).min(down(sensor.y - h as f32, step[3]));
+        // Recording: move the camera's crop as it streams, size unchanged.
+        if self.engine.is_recording() {
+            let Some(c) = self.engine.scenario.as_ref().map(|s| s.camera.clone()) else { return };
+            let x = snap(sel.min.x, step[2]).min(down(sensor.x - c.width as f32, step[2]));
+            let y = snap(sel.min.y, step[3]).min(down(sensor.y - c.height as f32, step[3]));
+            if (x, y) == (c.offset_x, c.offset_y) {
+                return;
+            }
+            self.message = match self.engine.live(None, Some((x, y))) {
+                Ok(()) => {
+                    (self.edit.camera.offset_x, self.edit.camera.offset_y) = (x, y);
+                    format!("Kivágás helye: ({x}, {y})")
+                }
+                Err(e) => format!("A kivágás most nem mozgatható: {e}"),
+            };
+            return;
+        }
         // Main page: the running scenario only, nothing is saved. Settings:
         // the edited scenario (saved with it).
         let main = self.page == Page::Main;
@@ -975,24 +1075,42 @@ impl App {
 
     /// Operator page: scenario, record / pause / stop, export of the last
     /// recording. Details and preview look are folded away.
-    fn main_page(&mut self, ui: &mut egui::Ui) {
+    /// Left panel: cards for the scenario, the live view, the details, the
+    /// system and the recordings.
+    fn left_panel(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Szcenárió", |ui| self.scenario_card(ui));
+        card(ui, "Felvételek", |ui| {
+            egui::ScrollArea::vertical().id_salt("recordings").max_height(300.0).show(ui, |ui| self.recordings_list(ui));
+        });
+        card(ui, "Élőkép", |ui| self.view_controls(ui));
+        card(ui, "Részletek", |ui| self.details(ui));
+        card(ui, "Rendszer", |ui| self.system_info(ui));
+    }
+
+    /// Scenario picker and the settings window's cog.
+    fn scenario_card(&mut self, ui: &mut egui::Ui) {
         let recording = self.recording.is_some();
-        let w = ui.available_width();
-        ui.label(egui::RichText::new("Szcenárió").strong());
         // The active scenario (also while its camera is away).
         let current = self.engine.scenario.as_ref().map_or(self.edit.name.clone(), |s| s.name.clone());
         let mut chosen = None;
         ui.add_enabled_ui(!recording, |ui| {
-            egui::ComboBox::from_id_salt("scenario")
-                .width(w)
-                .selected_text(egui::RichText::new(&current).size(16.0))
-                .show_ui(ui, |ui| {
-                    for s in &self.scenarios {
-                        if ui.selectable_label(s.name == current, &s.name).clicked() && s.name != current {
-                            chosen = Some(s.clone());
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("scenario")
+                    .width(ui.available_width() - 48.0)
+                    .selected_text(egui::RichText::new(&current).size(16.0))
+                    .show_ui(ui, |ui| {
+                        for s in &self.scenarios {
+                            if ui.selectable_label(s.name == current, &s.name).clicked() && s.name != current {
+                                chosen = Some(s.clone());
+                            }
                         }
-                    }
-                });
+                    });
+                let open = self.page == Page::Settings;
+                let cog = egui::Button::new(egui::RichText::new("⚙").size(20.0)).selected(open).min_size(egui::vec2(40.0, 30.0));
+                if ui.add(cog).on_hover_text("Beállítások").clicked() {
+                    self.page = if open { Page::Main } else { Page::Settings };
+                }
+            });
         });
         // A crop made on the preview lasts until the scenario is reloaded.
         let saved = self.scenarios.iter().find(|s| s.name == current).cloned();
@@ -1011,103 +1129,221 @@ impl App {
         if let Some(s) = chosen {
             self.apply(&s);
         }
-
-        ui.add_space(14.0);
-        let big = |t: &str, fill: egui::Color32, width: f32| {
-            egui::Button::new(egui::RichText::new(t).size(26.0).strong().color(egui::Color32::WHITE))
-                .fill(fill)
-                .min_size(egui::vec2(width, 64.0))
-        };
-        if !recording {
-            ui.label(egui::RichText::new("Felvétel neve").strong());
-            ui.add(egui::TextEdit::singleline(&mut self.rec_name).hint_text("üresen: dátum és idő").desired_width(w));
-            ui.add_space(6.0);
-            let ready = self.engine.scenario.is_some();
-            if ui.add_enabled(ready, big("⏺  REC", RED, w)).clicked() {
-                self.start_recording();
-            }
-        } else {
-            let paused = self.recording.as_ref().is_some_and(|r| r.paused_since.is_some());
-            let half = (w - ui.spacing().item_spacing.x) / 2.0;
-            let (mut pause, mut stop) = (false, false);
-            ui.horizontal(|ui| {
-                let (label, fill) = if paused { ("▶  Folytatás", GREEN) } else { ("⏸  Szünet", ORANGE) };
-                pause = ui.add(big(label, fill, half)).clicked();
-                stop = ui.add(big("⏹  Stop", egui::Color32::from_gray(70), half)).clicked();
-            });
-            if pause && let Some(r) = &mut self.recording {
-                r.set_paused(!paused);
-            }
-            if stop {
-                self.stop_recording();
-            }
-            if let Some(r) = &self.recording {
-                ui.label(format!("{}  ·  {} képkocka", file_name(&r.info.video), r.info.stats.written.load(Relaxed)));
-            }
-        }
-
-        ui.add_space(14.0);
-        self.last_recording(ui, w);
-
-        ui.add_space(14.0);
-        egui::CollapsingHeader::new("Részletek").show(ui, |ui| self.details(ui));
-        egui::CollapsingHeader::new("Élőkép beállítása").show(ui, |ui| self.view_controls(ui));
     }
 
-    /// The last recording and its export (what the operator does after Stop).
-    fn last_recording(&mut self, ui: &mut egui::Ui, w: f32) {
-        let Some((video, stats)) = self.last_rec.clone() else { return };
+    /// CPU, memory and the recording disk as bars with numbers.
+    fn system_info(&mut self, ui: &mut egui::Ui) {
+        let si = &mut self.sys;
+        if si.at.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            si.at = Some(Instant::now());
+            si.sys.refresh_cpu_usage();
+            si.sys.refresh_memory();
+            si.cpu = si.sys.global_cpu_usage();
+            si.mem = (si.sys.used_memory(), si.sys.total_memory());
+            let dir = self.engine.scenario.as_ref().map_or(self.edit.recording.output_dir.clone(), |s| s.recording.output_dir.clone());
+            let base = dir.ancestors().find(|d| d.exists()).map(|d| d.to_path_buf());
+            si.disk = base.and_then(|d| Some((fs4::available_space(&d).ok()?, fs4::total_space(&d).ok()?)));
+        }
+        let gb = |b: u64| b as f64 / 1e9;
+        let cores = si.sys.cpus().len();
+        bar(ui, "CPU", si.cpu / 100.0, format!("{:.0}% ({cores} mag)", si.cpu));
+        let (used, total) = si.mem;
+        bar(ui, "Memória", used as f32 / total.max(1) as f32, format!("{:.1} / {:.1} GB", gb(used), gb(total)));
+        if let Some((free, total)) = si.disk {
+            let used = total.saturating_sub(free);
+            bar(ui, "Lemez", used as f32 / total.max(1) as f32, format!("{:.0} GB szabad / {:.0} GB", gb(free), gb(total)));
+            // How long the free space lasts at the running recording's rate.
+            if let Some(r) = &self.recording
+                && let Ok(meta) = std::fs::metadata(&r.info.video)
+                && r.elapsed().as_secs_f64() > 5.0
+            {
+                let rate = meta.len() as f64 / r.elapsed().as_secs_f64();
+                ui.small(format!("{:.0} MB/s · kb. {:.0} perc fér még el", rate / 1e6, free as f64 / rate / 60.0));
+            }
+        }
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// Recordings newest first, one card each; the open card plays the
+    /// recording and lists its exports.
+    fn recordings_list(&mut self, ui: &mut egui::Ui) {
+        if !self.rec.loaded {
+            self.rec.folders = std::fs::read_to_string(FOLDERS_FILE)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| PathBuf::from(l.trim()))
+                .collect();
+        }
+        if self.rec.refreshed.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            self.refresh_recordings();
+        }
+        let recording = self.recording.is_some();
+        let raw: Vec<usize> = (0..self.rec.list.len()).filter(|&i| !self.rec.list[i].export).collect();
+        let exports_of = |video: &PathBuf, list: &[Recording]| -> Vec<usize> {
+            let stem = video.file_stem().map(|s| format!("{}_", s.to_string_lossy())).unwrap_or_default();
+            let dir = video.parent().map(|d| d.join(recordings::EXPORT_DIR));
+            (0..list.len())
+                .filter(|&i| list[i].export && list[i].video.parent() == dir.as_deref() && list[i].name().starts_with(&stem))
+                .collect()
+        };
+        let mut claimed = std::collections::BTreeSet::new();
+        let mut cards: Vec<(usize, Vec<usize>)> = raw
+            .iter()
+            .map(|&i| {
+                let ex = exports_of(&self.rec.list[i].video, &self.rec.list);
+                claimed.extend(ex.iter().copied());
+                (i, ex)
+            })
+            .collect();
+        // Exports whose recording is gone stand on their own.
+        cards.extend((0..self.rec.list.len()).filter(|i| self.rec.list[*i].export && !claimed.contains(i)).map(|i| (i, vec![])));
+        cards.sort_by(|a, b| self.rec.list[b.0].modified.cmp(&self.rec.list[a.0].modified));
+        if cards.is_empty() {
+            ui.weak("Még nincs felvétel.");
+        }
+        let viewing = self.rec.viewer.as_ref().map(|v| v.path.clone());
+        let mut action = None;
+        for (i, ex) in cards {
+            let r = &self.rec.list[i];
+            let (video, is_export, title) = (r.video.clone(), r.export, r.name());
+            let when = chrono::DateTime::<chrono::Local>::from(r.modified).format("%Y-%m-%d %H:%M").to_string();
+            let len = match (r.seconds, r.frames) {
+                (Some(s), Some(f)) => format!("{} · {f} kép · {:.0} fps", hms(s), f as f64 / s),
+                (_, Some(f)) => format!("{f} kép"),
+                _ => String::new(),
+            };
+            let sub = format!("{when} · {len} · {:.2} GB", r.bytes as f64 / 1e9);
+            let ex: Vec<(PathBuf, String)> =
+                ex.iter().map(|&e| (self.rec.list[e].video.clone(), format!("{} · {:.2} GB", self.rec.list[e].name(), self.rec.list[e].bytes as f64 / 1e9))).collect();
+            let open = self.rec.expanded.as_ref() == Some(&video);
+            let fill = if open { ui.visuals().selection.bg_fill.gamma_multiply(0.35) } else { ui.visuals().faint_bg_color };
+            egui::Frame::group(ui.style()).fill(fill).inner_margin(8.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let head = ui.add_enabled_ui(!recording, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&title).strong());
+                        ui.small(&sub);
+                    })
+                    .response
+                });
+                let resp = ui.interact(head.response.rect, ui.scope_id().with(("rec_card", i)), egui::Sense::click());
+                if !recording && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    action = Some(if open { CardAction::Close } else { CardAction::Open(video.clone()) });
+                }
+                if !open {
+                    return;
+                }
+                ui.separator();
+                for (x, label) in &ex {
+                    let on = viewing.as_ref() == Some(x);
+                    if ui.selectable_label(on, format!("▶ {label}")).on_hover_text("Lejátszás").clicked() {
+                        action = Some(CardAction::Play(x.clone()));
+                    }
+                }
+                if !ex.is_empty() && viewing.as_ref() != Some(&video) && ui.small_button("▶ az eredeti felvétel").clicked() {
+                    action = Some(CardAction::Play(video.clone()));
+                }
+                if !is_export {
+                    self.export_controls(ui, &video, &mut action);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        match action {
+            Some(CardAction::Open(v)) => {
+                self.rec.expanded = Some(v.clone());
+                self.rec.confirm_delete = None;
+                self.open_viewer(v);
+                self.play(true);
+            }
+            Some(CardAction::Play(v)) => {
+                self.open_viewer(v);
+                self.play(true);
+            }
+            Some(CardAction::Close) => {
+                self.rec.expanded = None;
+                self.rec.viewer = None;
+            }
+            Some(CardAction::Export(v)) => {
+                let export = self.engine.scenario.as_ref().map(|s| s.export.clone()).unwrap_or_default();
+                self.export_result.remove(&v);
+                self.rec.queue.push_back((v, export));
+            }
+            Some(CardAction::Delete(v)) => {
+                if self.rec.viewer.as_ref().is_some_and(|x| x.path == v) {
+                    self.rec.viewer = None;
+                }
+                match recordings::delete(&v) {
+                    Ok(()) => self.message = format!("Törölve: {}", v.display()),
+                    Err(e) => self.message = format!("Törlés: {e}"),
+                }
+                self.rec.expanded = None;
+                self.rec.confirm_delete = None;
+                self.refresh_recordings();
+            }
+            None => {}
+        }
+    }
+
+    /// Export state and buttons of an open recording card.
+    fn export_controls(&mut self, ui: &mut egui::Ui, video: &PathBuf, action: &mut Option<CardAction>) {
         let export = self.engine.scenario.as_ref().map(|s| s.export.clone()).unwrap_or_default();
-        egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-            ui.set_width(w - 22.0);
-            ui.label(egui::RichText::new("Utolsó felvétel").strong());
-            ui.label(file_name(&video.display().to_string()));
-            let dropped = stats.dropped.load(Relaxed);
-            ui.label(format!("{} képkocka", stats.written.load(Relaxed)));
+        let closing = self.last_rec.as_ref().is_some_and(|(v, st)| v == video && !st.finished.load(Relaxed));
+        if closing {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("A felvétel lezárása folyamatban…");
+            });
+            return;
+        }
+        if let Some((_, st)) = self.last_rec.as_ref().filter(|(v, _)| v == video) {
+            let dropped = st.dropped.load(Relaxed);
             if dropped > 0 {
                 ui.colored_label(RED, format!("{dropped} képkocka elveszett!"));
             }
-            ui.add_space(6.0);
-            let job = self.rec.job.as_ref().filter(|j| j.video == video);
-            if !stats.finished.load(Relaxed) {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("A felvétel lezárása folyamatban…");
-                });
-            } else if let Some(j) = job {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Export folyamatban… {:.0} s", j.started.elapsed().as_secs_f64()));
-                });
-                ui.small(j.last_line.lock().unwrap().clone());
-                if ui.button("Megszakítás").clicked() {
-                    self.cancel_export();
+        }
+        if let Some(j) = self.rec.job.as_ref().filter(|j| j.video == *video) {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Export folyamatban… {:.0} s", j.started.elapsed().as_secs_f64()));
+            });
+            ui.small(j.last_line.lock().unwrap().clone());
+            if ui.button("Megszakítás").clicked() {
+                self.cancel_export();
+            }
+            return;
+        }
+        if self.rec.queue.iter().any(|(v, _)| v == video) {
+            ui.label("Export sorban…");
+            return;
+        }
+        match self.export_result.get(video) {
+            Some(Ok(out)) => {
+                ui.colored_label(GREEN, format!("✔ Export kész: {}", file_name(&out.display().to_string())));
+            }
+            Some(Err(e)) => {
+                ui.colored_label(RED, format!("Export hiba: {e}"));
+            }
+            None => {}
+        }
+        ui.horizontal(|ui| {
+            let b = egui::Button::new(egui::RichText::new("⇪  Export").strong().color(egui::Color32::WHITE)).fill(BLUE).min_size(egui::vec2(120.0, 32.0));
+            if ui.add_enabled(export.method != "magnify" && video.exists(), b).on_hover_text(export_label(&export)).clicked() {
+                *action = Some(CardAction::Export(video.clone()));
+            }
+            if self.rec.confirm_delete.as_ref() == Some(video) {
+                if ui.button(egui::RichText::new("Végleg törlöm").color(RED)).clicked() {
+                    *action = Some(CardAction::Delete(video.clone()));
                 }
-            } else if self.rec.queue.iter().any(|(v, _)| *v == video) {
-                ui.label("Export sorban…");
-            } else {
-                match self.export_result.get(&video) {
-                    Some(Ok(out)) => {
-                        ui.colored_label(GREEN, "✔ Export kész");
-                        ui.small(out.display().to_string());
-                    }
-                    Some(Err(e)) => {
-                        ui.colored_label(RED, format!("Export hiba: {e}"));
-                    }
-                    None => {}
+                if ui.button("Mégse").clicked() {
+                    self.rec.confirm_delete = None;
                 }
-                if !matches!(self.export_result.get(&video), Some(Ok(_))) && video.exists() {
-                    let b = egui::Button::new(egui::RichText::new("⇪  Export").size(22.0).strong().color(egui::Color32::WHITE))
-                        .fill(BLUE)
-                        .min_size(egui::vec2(ui.available_width(), 48.0));
-                    if ui.add_enabled(export.method != "magnify", b).clicked() {
-                        self.export_result.remove(&video);
-                        self.rec.queue.push_back((video.clone(), export.clone()));
-                    }
-                    ui.small(export_label(&export));
-                }
+            } else if ui.add_enabled(!self.busy(video), egui::Button::new("Törlés").min_size(egui::vec2(80.0, 32.0))).clicked() {
+                self.rec.confirm_delete = Some(video.clone());
             }
         });
+        ui.small(export_label(&export));
     }
 
     fn start_recording(&mut self) {
@@ -1137,8 +1373,10 @@ impl App {
                 info.stats.dropped.load(Relaxed)
             );
             self.last_rec = Some((PathBuf::from(&info.video), info.stats.clone()));
+            self.rec.expanded = Some(PathBuf::from(&info.video));
         }
         self.rec_name.clear();
+        self.refresh_recordings();
     }
 
     /// Camera state in one colour and sentence.
@@ -1169,18 +1407,66 @@ impl App {
         (GREEN, format!("Kamera rendben · {}", self.engine.camera_name()))
     }
 
-    /// Bottom bar on every page: camera state, last message, background work.
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
+    /// Bottom bar: a tape recorder's REC, play, pause and stop, then the
+    /// camera state and the last message.
+    fn transport_bar(&mut self, ui: &mut egui::Ui) {
+        let recording = self.recording.is_some();
+        let paused = self.recording.as_ref().is_some_and(|r| r.paused_since.is_some());
+        let viewer = !recording && self.rec.viewer.is_some();
+        let playing = viewer && self.rec.viewer.as_ref().is_some_and(|v| v.player.is_some());
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!recording, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.rec_name).hint_text("felvétel neve (üresen: dátum)").desired_width(200.0));
+            });
+            ui.add_space(6.0);
+            let ready = self.engine.scenario.is_some();
+            if transport(ui, Icon::Rec, ready && (!recording || paused), recording && !paused, "Felvétel").clicked() {
+                if recording {
+                    if let Some(r) = &mut self.recording {
+                        r.set_paused(false);
+                    }
+                } else {
+                    // From any mode: back to the live view and record.
+                    self.rec.viewer = None;
+                    self.rec.expanded = None;
+                    self.page = Page::Main;
+                    self.start_recording();
+                }
+            }
+            if transport(ui, Icon::Play, viewer && !playing, playing, "Lejátszás").clicked() {
+                self.play(true);
+            }
+            if transport(ui, Icon::Pause, (recording && !paused) || playing, paused, "Szünet").clicked() {
+                if let Some(r) = &mut self.recording {
+                    r.set_paused(true);
+                } else {
+                    self.play(false);
+                }
+            }
+            if transport(ui, Icon::Stop, recording || viewer, false, "Stop").clicked() {
+                if recording {
+                    self.stop_recording();
+                } else {
+                    // Back to the live view.
+                    self.rec.viewer = None;
+                }
+            }
+            ui.add_space(10.0);
+            if let Some(r) = &self.recording {
+                let t = r.elapsed().as_secs_f64();
+                let color = if paused { ORANGE } else { RED };
+                ui.label(egui::RichText::new(format!("{} {}", if paused { "⏸" } else { "●" }, hms(t))).size(22.0).strong().color(color));
+                ui.label(format!("{} · {} kép", file_name(&r.info.video), r.info.stats.written.load(Relaxed)));
+            }
+        });
+        // Second line: camera state, last message, background work.
         ui.horizontal(|ui| {
             let (color, text) = self.health();
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 6.0, color);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 7.0, color);
             ui.label(egui::RichText::new(text).strong());
-            if !self.message.is_empty() {
-                ui.separator();
-                ui.label(&self.message);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
                 if let Some(j) = &self.rec.job {
                     let more = if self.rec.queue.is_empty() { String::new() } else { format!(" (+{} vár)", self.rec.queue.len()) };
                     ui.label(format!("Export: {}{more}", file_name(&j.video.display().to_string())));
@@ -1188,17 +1474,39 @@ impl App {
                 }
                 let fin = self.engine.finalizing();
                 if fin > 0 {
-                    ui.label(format!("Lezárás alatt: {fin} felvétel"));
+                    ui.label(format!("Lezárás: {fin}"));
                     ui.spinner();
+                }
+                if !self.message.is_empty() {
+                    ui.separator();
+                    ui.add(egui::Label::new(&self.message).truncate());
                 }
             });
         });
     }
 
+    /// Start (resume) or pause the playback of the open recording.
+    fn play(&mut self, on: bool) {
+        let Some(v) = &mut self.rec.viewer else { return };
+        if !on {
+            v.player = None;
+            return;
+        }
+        if v.error.is_some() && v.texture.is_none() {
+            return;
+        }
+        let end = (v.info.duration - 1.0 / v.info.fps).max(0.0);
+        if v.t >= end - 0.05 {
+            v.t = 0.0;
+        }
+        let speed = v.real_fps.map_or(1.0, |f| v.info.fps / f);
+        v.player = Some(Player::start(v.path.clone(), v.info.clone(), v.t, speed));
+    }
+
     /// Technical numbers of the camera and the running recording.
     fn details(&mut self, ui: &mut egui::Ui) {
         let st = self.engine.stats();
-        egui::Grid::new("details").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+        egui::Grid::new("details").num_columns(2).spacing([12.0, 4.0]).max_col_width(ui.available_width() - 140.0).show(ui, |ui| {
             if let Some(a) = self.engine.scenario.clone() {
                 ui.label("A kamera küld");
                 actual_mode(ui, &a, &self.engine.actual(), !self.engine.hw_crop());
@@ -1206,24 +1514,28 @@ impl App {
             }
             let mut row = |k: &str, v: String| {
                 ui.label(k);
-                ui.label(v);
+                ui.add(egui::Label::new(v).wrap());
                 ui.end_row();
             };
             row("Kamera", self.engine.camera_name());
-            row("Fogadott kép", st.received.load(Relaxed).to_string());
-            row("Kameránál elveszett", st.lost_at_camera.load(Relaxed).to_string());
-            row("Hibás kép", self.engine.camera_errors().to_string());
+            let lost = st.lost_at_camera.load(Relaxed);
+            let bad = self.engine.camera_errors();
+            row("Fogadott kép", format!("{} · elveszett {lost}{}", st.received.load(Relaxed), if bad > 0 { format!(" · hibás {bad}") } else { String::new() }));
             if let Some(c) = self.engine.scenario.as_ref().map(|s| &s.camera) {
-                row("Kért kép", format!("{}×{} ({}, {}) {}", c.width, c.height, c.offset_x, c.offset_y, c.pixel_format.name()));
                 let max = self.engine.max_fps().map_or(String::new(), |m| format!(" (max. {m:.1})"));
-                row("Képfrekvencia", format!("{} fps{max}", c.frame_rate));
+                row("Kért kép", format!("{}×{} ({}, {}) {} · {} fps{max}", c.width, c.height, c.offset_x, c.offset_y, c.pixel_format.name(), c.frame_rate));
             }
             if let Some(r) = &self.recording {
                 let s = &r.info.stats;
-                row("Felvett idő", format!("{:.0} s", r.elapsed().as_secs_f64()));
-                row("Írva", s.written.load(Relaxed).to_string());
-                row("Sorban", (s.queued.load(Relaxed) - s.written.load(Relaxed)).to_string());
-                row("Eldobva", s.dropped.load(Relaxed).to_string());
+                row(
+                    "Felvétel",
+                    format!(
+                        "{} írva · {} sorban · {} eldobva",
+                        s.written.load(Relaxed),
+                        s.queued.load(Relaxed) - s.written.load(Relaxed),
+                        s.dropped.load(Relaxed)
+                    ),
+                );
                 if let Some(enc) = *s.encoder.lock().unwrap() {
                     row("Kódoló", enc.to_string());
                 }
@@ -1624,6 +1936,13 @@ impl App {
                 });
                 ui.end_row();
 
+                ui.label("8 bites görbe");
+                let deep = e.camera.pixel_format.is_single_channel() && e.camera.pixel_format.bits() > 8;
+                ui.add_enabled(deep, egui::Checkbox::new(&mut e.recording.curve8, "10/12 bites kép 8 biten, a zajhoz illesztett görbével"))
+                    .on_hover_text("A teljes dinamikatartomány megmarad 8 biten: a szinteket a szenzor zajához igazítja (sötétben sűrűn, világosban ritkán), a kerekítés a zajt kb. 5%-kal növeli. Az export és a lejátszó visszaalakítja lineárisra. Fele akkora adat, mint a 16 bites tárolás.")
+                    .on_disabled_hover_text("10 vagy 12 bites Bayer/Mono formátumhoz.");
+                ui.end_row();
+
                 ui.label("Mappa");
                 let mut dir = e.recording.output_dir.display().to_string();
                 if ui.add(egui::TextEdit::singleline(&mut dir).desired_width(320.0)).changed() {
@@ -1741,34 +2060,60 @@ impl App {
         dirs
     }
 
-    fn save_folders(&self) {
-        let text: String = self.rec.folders.iter().map(|f| format!("{}\n", f.display())).collect();
-        let _ = std::fs::write(FOLDERS_FILE, text);
-    }
-
     fn open_viewer(&mut self, path: PathBuf) {
         let real_fps = self.rec.list.iter().find(|r| r.video == path).and_then(|r| Some(r.frames? as f64 / r.seconds?));
         self.rec.viewer = Some(match recordings::media_info(&path) {
-            Ok(info) => Viewer { path, info, t: 0.0, shown: None, busy: None, texture: None, error: None, real_fps },
+            Ok(info) => Viewer { path, info, t: 0.0, shown: None, busy: None, texture: None, error: None, real_fps, player: None },
             Err(e) => Viewer {
                 path,
-                info: MediaInfo { width: 0, height: 0, duration: 0.0, fps: 25.0, pix_fmt: String::new(), format: None },
+                info: MediaInfo { width: 0, height: 0, duration: 0.0, fps: 25.0, pix_fmt: String::new(), format: None, curve: false },
                 t: 0.0,
                 shown: Some(0.0),
                 busy: None,
                 texture: None,
                 error: Some(e),
                 real_fps,
+                player: None,
             },
         });
     }
 
     /// The browsed video: frame, time slider and step buttons.
     fn viewer(&mut self, ui: &mut egui::Ui) {
-        let Some(v) = &mut self.rec.viewer else {
-            ui.label("Kattints egy felvétel nevére a megtekintéshez.");
-            return;
-        };
+        let Some(v) = &mut self.rec.viewer else { return };
+        // Pictures of the running playback; it ends at the end of the video.
+        if let Some(p) = &v.player {
+            let mut last = None;
+            let mut ended = false;
+            loop {
+                match p.rx.try_recv() {
+                    Ok(x) => last = Some(x),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(_) => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+            if let Some((t, img)) = last {
+                match img {
+                    Ok(img) => {
+                        match &mut v.texture {
+                            Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                            None => v.texture = Some(ui.ctx().load_texture("viewer", img, egui::TextureOptions::LINEAR)),
+                        }
+                        v.error = None;
+                    }
+                    Err(e) => v.error = Some(e),
+                }
+                v.t = t;
+                v.shown = Some(t);
+            }
+            if ended {
+                v.player = None;
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(15));
+        }
         // Collect a finished decode, start the next if the time moved.
         if let Some(rx) = &v.busy {
             match rx.try_recv() {
@@ -1788,7 +2133,7 @@ impl App {
                 Err(_) => v.busy = None,
             }
         }
-        if v.busy.is_none() && v.shown != Some(v.t) {
+        if v.player.is_none() && v.busy.is_none() && v.shown != Some(v.t) {
             let (tx, rx) = std::sync::mpsc::channel();
             let (path, info, t) = (v.path.clone(), v.info.clone(), v.t);
             std::thread::spawn(move || {
@@ -1811,7 +2156,7 @@ impl App {
         let end = (v.info.duration - dt).max(0.0);
         ui.horizontal(|ui| {
             let mut step = |ui: &mut egui::Ui, label: &str, d: f64| {
-                if ui.button(label).clicked() {
+                if ui.add_enabled(v.player.is_none(), egui::Button::new(label)).clicked() {
                     v.t = (v.t + d).clamp(0.0, end);
                 }
             };
@@ -1826,7 +2171,13 @@ impl App {
             };
         });
         ui.spacing_mut().slider_width = ui.available_width() - 80.0;
-        ui.add(egui::Slider::new(&mut v.t, 0.0..=end).suffix(" s").fixed_decimals(2));
+        let before = v.t;
+        let seek = ui.add(egui::Slider::new(&mut v.t, 0.0..=end).suffix(" s").fixed_decimals(2));
+        // Seeking while playing: play on from there.
+        if v.player.is_some() && seek.changed() && v.t != before {
+            let speed = v.real_fps.map_or(1.0, |f| v.info.fps / f);
+            v.player = Some(Player::start(v.path.clone(), v.info.clone(), v.t, speed));
+        }
         if let Some(e) = &v.error {
             ui.colored_label(egui::Color32::from_rgb(200, 60, 50), e);
         }
@@ -1843,9 +2194,8 @@ impl App {
 
     fn refresh_recordings(&mut self) {
         self.rec.list = recordings::list(&self.recording_dirs());
-        let names: std::collections::BTreeSet<_> = self.rec.list.iter().map(|r| r.video.clone()).collect();
-        self.rec.selected.retain(|p| names.contains(p));
         self.rec.loaded = true;
+        self.rec.refreshed = Some(Instant::now());
     }
 
     /// Recordings that must not be touched: being recorded or exported.
@@ -1884,196 +2234,6 @@ impl App {
                     break;
                 }
                 Err(e) => self.rec.log.push((false, format!("{}: {e}", video.display()))),
-            }
-        }
-    }
-
-    fn recordings_page(&mut self, ui: &mut egui::Ui) {
-        if !self.rec.loaded {
-            self.rec.folders = std::fs::read_to_string(FOLDERS_FILE)
-                .unwrap_or_default()
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| PathBuf::from(l.trim()))
-                .collect();
-            if let Some(s) = &self.engine.scenario {
-                self.rec.export = s.export.clone();
-            }
-            self.refresh_recordings();
-        }
-        let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Felvételek").strong().size(16.0));
-            if ui.button("⟳ Frissítés").clicked() {
-                self.refresh_recordings();
-            }
-        });
-        let dirs = self.recording_dirs();
-        egui::CollapsingHeader::new(format!("Mappák ({})", dirs.len())).show(ui, |ui| {
-            let mut remove = None;
-            for d in &dirs {
-                ui.horizontal(|ui| {
-                    let free = recordings::free_space(d).map_or("?".into(), gb);
-                    ui.label(format!("📁 {} – {free} szabad", d.display()));
-                    if self.rec.folders.contains(d)
-                        && ui.small_button("✖").on_hover_text("Mappa eltávolítása a listából (a fájlok maradnak)").clicked()
-                    {
-                        remove = Some(d.clone());
-                    }
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.rec.new_folder).hint_text("további mappa elérési útja").desired_width(320.0));
-                let path = PathBuf::from(self.rec.new_folder.trim());
-                if ui.add_enabled(path.is_dir(), egui::Button::new("Hozzáadás")).clicked() {
-                    if !self.rec.folders.contains(&path) {
-                        self.rec.folders.push(path);
-                    }
-                    self.rec.new_folder.clear();
-                    self.save_folders();
-                    self.refresh_recordings();
-                }
-            });
-            if let Some(d) = remove {
-                self.rec.folders.retain(|f| *f != d);
-                self.save_folders();
-                self.refresh_recordings();
-            }
-        });
-        ui.add_space(4.0);
-
-        // Table of recordings.
-        let mut toggle = None;
-        let mut open = None;
-        let current = self.rec.viewer.as_ref().map(|v| v.path.clone());
-        let several_dirs = dirs.len() > 1;
-        egui::ScrollArea::vertical().id_salt("rec_list").max_height((ui.available_height() * 0.5).max(160.0)).show(ui, |ui| {
-            egui::Grid::new("recordings").striped(true).spacing([14.0, 6.0]).show(ui, |ui| {
-                let all = !self.rec.list.is_empty() && self.rec.list.iter().all(|r| self.rec.selected.contains(&r.video));
-                let mut all_now = all;
-                ui.checkbox(&mut all_now, "");
-                if all_now != all {
-                    toggle = Some(None);
-                }
-                ui.strong("Felvétel");
-                ui.strong("Időpont");
-                ui.strong("Hossz");
-                ui.strong("Méret");
-                if several_dirs {
-                    ui.strong("Mappa");
-                }
-                ui.end_row();
-                for r in &self.rec.list {
-                    let mut on = self.rec.selected.contains(&r.video);
-                    if ui.checkbox(&mut on, "").changed() {
-                        toggle = Some(Some(r.video.clone()));
-                    }
-                    let mut name = r.name();
-                    if r.export {
-                        name = format!("{name}  (export)");
-                    }
-                    if ui.selectable_label(current.as_ref() == Some(&r.video), name).on_hover_text("Megtekintés").clicked() {
-                        open = Some(r.video.clone());
-                    }
-                    ui.label(chrono::DateTime::<chrono::Local>::from(r.modified).format("%Y-%m-%d %H:%M").to_string());
-                    ui.label(match (r.seconds, r.frames) {
-                        (Some(s), Some(f)) => format!("{s:.1} s · {f} kép · {:.1} fps", f as f64 / s),
-                        (_, Some(f)) => format!("{f} kép"),
-                        _ => "nincs CSV".into(),
-                    });
-                    ui.label(gb(r.bytes));
-                    if several_dirs {
-                        ui.label(r.video.parent().map(|p| p.display().to_string()).unwrap_or_default());
-                    }
-                    ui.end_row();
-                }
-            });
-            if self.rec.list.is_empty() {
-                ui.label("Nincs felvétel.");
-            }
-        });
-        if let Some(p) = open {
-            self.open_viewer(p);
-        }
-        match toggle {
-            Some(None) => {
-                if self.rec.selected.len() == self.rec.list.len() {
-                    self.rec.selected.clear();
-                } else {
-                    self.rec.selected = self.rec.list.iter().map(|r| r.video.clone()).collect();
-                }
-            }
-            Some(Some(p)) => {
-                if !self.rec.selected.remove(&p) {
-                    self.rec.selected.insert(p);
-                }
-            }
-            None => {}
-        }
-        let chosen: Vec<PathBuf> = self.rec.list.iter().filter(|r| self.rec.selected.contains(&r.video)).map(|r| r.video.clone()).collect();
-        let chosen_bytes: u64 = self.rec.list.iter().filter(|r| self.rec.selected.contains(&r.video)).map(|r| r.bytes).sum();
-        let usable: Vec<PathBuf> = chosen.iter().filter(|v| !self.busy(v)).cloned().collect();
-        ui.add_space(8.0);
-
-        egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new(format!("Kijelölt felvételek: {} ({})", usable.len(), gb(chosen_bytes))).strong().size(16.0));
-            ui.add_space(4.0);
-            export_editor(ui, &mut self.rec.export, "rec_export");
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let ok = !usable.is_empty() && self.rec.export.method != "magnify";
-                let b = egui::Button::new(egui::RichText::new("⇪  Export").strong().color(egui::Color32::WHITE)).fill(BLUE).min_size(egui::vec2(140.0, 32.0));
-                if ui.add_enabled(ok, b).clicked() {
-                    for v in &usable {
-                        self.export_result.remove(v);
-                        self.rec.queue.push_back((v.clone(), self.rec.export.clone()));
-                    }
-                }
-                if !self.rec.confirm_delete {
-                    if ui.add_enabled(!usable.is_empty(), egui::Button::new("Törlés").min_size(egui::vec2(100.0, 32.0))).clicked() {
-                        self.rec.confirm_delete = true;
-                    }
-                } else {
-                    ui.colored_label(RED, format!("{} felvétel végleges törlése?", usable.len()));
-                    if ui.button("Igen, törlöm").clicked() {
-                        for v in &usable {
-                            if let Err(e) = recordings::delete(v) {
-                                self.rec.log.push((false, format!("{}: {e}", v.display())));
-                            }
-                        }
-                        self.rec.confirm_delete = false;
-                        self.refresh_recordings();
-                    }
-                    if ui.button("Mégse").clicked() {
-                        self.rec.confirm_delete = false;
-                    }
-                }
-            });
-        });
-
-        // Running and finished exports.
-        if let Some(j) = &self.rec.job {
-            ui.add_space(6.0);
-            let name = file_name(&j.video.display().to_string());
-            let mut cancel = false;
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("{name} → {} · {:.0} s", j.output.display(), j.started.elapsed().as_secs_f64()));
-                cancel = ui.button("Megszakítás").clicked();
-            });
-            ui.small(j.last_line.lock().unwrap().clone());
-            if !self.rec.queue.is_empty() {
-                ui.label(format!("Még {} export vár.", self.rec.queue.len()));
-            }
-            if cancel {
-                self.cancel_export();
-            }
-        }
-        if !self.rec.log.is_empty() {
-            ui.add_space(6.0);
-            for (ok, l) in self.rec.log.iter().rev() {
-                ui.colored_label(if *ok { GREEN } else { RED }, l);
             }
         }
     }
@@ -2207,10 +2367,11 @@ impl eframe::App for App {
         self.watch_camera();
         self.update_preview(&ctx);
         self.poll_test();
-        // While recording only the main page is available.
+        // While recording: live view only, no settings window.
         let recording = self.recording.is_some();
         if recording {
             self.page = Page::Main;
+            self.rec.viewer = None;
         }
         if !self.styled {
             self.styled = true;
@@ -2220,30 +2381,6 @@ impl eframe::App for App {
                 s.spacing.interact_size.y = 24.0;
             });
         }
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!recording, |ui| {
-                    for (page, label) in [(Page::Main, "Főoldal"), (Page::Recordings, "Felvételek"), (Page::Settings, "Beállítások")] {
-                        let text = egui::RichText::new(label).size(17.0);
-                        ui.selectable_value(&mut self.page, page, text);
-                        ui.add_space(6.0);
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(concat!("vid_recorder ", env!("CARGO_PKG_VERSION")));
-                    if recording {
-                        ui.colored_label(RED, "Felvétel közben csak a főoldal érhető el.");
-                    }
-                });
-            });
-            ui.add_space(2.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.add_space(3.0);
-            self.status_bar(ui);
-            ui.add_space(1.0);
-        });
         if self.page == Page::Settings {
             // First visit with a camera: read its limits once.
             if self.modes.as_ref().is_none_or(|(d, _)| *d != self.edit.device)
@@ -2260,27 +2397,42 @@ impl eframe::App for App {
             }
         }
         self.poll_export();
-        if self.page == Page::Recordings {
-            egui::Panel::left("recordings_list").resizable(true).default_size(720.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("rec_page").show(ui, |ui| self.recordings_page(ui));
-            });
-            egui::CentralPanel::default().show(ui, |ui| self.viewer(ui));
-            ctx.request_repaint_after(PREVIEW_INTERVAL);
-            return;
+        egui::Panel::bottom("transport").show(ui, |ui| {
+            ui.add_space(6.0);
+            self.transport_bar(ui);
+            ui.add_space(4.0);
+        });
+        egui::Panel::left("left").resizable(false).exact_size(400.0).show(ui, |ui| {
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical().show(ui, |ui| self.left_panel(ui));
+        });
+        if self.page == Page::Settings {
+            let mut open = true;
+            egui::Window::new("Beállítások")
+                .open(&mut open)
+                .default_pos([420.0, 40.0])
+                .default_size([620.0, 820.0])
+                .collapsible(false)
+                .show(&ctx, |ui| self.settings_page(ui));
+            if !open {
+                self.page = Page::Main;
+            }
         }
-        if self.page == Page::Main {
-            egui::Panel::left("main_controls").resizable(false).exact_size(360.0).show(ui, |ui| {
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().show(ui, |ui| self.main_page(ui));
-            });
+        // Recording: only the crop position may move (its size is fixed).
+        let crop = if self.test.is_some() {
+            Crop::Off
+        } else if recording {
+            if self.engine.hw_crop() { Crop::Move } else { Crop::Off }
         } else {
-            egui::Panel::left("settings_controls").resizable(true).default_size(560.0).show(ui, |ui| {
-                ui.add_space(8.0);
-                self.settings_page(ui);
-            });
-        }
-        let crop = self.recording.is_none() && self.test.is_none();
-        egui::CentralPanel::default().show(ui, |ui| self.preview(ui, true, crop));
+            Crop::Full
+        };
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.rec.viewer.is_some() {
+                self.viewer(ui);
+            } else {
+                self.preview(ui, true, crop);
+            }
+        });
         ctx.request_repaint_after(PREVIEW_INTERVAL);
     }
 
@@ -2363,6 +2515,112 @@ fn actual_mode(ui: &mut egui::Ui, s: &Scenario, a: &crate::engine::Actual, sw_cr
 }
 
 /// A collapsible group of settings.
+/// A card of the left panel.
+fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style()).inner_margin(10.0).corner_radius(6.0).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new(title).strong().size(15.0));
+        ui.add_space(2.0);
+        add(ui);
+    });
+    ui.add_space(8.0);
+}
+
+/// A labelled bar: green, orange above 70%, red above 90%.
+fn bar(ui: &mut egui::Ui, label: &str, frac: f32, text: String) {
+    let frac = frac.clamp(0.0, 1.0);
+    ui.horizontal(|ui| {
+        ui.add_sized([62.0, 18.0], egui::Label::new(label));
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+        let color = if frac > 0.9 { RED } else if frac > 0.7 { ORANGE } else { GREEN };
+        p.rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height())), 3.0, color);
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(12.0), ui.visuals().strong_text_color());
+    });
+}
+
+/// "1:02:03" or "2:03.4".
+fn hms(s: f64) -> String {
+    let (h, m) = ((s / 3600.0) as u64, (s / 60.0) as u64 % 60);
+    if h > 0 { format!("{h}:{m:02}:{:02}", s as u64 % 60) } else { format!("{m}:{:04.1}", s % 60.0) }
+}
+
+/// What a recording card asks for.
+enum CardAction {
+    Open(PathBuf),
+    Play(PathBuf),
+    Close,
+    Export(PathBuf),
+    Delete(PathBuf),
+}
+
+/// How the crop selection on the preview may be changed.
+#[derive(Clone, Copy, PartialEq)]
+enum Crop {
+    Off,
+    /// Moved only (while recording: the size is fixed).
+    Move,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Rec,
+    Play,
+    Pause,
+    Stop,
+}
+
+/// A tape recorder button: the symbol everyone knows, drawn, not a glyph.
+fn transport(ui: &mut egui::Ui, icon: Icon, enabled: bool, active: bool, hint: &str) -> egui::Response {
+    let size = egui::vec2(72.0, 48.0);
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    let v = ui.visuals();
+    let fill = if active && matches!(icon, Icon::Rec) {
+        egui::Color32::from_rgb(90, 20, 20)
+    } else if active {
+        v.selection.bg_fill
+    } else if enabled && resp.hovered() {
+        v.widgets.hovered.bg_fill
+    } else {
+        v.widgets.inactive.bg_fill
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 6.0, fill);
+    p.rect_stroke(rect, 6.0, v.widgets.inactive.bg_stroke, egui::StrokeKind::Inside);
+    let ink = if matches!(icon, Icon::Rec) && active {
+        egui::Color32::from_rgb(255, 40, 40)
+    } else if !enabled {
+        v.weak_text_color().gamma_multiply(0.5)
+    } else if matches!(icon, Icon::Rec) {
+        RED
+    } else {
+        v.strong_text_color()
+    };
+    let c = rect.center();
+    let r = 13.0;
+    match icon {
+        Icon::Rec => {
+            p.circle_filled(c, r, ink);
+        }
+        Icon::Play => {
+            let pts = vec![c + egui::vec2(-r * 0.7, -r), c + egui::vec2(-r * 0.7, r), c + egui::vec2(r, 0.0)];
+            p.add(egui::Shape::convex_polygon(pts, ink, egui::Stroke::NONE));
+        }
+        Icon::Pause => {
+            for dx in [-r * 0.55, r * 0.55] {
+                p.rect_filled(egui::Rect::from_center_size(c + egui::vec2(dx, 0.0), egui::vec2(r * 0.55, r * 2.0)), 1.0, ink);
+            }
+        }
+        Icon::Stop => {
+            p.rect_filled(egui::Rect::from_center_size(c, egui::vec2(r * 1.8, r * 1.8)), 2.0, ink);
+        }
+    }
+    let resp = resp.on_hover_text(hint);
+    if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
 fn section(ui: &mut egui::Ui, title: &str, open: bool, add: impl FnOnce(&mut egui::Ui)) {
     egui::CollapsingHeader::new(egui::RichText::new(title).strong().size(15.0)).default_open(open).show(ui, |ui| {
         add(ui);
@@ -2483,23 +2741,33 @@ const SHOTS: [Shot; 6] = [
         }
     }),
     ("5_beallitasok", |a| a.page = Page::Settings),
-    ("6_felvetelek", |a| {
-        a.page = Page::Recordings;
+    ("6_felvetel_lejatszasa", |a| {
+        a.page = Page::Main;
         a.refresh_recordings();
-        if let Some(r) = a.rec.list.first() {
+        if let Some(r) = a.rec.list.iter().find(|r| !r.export) {
             let v = r.video.clone();
+            a.rec.expanded = Some(v.clone());
             a.open_viewer(v);
+            a.play(true);
         }
     }),
 ];
 
 /// Walk on the real camera (`screenshots DIR camera`).
-const CAMERA_SHOTS: [Shot; 16] = [
+const CAMERA_SHOTS: [Shot; 18] = [
     ("01_fooldal", |a| a.page = Page::Main),
     ("02_fooldal_kivagas", |a| a.crop_centre(960.0, 540.0)),
     ("03_felvetel", |a| {
         a.rec_name = "_kamerateszt".into();
         a.start_recording();
+    }),
+    ("03b_felvetel_kozben_fenyero", |a| a.set_camera_light(true, 10.0)),
+    ("03c_felvetel_kozben_kivagas_mozgatasa", |a| {
+        // Move the crop by (64, 32) on the sensor, size unchanged.
+        let (Some(g), Some(c)) = (a.geometry(), a.engine.scenario.as_ref().map(|s| s.camera.clone())) else { return };
+        let sel = egui::Rect::from_min_size(egui::pos2((c.offset_x + 64) as f32, (c.offset_y + 32) as f32), egui::vec2(c.width as f32, c.height as f32));
+        let (sensor, min) = (egui::vec2(g.sensor.0 as f32, g.sensor.1 as f32), egui::vec2(g.min_size.0 as f32, g.min_size.1 as f32));
+        a.crop_to(sel, g.step, min, sensor);
     }),
     ("04_szunet", |a| {
         if let Some(r) = &mut a.recording {
@@ -2539,12 +2807,14 @@ const CAMERA_SHOTS: [Shot; 16] = [
         a.edit.view.dark = true;
     }),
     ("14_teljes_kep", |a| a.crop_centre(1944.0, 1470.0)),
-    ("15_felvetelek", |a| {
-        a.page = Page::Recordings;
+    ("15_felvetel_lejatszasa", |a| {
+        a.page = Page::Main;
         a.refresh_recordings();
-        if let Some(r) = a.rec.list.iter().find(|r| r.video.to_string_lossy().contains("_kamerateszt")) {
+        if let Some(r) = a.rec.list.iter().find(|r| r.video.to_string_lossy().contains("_kamerateszt") && !r.export) {
             let v = r.video.clone();
+            a.rec.expanded = Some(v.clone());
             a.open_viewer(v);
+            a.play(true);
         }
     }),
     ("16_vege", |a| a.page = Page::Main),

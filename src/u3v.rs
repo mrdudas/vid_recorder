@@ -480,6 +480,45 @@ impl Camera for U3vCamera {
         self.lost.load(Relaxed)
     }
 
+    fn live(&mut self, target: Option<f64>, offset: Option<(u32, u32)>) -> Result<(), String> {
+        let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
+        // Write only what is writable now: a refused write locks the Alvium.
+        let writable = |p: &mut Params, name: &str| -> Result<(), String> {
+            let ok = match p.node(name) {
+                Some(n) => match (n.as_float(p), n.as_integer(p)) {
+                    (Some(f), _) => f.is_writable(p).unwrap_or(false),
+                    (_, Some(i)) => i.is_writable(p).unwrap_or(false),
+                    _ => false,
+                },
+                None => false,
+            };
+            if ok { Ok(()) } else { Err(format!("{name} futás közben nem írható")) }
+        };
+        if let Some(t) = target {
+            writable(&mut p, "IntensityControllerTarget")?;
+            set_float_clamped(&mut p, "IntensityControllerTarget", t)?;
+        }
+        if let Some((x, y)) = offset {
+            // The offsets are locked while acquiring: stop the acquisition
+            // (the stream stays open), unlock, write, lock, start again.
+            let locked = writable(&mut p, "OffsetX").is_err();
+            if locked {
+                exec(&mut p, "AcquisitionStop")?;
+                set_int(&mut p, "TLParamsLocked", 0)?;
+            }
+            let r = writable(&mut p, "OffsetX")
+                .and_then(|_| writable(&mut p, "OffsetY"))
+                .and_then(|_| set_int(&mut p, "OffsetX", x as i64))
+                .and_then(|_| set_int(&mut p, "OffsetY", y as i64));
+            if locked {
+                set_int(&mut p, "TLParamsLocked", 1)?;
+                exec(&mut p, "AcquisitionStart")?;
+            }
+            r?;
+        }
+        Ok(())
+    }
+
     fn reset(&mut self) {
         self.stop();
         let Ok(mut p) = self.cam.params_ctxt() else { return };
@@ -593,6 +632,11 @@ fn set_float_clamped(p: &mut Params, name: &str, v: f64) -> Result<(), String> {
 
 fn missing(name: &str, kind: &str) -> String {
     format!("camera feature {name} not found (or not a {kind})")
+}
+
+fn exec(p: &mut Params, name: &str) -> Result<(), String> {
+    let c = p.node(name).and_then(|n| n.as_command(p)).ok_or_else(|| missing(name, "command"))?;
+    c.execute(p).map_err(|e| format!("{name}: {e}"))
 }
 
 fn set_int(p: &mut Params, name: &str, v: i64) -> Result<(), String> {

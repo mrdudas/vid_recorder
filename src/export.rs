@@ -157,6 +157,9 @@ struct Probe {
     luma: bool,
     /// The luma plane is 10 bit.
     luma10: bool,
+    /// 8-bit codes on the noise-matched curve (`CURVE` tag) of a sensor
+    /// with this many bits.
+    curve: Option<u32>,
     /// Left shift that brings the samples to full 16-bit range: set when
     /// fewer bits are stored as plain 16-bit words (FFVHuff recordings).
     shift: u32,
@@ -196,6 +199,7 @@ fn probe(input: &str) -> Result<Probe, String> {
         gray: luma || field("pix_fmt").is_some_and(|p| p.starts_with("gray")),
         luma,
         luma10: field("pix_fmt").is_some_and(|p| p.contains("p10")),
+        curve: bits.filter(|_| field("TAG:CURVE").as_deref() == Some(crate::curve::TAG)),
         tag,
         shift,
     })
@@ -236,7 +240,11 @@ fn spawn_decoder(input: &str, p: &Probe, o: &Options, from: f64, len: Option<f64
     let scale = (size != (p.w, p.h)).then(|| format!("scale={}:{}:flags=area", size.0, size.1));
     let bayer = o.bayer.as_ref().filter(|_| p.gray);
     // Stored value -> 16-bit linear.
-    let table: Option<Vec<u16>> = if p.luma && p.luma10 {
+    let table: Option<Vec<u16>> = if let Some(bits) = p.curve {
+        // 8-bit codes, read as 16 bit (v * 257): code = value >> 8.
+        let d = crate::curve::decode_table(bits);
+        Some((0..65536u32).map(|i| d[(i >> 8) as usize] << (16 - bits)).collect())
+    } else if p.luma && p.luma10 {
         Some((0..1024).map(|v| v << 6).collect())
     } else if p.shift > 0 {
         Some((0..1u32 << (16 - p.shift)).map(|v| (v << p.shift) as u16).collect())
@@ -257,7 +265,7 @@ fn spawn_decoder(input: &str, p: &Probe, o: &Options, from: f64, len: Option<f64
         if p.luma {
             first.args(["-vf", "extractplanes=y"]);
         }
-        first.args(["-pix_fmt", if p.luma { "gray10le" } else { "gray16le" }]);
+        first.args(["-pix_fmt", if p.luma && p.luma10 { "gray10le" } else { "gray16le" }]);
     } else {
         let luma = p.luma.then_some("extractplanes=y");
         let vf: Vec<&str> = luma.into_iter().chain(scale.iter().filter(|_| bayer.is_none()).map(String::as_str)).collect();
