@@ -10,7 +10,7 @@ use cameleon::genapi::{DefaultGenApiCtxt, ParamsCtxt};
 use cameleon::payload::PixelFormat as UPixelFormat;
 use cameleon::u3v::{self, ControlHandle, StreamHandle};
 
-use crate::camera::{Camera, FrameSink, Geometry, Limits, Mode};
+use crate::camera::{self as camera_mod, Camera, FrameSink, Geometry, Limits, Mode, Ranges};
 use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::scenario::CameraSettings;
 
@@ -32,6 +32,7 @@ pub struct U3vCamera {
     /// Highest frame rate the camera allowed at the last `apply`.
     max_fps: Option<f64>,
     geometry: Option<Geometry>,
+    ranges: Option<Ranges>,
     /// Width, Height and the offsets are writable (hardware crop).
     roi: bool,
 }
@@ -144,6 +145,7 @@ impl U3vCamera {
             lost: Arc::new(AtomicBool::new(false)),
             max_fps: None,
             geometry: None,
+            ranges: None,
         })
     }
 }
@@ -201,6 +203,7 @@ impl Camera for U3vCamera {
                 s.pixel_format.name()
             ));
         }
+        self.ranges = read_ranges(&mut p, s.pixel_format, width, height).ok();
         // Exposure first, with the frame rate unconstrained (the exposure
         // range depends on the current frame rate and vice versa). With auto
         // exposure the frame rate must hold at the shortest exposure it may
@@ -258,6 +261,71 @@ impl Camera for U3vCamera {
         self.geometry
     }
 
+    fn ranges(&self) -> Option<Ranges> {
+        self.ranges.clone()
+    }
+
+    /// In the order the features depend on each other: format, crop,
+    /// frame rate (at the shortest exposure), exposure and gain.
+    fn fit(&mut self, s: &mut CameraSettings) -> Result<Vec<String>, String> {
+        let mut notes = Vec::new();
+        let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
+        let p = &mut p;
+        let _ = set_bool(p, "ChunkModeActive", false);
+        let formats = available_formats(p)?;
+        if !formats.contains(&s.pixel_format) {
+            // The closest one: same bit depth and colour, else the first.
+            let f = formats
+                .iter()
+                .copied()
+                .find(|f| f.bits() == s.pixel_format.bits() && f.is_bayer() == s.pixel_format.is_bayer())
+                .or_else(|| formats.iter().copied().find(|f| f.is_bayer() == s.pixel_format.is_bayer()))
+                .or_else(|| formats.first().copied())
+                .ok_or("a kamera egyik formátumát sem tudjuk rögzíteni")?;
+            notes.push(format!("{} helyett {}: a kamera nem tudja", s.pixel_format.name(), f.name()));
+            s.pixel_format = f;
+        }
+        set_enum(p, "PixelFormat", s.pixel_format.name())?;
+        set_bool(p, "ReverseX", s.reverse_x)?;
+        set_bool(p, "ReverseY", s.reverse_y)?;
+        let size = if self.roi {
+            set_int(p, "OffsetX", 0)?;
+            set_int(p, "OffsetY", 0)?;
+            notes.extend(camera_mod::fit_crop(s, &geometry(p)?));
+            set_int(p, "Width", s.width as i64)?;
+            set_int(p, "Height", s.height as i64)?;
+            (s.width, s.height)
+        } else {
+            (s.width, s.height)
+        };
+        for (name, value) in &s.extra {
+            let _ = set_json(p, name, value);
+        }
+        let r = read_ranges(p, s.pixel_format, size.0, size.1)?;
+        notes.extend(camera_mod::fit_light(s, &r));
+        // The frame rate must also hold at the exposure the camera will use
+        // (the shortest automatic one): shorten it if not.
+        for _ in 0..6 {
+            let exp = if s.auto_exposure { s.auto_exposure_range.0 } else { s.exposure_us };
+            let _ = set_bool(p, "AcquisitionFrameRateEnable", false);
+            set_float_clamped(p, "ExposureTime", exp)?;
+            let _ = set_bool(p, "AcquisitionFrameRateEnable", true);
+            let max = float_max(p, "AcquisitionFrameRate")?;
+            if s.frame_rate <= max + 1e-3 || exp <= r.exposure_us.0 {
+                break;
+            }
+            let shorter = (exp * max / s.frame_rate * 0.97).max(r.exposure_us.0);
+            notes.push(format!("expozíció {exp:.0} µs helyett {shorter:.0} µs, hogy a {:.1} fps tartható legyen", s.frame_rate));
+            if s.auto_exposure {
+                s.auto_exposure_range.0 = shorter;
+            } else {
+                s.exposure_us = shorter;
+            }
+        }
+        self.ranges = Some(r);
+        Ok(notes)
+    }
+
     /// Only register reads and cheap writes, no streaming: the whole table
     /// takes about a second.
     fn limits(&mut self, s: &CameraSettings) -> Result<Limits, String> {
@@ -270,25 +338,11 @@ impl Camera for U3vCamera {
             let _ = set_json(p, name, value);
         }
         set_exposure(p, s)?;
-        let float_range = |p: &mut Params, name| -> (f64, f64) {
-            p.node(name)
-                .and_then(|n| n.as_float(p))
-                .and_then(|n| Some((n.min(p).ok()?, n.max(p).ok()?)))
-                .unwrap_or((0.0, 0.0))
-        };
         let exposure_us = float_range(p, "ExposureTime");
         let gain_db = float_range(p, "Gain");
         let _ = set_bool(p, "AcquisitionFrameRateEnable", true);
 
-        let node = p.node("PixelFormat").and_then(|n| n.as_enumeration(p)).ok_or_else(|| missing("PixelFormat", "enumeration"))?;
-        let mut formats = Vec::new();
-        for e in node.entries(p) {
-            if e.is_available(p).unwrap_or(false)
-                && let Some(f) = PixelFormat::ALL.into_iter().find(|f| f.name() == e.symbolic(p))
-            {
-                formats.push(f);
-            }
-        }
+        let mut formats = available_formats(p)?;
         // Switching between 12-bit and other formats takes the Alvium
         // ~1.5 s (sensor mode change), the rest a few ms: scenario's group first.
         let group = |f: PixelFormat| (f.bits() == 12) != (s.pixel_format.bits() == 12);
@@ -595,6 +649,44 @@ fn set_exposure(p: &mut Params, s: &CameraSettings) -> Result<(), String> {
         set_float(p, "Gain", s.gain_db)?;
     }
     Ok(())
+}
+
+/// Formats the camera offers that we can record.
+fn available_formats(p: &mut Params) -> Result<Vec<PixelFormat>, String> {
+    let node = p.node("PixelFormat").and_then(|n| n.as_enumeration(p)).ok_or_else(|| missing("PixelFormat", "enumeration"))?;
+    let mut formats = Vec::new();
+    for e in node.entries(p) {
+        if e.is_available(p).unwrap_or(false)
+            && let Some(f) = PixelFormat::ALL.into_iter().find(|f| f.name() == e.symbolic(p))
+        {
+            formats.push(f);
+        }
+    }
+    Ok(formats)
+}
+
+/// Min and max of a float feature; (0, 0) if the camera has none.
+fn float_range(p: &mut Params, name: &str) -> (f64, f64) {
+    p.node(name).and_then(|n| n.as_float(p)).and_then(|n| Some((n.min(p).ok()?, n.max(p).ok()?))).unwrap_or((0.0, 0.0))
+}
+
+/// Ranges for the written format and size (see [`Ranges`]). Leaves the
+/// exposure at its shortest and the automatics off: apply sets them after.
+fn read_ranges(p: &mut Params, f: PixelFormat, width: u32, height: u32) -> Result<Ranges, String> {
+    let formats = available_formats(p)?;
+    let _ = set_bool(p, "AcquisitionFrameRateEnable", false);
+    let _ = set_enum(p, "ExposureAuto", "Off");
+    let _ = set_enum(p, "GainAuto", "Off");
+    let exposure_us = float_range(p, "ExposureTime");
+    let gain_db = float_range(p, "Gain");
+    set_float_clamped(p, "ExposureTime", exposure_us.0)?;
+    let _ = set_bool(p, "AcquisitionFrameRateEnable", true);
+    let mut max = float_max(p, "AcquisitionFrameRate")?;
+    if let Some((link, _)) = link_fps(p, f, width, height) {
+        max = max.min(link);
+    }
+    // Rounded down: the exact maximum may not be settable.
+    Ok(Ranges { formats, max_fps: (max * 100.0).floor() / 100.0, exposure_us, gain_db })
 }
 
 /// Frame rate the USB link limit allows, and the limit [bytes/s]; `None`

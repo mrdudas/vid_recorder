@@ -1,13 +1,13 @@
 //! GUI: main page (scenario select, record start/end, preview) and settings
 //! page (edit, try and save scenarios). Preview refreshes at most 25 fps.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::camera::{Geometry, Limits, Mode};
+use crate::camera::{self as cam, Geometry, Limits, Mode, Ranges};
 use crate::encoder;
 use crate::engine::{Engine, PREVIEW_INTERVAL, RecordingInfo};
 use crate::probe::{self, Level, Verdict};
@@ -60,6 +60,9 @@ struct RecPage {
     expanded: Option<PathBuf>,
     confirm_delete: Option<PathBuf>,
     viewer: Option<Viewer>,
+    /// Opened while its file was still being closed: plays once closed
+    /// (an unclosed file has no length yet).
+    play_after_close: Option<PathBuf>,
 }
 
 /// Extra folders on the recordings page, one path per line.
@@ -93,12 +96,14 @@ struct Player {
 impl Player {
     /// From `t0` seconds of video; `speed`: real seconds per video second.
     fn start(path: PathBuf, info: MediaInfo, t0: f64, speed: f64) -> Player {
-        const RATE: f64 = 25.0;
+        // At most 25 pictures per real second: every frame of a slow
+        // camera, a subset of a fast one (in video time: 25 · speed).
+        let rate = (25.0 * speed).min(info.fps);
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let quit = stop.clone();
         std::thread::spawn(move || {
-            let mut d = match recordings::Decoder::open(&path, &info, t0, PREVIEW_MAX_WIDTH as u32, Some(RATE), None) {
+            let mut d = match recordings::Decoder::open(&path, &info, t0, PREVIEW_MAX_WIDTH as u32, Some(rate), None) {
                 Ok(d) => d,
                 Err(e) => {
                     let _ = tx.send((t0, Err(e)));
@@ -109,11 +114,11 @@ impl Player {
             let mut n = 0u64;
             while !quit.load(Relaxed) {
                 let Some(f) = d.next() else { break };
-                let due = start + Duration::from_secs_f64(n as f64 / RATE * speed);
+                let due = start + Duration::from_secs_f64(n as f64 / rate * speed);
                 if let Some(w) = due.checked_duration_since(Instant::now()) {
                     std::thread::sleep(w);
                 }
-                if tx.send((t0 + n as f64 / RATE, f.and_then(still_image))).is_err() {
+                if tx.send((t0 + n as f64 / rate, f.and_then(still_image))).is_err() {
                     break;
                 }
                 n += 1;
@@ -193,6 +198,10 @@ pub struct App {
     /// Result of each export started in this session: output or error.
     export_result: std::collections::BTreeMap<PathBuf, Result<PathBuf, String>>,
     confirm_delete_scenario: bool,
+    /// What the camera changed at the last apply to stay within its limits.
+    fit_notes: Vec<String>,
+    /// Settings the camera refused (not tried again until they change).
+    failed: Option<Scenario>,
     /// Spacing set up (first frame).
     styled: bool,
     /// Preview averaging and the settings it runs with (a change restarts it).
@@ -332,6 +341,8 @@ impl App {
             sys: SysInfo { sys: sysinfo::System::new(), at: None, cpu: 0.0, mem: (0, 0), disk: None },
             export_result: Default::default(),
             confirm_delete_scenario: false,
+            fit_notes: Vec::new(),
+            failed: None,
             styled: false,
             stacker: Stacker::new(),
             stack_settings: None,
@@ -349,8 +360,8 @@ impl App {
     /// With `camera` the scenarios' own cameras are used and a longer walk
     /// exercises crop, pause, limits, averaging and dark calibration; its
     /// recording and dark frame are left for checking.
-    pub fn screenshots(mut self, dir: PathBuf, camera: bool) -> Self {
-        if !camera {
+    pub fn screenshots(mut self, dir: PathBuf, camera: bool, uvc: bool) -> Self {
+        if !camera || uvc {
             for s in &mut self.scenarios {
                 s.device = Device::Sim;
             }
@@ -358,8 +369,8 @@ impl App {
         }
         let first = self.scenarios[0].clone();
         self.apply(&first);
-        let steps: &'static [Shot] = if camera { &CAMERA_SHOTS } else { &SHOTS };
-        self.shots = Some(Shots { dir, steps, cleanup: !camera, step: 0, started: None, pending: None });
+        let steps: &'static [Shot] = if uvc { &UVC_SHOTS } else if camera { &CAMERA_SHOTS } else { &SHOTS };
+        self.shots = Some(Shots { dir, steps, cleanup: !camera && !uvc, step: 0, started: None, pending: None });
         self
     }
 
@@ -375,19 +386,112 @@ impl App {
     /// Make `s` the active scenario: the camera switches to it, the main
     /// and the settings page both show it, and it is loaded at the next start.
     fn apply(&mut self, s: &Scenario) {
-        if self.edit.name != s.name || self.edit != *s {
-            self.extra_json = extra_to_json(s);
-            self.edit = s.clone();
+        if self.edit.name != s.name {
             self.confirm_delete_scenario = false;
         }
+        self.extra_json = extra_to_json(s);
         if self.shots.is_none() {
             let _ = std::fs::write(ACTIVE_FILE, &s.name);
         }
-        self.message = match self.engine.apply(s) {
-            Ok(()) => format!("Szcenárió aktív: {}", s.name),
+        self.message = match self.run(s.clone()) {
+            Ok(()) if self.fit_notes.is_empty() => format!("Szcenárió aktív: {}", s.name),
+            Ok(()) => format!("Szcenárió aktív: {} – a kamera határai miatt: {}", s.name, self.fit_notes.join("; ")),
             Err(e) if self.engine.waiting_for_camera() => format!("Nincs kamera ({e}). Várakozás a csatlakozásra…"),
             Err(e) => format!("Hiba: {e}"),
         };
+    }
+
+    /// Run `s` on the camera, fitted to what the camera allows. The edited
+    /// scenario always mirrors what runs (two states: running and saved).
+    /// Refused: back to what ran before.
+    fn run(&mut self, mut s: Scenario) -> Result<(), String> {
+        let before = self.engine.scenario.clone();
+        let rec_note = fit_recording(&mut s);
+        match self.engine.apply_fit(&mut s) {
+            Ok(mut notes) => {
+                notes.extend(rec_note);
+                self.fit_notes = notes;
+                self.edit = s;
+                self.failed = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.fit_notes.clear();
+                if self.engine.waiting_for_camera() {
+                    // Runs as soon as the camera is back.
+                    self.edit = s.clone();
+                } else if let Some(mut b) = before.filter(|b| *b != s) {
+                    let _ = self.engine.apply_fit(&mut b);
+                    self.edit = b;
+                }
+                self.failed = Some(s);
+                Err(e)
+            }
+        }
+    }
+
+    /// Settings window: every change goes to the camera at once (after a
+    /// drag is released); what the camera changed is shown.
+    fn commit_edit(&mut self, ctx: &egui::Context) {
+        if self.engine.is_recording() || self.test.is_some() || ctx.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let mut s = self.edit.clone();
+        // Extra features only when their JSON is complete.
+        let text = self.extra_json.trim();
+        match serde_json::from_str(if text.is_empty() { "{}" } else { text }) {
+            Ok(m) => s.camera.extra = m,
+            Err(_) => return,
+        }
+        if let Some(a) = &self.engine.scenario {
+            s.view = a.view.clone();
+        }
+        // A UVC camera: one of its own modes. Its modes are read first
+        // (on a device switch the old format and size rarely fit).
+        let mut mode_note = None;
+        if matches!(s.device, Device::Uvc { .. }) {
+            match &self.modes {
+                Some((d, Ok(m))) if *d == s.device => mode_note = fit_mode(&mut s, m),
+                Some((d, Err(_))) if *d == s.device => {}
+                _ => return,
+            }
+        }
+        if s.name.trim().is_empty() || self.engine.scenario.as_ref() == Some(&s) || self.failed.as_ref() == Some(&s) {
+            return;
+        }
+        // Only the auto exposure target: written to the streaming camera.
+        if let Some(a) = &self.engine.scenario
+            && a.device == s.device
+            && a.camera.auto_exposure
+            && a.camera != s.camera
+            && (scenario::CameraSettings { auto_target: s.camera.auto_target, ..a.camera.clone() }) == s.camera
+            && self.engine.live(Some(s.camera.auto_target), None).is_ok()
+        {
+            self.message = format!("Kamera célfényerő: {:.0}%", s.camera.auto_target);
+        }
+        if self.engine.scenario.as_ref().is_some_and(|a| a.device == s.device && a.camera == s.camera) {
+            if let Some(n) = fit_recording(&mut s) {
+                self.message = n;
+            }
+            self.engine.update_meta(&s);
+            self.edit = s;
+            return;
+        }
+        let result = self.run(s);
+        if result.is_ok() {
+            self.fit_notes.splice(0..0, mode_note);
+        }
+        self.message = match result {
+            Ok(()) if self.fit_notes.is_empty() => "Beállítva.".into(),
+            Ok(()) => format!("A kamera határai miatt: {}", self.fit_notes.join("; ")),
+            Err(e) if self.engine.waiting_for_camera() => format!("Nincs kamera ({e}). Várakozás a csatlakozásra…"),
+            Err(e) => format!("A kamera nem fogadta el: {e}. Visszaállítva."),
+        };
+    }
+
+    /// What the edited camera allows (only while it is the running one).
+    fn ranges(&self) -> Option<Ranges> {
+        self.engine.scenario.as_ref().filter(|a| a.device == self.edit.device).and(self.engine.ranges())
     }
 
     /// Unplugged, hung or missing camera: the engine reopens it and keeps
@@ -766,15 +870,13 @@ impl App {
         }
     }
 
-    /// Auto exposure on/off and its target: on the main page the running
-    /// scenario only (not saved), on the settings page the edited one.
+    /// Auto exposure on/off and its target, on the running scenario.
     fn set_camera_light(&mut self, auto: bool, target: f64) {
-        let main = self.page == Page::Main;
         // Only the target changes: written to the streaming camera (this
         // also works while recording), else a restart with the new settings.
         let running_auto = self.engine.scenario.as_ref().is_some_and(|s| s.camera.auto_exposure);
         let recording = self.engine.is_recording();
-        if auto && running_auto && (main || recording) {
+        if auto && running_auto {
             match self.engine.live(Some(target), None) {
                 Ok(()) => {
                     self.edit.camera.auto_target = target;
@@ -788,21 +890,13 @@ impl App {
                 Err(_) => {}
             }
         }
-        let Some(mut s) = (if main { self.engine.scenario.clone() } else { self.edited() }) else { return };
-        let before = self.engine.scenario.clone();
+        let Some(mut s) = self.engine.scenario.clone() else { return };
         (s.camera.auto_exposure, s.camera.auto_target) = (auto, target);
-        match self.engine.apply(&s) {
-            Ok(()) => {
-                (self.edit.camera.auto_exposure, self.edit.camera.auto_target) = (auto, target);
-                self.message = if auto { format!("Kamera célfényerő: {target:.0}%") } else { "Kézi expozíció".into() };
-            }
-            Err(e) => {
-                if let Some(b) = before {
-                    self.apply(&b);
-                }
-                self.message = format!("A kamera nem fogadta el: {e}. Visszaállítva.");
-            }
-        }
+        self.message = match self.run(s) {
+            Ok(()) if auto => format!("Kamera célfényerő: {target:.0}%"),
+            Ok(()) => "Kézi expozíció".into(),
+            Err(e) => format!("A kamera nem fogadta el: {e}. Visszaállítva."),
+        };
     }
 
     /// The preview scaled to fill the available space. With `sensor_view`
@@ -985,32 +1079,25 @@ impl App {
             };
             return;
         }
-        // Main page: the running scenario only, nothing is saved. Settings:
-        // the edited scenario (saved with it).
-        let main = self.page == Page::Main;
-        let Some(mut s) = (if main { self.engine.scenario.clone() } else { self.edited() }) else { return };
-        let before = self.engine.scenario.clone();
+        // The running scenario (saved only with Mentés); the camera fits
+        // the frame rate and exposure to the new size.
+        let Some(mut s) = self.engine.scenario.clone() else { return };
         let c = &mut s.camera;
         if (c.width, c.height, c.offset_x, c.offset_y) == (w, h, x, y) {
             return;
         }
         (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
-        match self.engine.apply(&s) {
+        self.message = match self.run(s) {
             Ok(()) => {
-                // One active scenario: the settings page shows the crop too
-                // (saved only with Mentés).
-                let c = &mut self.edit.camera;
-                (c.width, c.height, c.offset_x, c.offset_y) = (w, h, x, y);
-                self.message = format!("Kivágás: {w}×{h} ({x}, {y})");
-            }
-            Err(e) => {
-                // Back to the crop that worked, so the camera keeps running.
-                if let Some(b) = before {
-                    self.apply(&b);
+                let c = &self.edit.camera;
+                let mut m = format!("Kivágás: {}×{} ({}, {})", c.width, c.height, c.offset_x, c.offset_y);
+                if !self.fit_notes.is_empty() {
+                    m += &format!(" – {}", self.fit_notes.join("; "));
                 }
-                self.message = format!("A kamera nem fogadta el a {w}×{h} kivágást: {e}. Visszaállítva.");
+                m
             }
-        }
+            Err(e) => format!("A kamera nem fogadta el a {w}×{h} kivágást: {e}. Visszaállítva."),
+        };
     }
 
     /// The camera the page works with: the running one on the main page,
@@ -1049,27 +1136,16 @@ impl App {
             (Ok(m), Ok(_)) => format!("Kamera felmérve: {} mód, határok kiolvasva.", m.len()),
             (Ok(m), Err(_)) => format!("Kamera felmérve: {} mód.", m.len()),
         };
-        // The edited format is one the camera does not have: take its first mode.
-        let mut fixed = None;
-        if let Ok(m) = &modes
-            && let Some(first) = m.first()
-            && !m.iter().any(|m| m.format == s.camera.pixel_format)
-        {
-            let old = s.camera.pixel_format;
-            set_mode(&mut self.edit, first);
-            set_mode(&mut s, first);
-            self.message += &format!(" A kamera nem tud {} formátumot, átállítva: {}.", old.name(), mode_label(first));
-            fixed = Some(s.clone());
+        let device = s.device.clone();
+        if let Ok(m) = &modes {
+            fit_mode(&mut s, m);
         }
-        self.limits = Some((s.device.clone(), l));
-        self.modes = Some((s.device.clone(), modes));
-        // Restart what ran before; the edited scenario if it was fixed
-        // (or nothing ran).
-        let before = before.filter(|b| fixed.is_none() || b.name != s.name);
-        if let Some(b) = before.or(fixed).or(Some(s)) {
-            if let Err(e) = self.engine.apply(&b) {
-                self.message = format!("Hiba: {e}");
-            }
+        self.limits = Some((device.clone(), l));
+        self.modes = Some((device, modes));
+        // Restart what ran before (or the edited scenario, fitted to the
+        // modes, if nothing ran). A switched device follows in commit_edit.
+        if let Err(e) = self.engine.apply(&before.unwrap_or(s)) {
+            self.message = format!("Hiba: {e}");
         }
     }
 
@@ -1116,10 +1192,15 @@ impl App {
         let saved = self.scenarios.iter().find(|s| s.name == current).cloned();
         if let (Some(a), Some(saved)) = (&self.engine.scenario, &saved) {
             let roi = |c: &crate::scenario::CameraSettings| (c.width, c.height, c.offset_x, c.offset_y);
-            if roi(&a.camera) != roi(&saved.camera) {
+            let other = a.device != saved.device || a.camera.pixel_format != saved.camera.pixel_format;
+            if other || roi(&a.camera) != roi(&saved.camera) {
                 let (cw, ch, x, y) = roi(&a.camera);
                 ui.horizontal_wrapped(|ui| {
-                    ui.small(format!("Kivágás: {cw}×{ch} ({x}, {y}), nincs mentve."));
+                    if other {
+                        ui.small(format!("Nem mentett beállítás fut: {}, {}.", a.device.label(), a.camera.pixel_format.name()));
+                    } else {
+                        ui.small(format!("Kivágás: {cw}×{ch} ({x}, {y}), nincs mentve."));
+                    }
                     if ui.add_enabled(!recording, egui::Button::new("Vissza").small()).clicked() {
                         chosen = Some(saved.clone());
                     }
@@ -1174,6 +1255,12 @@ impl App {
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| PathBuf::from(l.trim()))
                 .collect();
+        }
+        if let Some(v) = self.rec.play_after_close.clone()
+            && !self.closing(&v)
+        {
+            self.refresh_recordings(); // the closed file's size and CSV
+            self.open_and_play(v);
         }
         if self.rec.refreshed.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
             self.refresh_recordings();
@@ -1254,16 +1341,13 @@ impl App {
             Some(CardAction::Open(v)) => {
                 self.rec.expanded = Some(v.clone());
                 self.rec.confirm_delete = None;
-                self.open_viewer(v);
-                self.play(true);
+                self.open_and_play(v);
             }
-            Some(CardAction::Play(v)) => {
-                self.open_viewer(v);
-                self.play(true);
-            }
+            Some(CardAction::Play(v)) => self.open_and_play(v),
             Some(CardAction::Close) => {
                 self.rec.expanded = None;
                 self.rec.viewer = None;
+                self.rec.play_after_close = None;
             }
             Some(CardAction::Export(v)) => {
                 let export = self.engine.scenario.as_ref().map(|s| s.export.clone()).unwrap_or_default();
@@ -1286,11 +1370,27 @@ impl App {
         }
     }
 
+    /// The file is still being closed after the recording stopped.
+    fn closing(&self, video: &Path) -> bool {
+        self.last_rec.as_ref().is_some_and(|(v, st)| v == video && !st.finished.load(Relaxed))
+    }
+
+    /// Play `video` now, or once its file is closed.
+    fn open_and_play(&mut self, video: PathBuf) {
+        if self.closing(&video) {
+            self.rec.viewer = None;
+            self.rec.play_after_close = Some(video);
+        } else {
+            self.rec.play_after_close = None;
+            self.open_viewer(video);
+            self.play(true);
+        }
+    }
+
     /// Export state and buttons of an open recording card.
     fn export_controls(&mut self, ui: &mut egui::Ui, video: &PathBuf, action: &mut Option<CardAction>) {
         let export = self.engine.scenario.as_ref().map(|s| s.export.clone()).unwrap_or_default();
-        let closing = self.last_rec.as_ref().is_some_and(|(v, st)| v == video && !st.finished.load(Relaxed));
-        if closing {
+        if self.closing(video) {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("A felvétel lezárása folyamatban…");
@@ -1570,6 +1670,7 @@ impl App {
             });
             self.tests_section(ui, busy);
         });
+        self.commit_edit(ui.ctx());
     }
 
     /// Pick / create / save / delete / try the edited scenario.
@@ -1599,12 +1700,7 @@ impl App {
             ui.end_row();
         });
         ui.horizontal(|ui| {
-            if ui.button("Kipróbálás").on_hover_text("A kamera átáll ezekre a beállításokra, mentés nélkül.").clicked()
-                && let Some(s) = self.edited()
-            {
-                self.apply(&s);
-            }
-            if ui.button("Mentés").clicked()
+            if ui.button("Mentés").on_hover_text("A kamera most ezekkel a beállításokkal fut: így menti el.").clicked()
                 && let Some(s) = self.edited()
             {
                 let saved = scenario::save(&self.dir, &s);
@@ -1623,6 +1719,11 @@ impl App {
             let stored = self.scenarios.iter().find(|x| x.name == self.edit.name);
             let differs = stored.is_none_or(|x| x.camera != self.edit.camera || x.recording != self.edit.recording || x.export != self.edit.export || x.preview_lut != self.edit.preview_lut || x.device != self.edit.device);
             if differs {
+                if let Some(saved) = stored.cloned()
+                    && ui.button("Visszaállítás").on_hover_text("A mentett beállítások vissza a kamerára.").clicked()
+                {
+                    self.apply(&saved);
+                }
                 ui.colored_label(ORANGE, "● nem mentett módosítás");
             }
             if !self.confirm_delete_scenario {
@@ -1680,8 +1781,11 @@ impl App {
         }
     }
 
+    /// The camera chain, top down in the order the settings depend on each
+    /// other: device, format (or mode), then crop, frame rate and exposure
+    /// in the next sections. Only what the camera offers is listed.
     fn camera_section(&mut self, ui: &mut egui::Ui) {
-        let max_fps = self.current_limits().and_then(|l| l.max_fps);
+        let ranges = self.ranges();
         let modes = self.known_modes().to_vec();
         let status: Vec<Option<Level>> = modes.iter().map(|m| self.tested(m.format, m.width, m.height)).collect();
         let modes_err = match &self.modes {
@@ -1691,6 +1795,7 @@ impl App {
         let sw_crop = self.sw_crop();
         // What the running camera really sends, if it is the edited one.
         let actual = self.engine.scenario.as_ref().filter(|a| a.device == self.edit.device).map(|a| (a.clone(), self.engine.actual()));
+        let notes = self.fit_notes.clone();
         let mut reread = false;
         section(ui, "Kamera", true, |ui| {
             grid(ui, "cam", |ui| {
@@ -1709,15 +1814,22 @@ impl App {
                 });
                 ui.end_row();
 
-                // A mode the camera reported (or accepted): format, size, fps.
-                if !modes.is_empty() {
+                if let Some(r) = &ranges {
+                    // USB3 Vision: the camera's own formats; size, frame rate
+                    // and exposure below, within what it allows.
+                    ui.label("Formátum");
+                    egui::ComboBox::from_id_salt("pixfmt").width(260.0).selected_text(format_label(e.camera.pixel_format)).show_ui(ui, |ui| {
+                        for &f in &r.formats {
+                            ui.selectable_value(&mut e.camera.pixel_format, f, format_label(f));
+                        }
+                    });
+                    ui.end_row();
+                } else if !modes.is_empty() {
+                    // UVC: the modes the camera lists (format, size, rates).
                     ui.label("Kameramód");
-                    let cap = if sw_crop { e.camera.capture_size.unwrap_or((e.camera.width, e.camera.height)) } else { (0, 0) };
-                    let current = modes.iter().position(|m| m.format == e.camera.pixel_format && (!sw_crop || (m.width, m.height) == cap));
-                    let text = match current {
-                        Some(i) if sw_crop => mode_label(&modes[i]),
-                        _ => format!("{} {}×{}", e.camera.pixel_format.name(), e.camera.width, e.camera.height),
-                    };
+                    let cap = e.camera.capture_size.unwrap_or((e.camera.width, e.camera.height));
+                    let current = modes.iter().position(|m| m.format == e.camera.pixel_format && (m.width, m.height) == cap);
+                    let text = current.map_or_else(|| "válassz módot".to_string(), |i| mode_label(&modes[i]));
                     egui::ComboBox::from_id_salt("mode").width(260.0).selected_text(text).show_ui(ui, |ui| {
                         for (m, st) in modes.iter().zip(&status) {
                             let (mark, tip) = match (st, m.reported) {
@@ -1727,70 +1839,38 @@ impl App {
                                 (None, true) => ("", "A kamera megadta; felvételi teszttel még nincs kipróbálva."),
                                 (None, false) => ("? ", "Megnyitáskor elfogadta; felvételi teszttel még nincs kipróbálva."),
                             };
-                            let ok = *st != Some(Level::Fail);
+                            if *st == Some(Level::Fail) {
+                                continue; // never offer what failed
+                            }
                             let label = format!("{mark}{}", mode_label(m));
-                            if ui.add_enabled(ok, egui::Button::selectable(Some(m) == current.map(|i| &modes[i]), label)).on_hover_text(tip).on_disabled_hover_text(tip).clicked() {
+                            if ui.add(egui::Button::selectable(Some(m) == current.map(|i| &modes[i]), label)).on_hover_text(tip).clicked() {
                                 set_mode(e, m);
                                 e.camera.frame_rate = best_rate(&self.probe_results, &e.device, m).unwrap_or(m.fps);
                             }
                         }
                     });
                     ui.end_row();
+                    if let Some(m) = current.map(|i| &modes[i]) {
+                        ui.label("Képfrekvencia");
+                        ui.horizontal(|ui| {
+                            if m.rates.is_empty() {
+                                ui.add(egui::Slider::new(&mut e.camera.frame_rate, 1.0..=m.fps.max(1.0)).max_decimals(1).suffix(" fps").update_while_editing(false));
+                            } else {
+                                // A UVC camera takes only the rates it lists.
+                                for &r in &m.rates {
+                                    if ui.selectable_label((e.camera.frame_rate - r).abs() < 1e-3, format!("{r} fps")).clicked() {
+                                        e.camera.frame_rate = r;
+                                    }
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    }
+                } else {
+                    ui.label("Kameramód");
+                    ui.weak(if modes_err.is_some() { "a kamera nem adta meg" } else { "beolvasás…" });
+                    ui.end_row();
                 }
-
-                ui.label("Pixelformátum");
-                egui::ComboBox::from_id_salt("pixfmt").width(260.0).selected_text(e.camera.pixel_format.name()).show_ui(ui, |ui| {
-                    for f in PixelFormat::ALL {
-                        let of: Vec<usize> = (0..modes.len()).filter(|&i| modes[i].format == f).collect();
-                        let has = modes.is_empty() || !of.is_empty();
-                        let works = of.is_empty() || of.iter().any(|&i| status[i] != Some(Level::Fail));
-                        let tip = if !has { "A kamera ezt a formátumot nem tudja." } else if !works { "Felvételi teszten nem ment át." } else { "" };
-                        let r = ui.add_enabled(has && works, egui::Button::selectable(e.camera.pixel_format == f, f.name()));
-                        if !tip.is_empty() {
-                            r.clone().on_disabled_hover_text(tip);
-                        }
-                        if r.clicked() {
-                            // The format's largest working mode, if known.
-                            match of.iter().find(|&&i| status[i] != Some(Level::Fail)) {
-                                Some(&i) => {
-                                    set_mode(e, &modes[i]);
-                                    e.camera.frame_rate = best_rate(&self.probe_results, &e.device, &modes[i]).unwrap_or(modes[i].fps);
-                                }
-                                None => e.camera.pixel_format = f,
-                            }
-                        }
-                    }
-                });
-                ui.end_row();
-
-                ui.label("Képfrekvencia");
-                let mode = modes.iter().find(|m| {
-                    m.format == e.camera.pixel_format && (!sw_crop || Some((m.width, m.height)) == e.camera.capture_size)
-                });
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut e.camera.frame_rate).range(0.1..=1000.0).speed(0.5).suffix(" fps"));
-                    match mode {
-                        // A UVC camera takes only the rates it lists.
-                        Some(m) if !m.rates.is_empty() => {
-                            for &r in &m.rates {
-                                if ui.selectable_label((e.camera.frame_rate - r).abs() < 1e-3, format!("{r}")).clicked() {
-                                    e.camera.frame_rate = r;
-                                }
-                            }
-                        }
-                        _ => {
-                            if let Some(m) = max_fps.or(mode.map(|m| m.fps))
-                                && ui
-                                    .button(format!("max. {m:.1}"))
-                                    .on_hover_text("A kamera legnagyobb fps-e ezzel a formátummal, kivágással és expozícióval.")
-                                    .clicked()
-                            {
-                                e.camera.frame_rate = m;
-                            }
-                        }
-                    }
-                });
-                ui.end_row();
 
                 if let Some((a, act)) = &actual {
                     ui.label("A kamera most küld");
@@ -1798,9 +1878,12 @@ impl App {
                     ui.end_row();
                 }
             });
+            if !notes.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(format!("A kamera határai miatt: {}", notes.join("; "))).color(ORANGE)).wrap());
+            }
             if let Some(e) = &modes_err {
                 ui.colored_label(ORANGE, format!("A kamera módjai nem olvashatók: {e}"));
-            } else if modes.iter().any(|m| !m.reported) {
+            } else if ranges.is_none() && modes.iter().any(|m| !m.reported) {
                 ui.small("A kamera nem sorolta fel a módjait: a rendszer megnyitással kitapogatta, mit fogad el (?). A Kamera felderítése felvétellel is kipróbálja őket.");
             }
         });
@@ -1834,9 +1917,9 @@ impl App {
                 let (step, sensor, min) = geo.map_or(([1; 4], (16384, 16384), (8, 8)), |g| (g.step, g.sensor, g.min_size));
                 ui.label("Méret");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut c.width).range(min.0..=sensor.0).speed(step[0]));
+                    ui.add(egui::DragValue::new(&mut c.width).range(min.0..=sensor.0).update_while_editing(false).speed(step[0]));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut c.height).range(min.1..=sensor.1).speed(step[1]));
+                    ui.add(egui::DragValue::new(&mut c.height).range(min.1..=sensor.1).update_while_editing(false).speed(step[1]));
                     if geo.is_some() && ui.button("Teljes").on_hover_text(format!("{}×{}", sensor.0, sensor.1)).clicked() {
                         (c.width, c.height, c.offset_x, c.offset_y) = (sensor.0, sensor.1, 0, 0);
                     }
@@ -1845,8 +1928,8 @@ impl App {
 
                 ui.label("Eltolás (X, Y)");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut c.offset_x).range(0..=sensor.0.saturating_sub(c.width)).speed(step[2]));
-                    ui.add(egui::DragValue::new(&mut c.offset_y).range(0..=sensor.1.saturating_sub(c.height)).speed(step[3]));
+                    ui.add(egui::DragValue::new(&mut c.offset_x).range(0..=sensor.0.saturating_sub(c.width)).update_while_editing(false).speed(step[2]));
+                    ui.add(egui::DragValue::new(&mut c.offset_y).range(0..=sensor.1.saturating_sub(c.height)).update_while_editing(false).speed(step[3]));
                     if geo.is_some() && ui.button("Középre").clicked() {
                         c.offset_x = sensor.0.saturating_sub(c.width) / 2;
                         c.offset_y = sensor.1.saturating_sub(c.height) / 2;
@@ -1874,49 +1957,80 @@ impl App {
         });
     }
 
+    /// Frame rate, then exposure and gain within its frame period: the
+    /// sliders reach exactly as far as the camera allows.
     fn exposure_section(&mut self, ui: &mut egui::Ui) {
-        let limits = self.current_limits().cloned();
-        section(ui, "Expozíció és erősítés", true, |ui| {
+        // UVC: the rate is part of the mode, exposure is not set.
+        let Some(r) = self.ranges() else { return };
+        section(ui, "Képfrekvencia és expozíció", true, |ui| {
             grid(ui, "exp", |ui| {
                 let c = &mut self.edit.camera;
-                let (exp, gain) = limits.as_ref().map_or(((1.0, 10_000_000.0), (0.0, 48.0)), |l| (l.exposure_us, l.gain_db));
+                ui.label("Képfrekvencia");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut c.frame_rate, 1.0..=r.max_fps.max(1.0))
+                            .logarithmic(true)
+                            .max_decimals(1)
+                            .suffix(" fps")
+                            .update_while_editing(false),
+                    );
+                    if ui.button("max").clicked() {
+                        c.frame_rate = r.max_fps;
+                    }
+                })
+                .response
+                .on_hover_text(format!(
+                    "Legfeljebb {:.1} fps ezzel a formátummal és kivágással (a USB-vel együtt). Kisebb magasság mellett több.",
+                    r.max_fps
+                ));
+                ui.end_row();
+
+                let cap = cam::exposure_cap(&r, c.frame_rate);
+                let (g0, g1) = r.gain_db;
                 ui.label("Automatikus");
                 ui.checkbox(&mut c.auto_exposure, "a kamera állítja")
-                    .on_hover_text("A felvételre is hat: a nyers jel fényessége menet közben változhat.");
+                    .on_hover_text("A lehető leghosszabb expozíció (legfeljebb egy képkocka ideje), és csak ha ez kevés, a legkisebb szükséges erősítés. A felvételre is hat.");
                 ui.end_row();
                 if c.auto_exposure {
-                    let period = 1e6 / c.frame_rate;
-                    ui.label("Expozíció tartomány");
+                    ui.label("Expozíció");
                     ui.horizontal(|ui| {
                         let (lo, hi) = &mut c.auto_exposure_range;
-                        ui.add(egui::DragValue::new(lo).range(0.0..=*hi).speed(10.0).suffix(" µs"));
+                        ui.add(egui::DragValue::new(lo).range(r.exposure_us.0..=*hi).speed(10.0).max_decimals(0).suffix(" µs").update_while_editing(false));
                         ui.label("–");
-                        ui.add(egui::DragValue::new(hi).range(*lo..=exp.1).speed(10.0).suffix(" µs"));
+                        ui.add(egui::DragValue::new(hi).range(*lo..=cap).speed(10.0).max_decimals(0).suffix(" µs").update_while_editing(false));
+                        if ui.button("teljes képkocka").on_hover_text(format!("{cap:.0} µs")).clicked() {
+                            *hi = cap;
+                        }
                     })
                     .response
-                    .on_hover_text(format!("Ezen belül állíthat az automatika. Egy képkocka ideje {period:.0} µs, a felső határ ne legyen nagyobb, különben az fps nem tartható."));
+                    .on_hover_text(format!("Ezen belül állít az automatika. Felső határ: {cap:.0} µs, egy képkocka ideje {:.1} fps-nél.", c.frame_rate));
                     ui.end_row();
-                    ui.label("Erősítés tartomány");
-                    ui.horizontal(|ui| {
-                        let (lo, hi) = &mut c.auto_gain_range;
-                        ui.add(egui::DragValue::new(lo).range(0.0..=*hi).speed(0.1).suffix(" dB"));
-                        ui.label("–");
-                        ui.add(egui::DragValue::new(hi).range(*lo..=gain.1).speed(0.1).suffix(" dB"));
-                    })
-                    .response
-                    .on_hover_text("Nagyobb erősítés: világosabb, de zajosabb kép.");
-                    ui.end_row();
+                    if g1 > g0 {
+                        ui.label("Erősítés");
+                        ui.horizontal(|ui| {
+                            let (lo, hi) = &mut c.auto_gain_range;
+                            ui.add(egui::DragValue::new(lo).range(g0..=*hi).speed(0.1).suffix(" dB").update_while_editing(false));
+                            ui.label("–");
+                            ui.add(egui::DragValue::new(hi).range(*lo..=g1).speed(0.1).suffix(" dB").update_while_editing(false));
+                        })
+                        .response
+                        .on_hover_text("Nagyobb erősítés: világosabb, de zajosabb kép.");
+                        ui.end_row();
+                    }
                     ui.label("Célfényerő");
                     ui.add(egui::Slider::new(&mut c.auto_target, 5.0..=80.0).fixed_decimals(0).suffix(" %"))
-                        .on_hover_text("Erre az átlagos fényerőre állít az automatika. Ha a világos részek beégnek, csökkentsd. A kamera alapértéke kb. 50%, ez világos ablakos jelenetnél a kép ötödét beégeti; 25%-nál kb. 1%-ot. Az élőkép automatikus fényereje a sötétebb képet is kivilágosítja.");
+                        .on_hover_text("Erre az átlagos fényerőre állít az automatika. Ha a világos részek beégnek, csökkentsd. A kamera alapértéke kb. 50%, ez világos ablakos jelenetnél a kép ötödét beégeti; 25%-nál kb. 1%-ot.");
                     ui.end_row();
                 } else {
                     ui.label("Expozíció");
-                    ui.add(egui::DragValue::new(&mut c.exposure_us).range(exp.0..=exp.1).speed(10.0).suffix(" µs"));
+                    ui.add(egui::Slider::new(&mut c.exposure_us, r.exposure_us.0..=cap).logarithmic(true).max_decimals(0).suffix(" µs").update_while_editing(false))
+                        .on_hover_text(format!("Legfeljebb {cap:.0} µs: egy képkocka ideje {:.1} fps-nél.", c.frame_rate));
                     ui.end_row();
-                    ui.label("Erősítés");
-                    ui.add(egui::DragValue::new(&mut c.gain_db).range(gain.0..=gain.1).speed(0.1).suffix(" dB"));
-                    ui.end_row();
+                    if g1 > g0 {
+                        ui.label("Erősítés");
+                        ui.add(egui::Slider::new(&mut c.gain_db, g0..=g1).max_decimals(1).suffix(" dB").update_while_editing(false));
+                        ui.end_row();
+                    }
                 }
             });
         });
@@ -1926,29 +2040,40 @@ impl App {
         section(ui, "Felvétel és export", true, |ui| {
             grid(ui, "rec", |ui| {
                 let e = &mut self.edit;
+                let f = e.camera.pixel_format;
                 ui.label("Kódoló");
-                let label = encoder::PROFILES.iter().find(|p| p.id == e.recording.encoder).map_or("auto (veszteségmentes)", |p| p.label);
-                egui::ComboBox::from_id_salt("encoder").width(320.0).selected_text(label).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut e.recording.encoder, "auto".to_string(), "auto (veszteségmentes)");
-                    for p in encoder::available() {
-                        ui.selectable_value(&mut e.recording.encoder, p.id.to_string(), p.label);
-                    }
-                });
+                if f == PixelFormat::Mjpeg {
+                    ui.label("MJPEG: a kamera képe változatlanul kerül a fájlba");
+                } else {
+                    let label = encoder::PROFILES.iter().find(|p| p.id == e.recording.encoder).map_or("auto (veszteségmentes)", |p| p.label);
+                    egui::ComboBox::from_id_salt("encoder").width(320.0).selected_text(label).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut e.recording.encoder, "auto".to_string(), "auto (veszteségmentes)");
+                        // Only what can record this format.
+                        for p in encoder::available().into_iter().filter(|p| encoder_fits(p, f)) {
+                            ui.selectable_value(&mut e.recording.encoder, p.id.to_string(), p.label);
+                        }
+                    });
+                }
                 ui.end_row();
 
-                if e.recording.encoder == "hevc_qsv" {
+                if e.recording.encoder == "hevc_qsv" && f != PixelFormat::Mjpeg {
                     ui.label("GPU minőség");
                     ui.add(egui::Slider::new(&mut e.recording.gpu_q, 8..=30).text("q (kisebb = pontosabb)"))
                         .on_hover_text("Intel GPU HEVC minőség. q8: a legpontosabb, amit a low-power mód tud (12 bites görbés felvétel, 1080p, 120 fps: kb. 3–5 GB/perc, zaj +50–60%). Nagyobb q: kisebb fájl, nagyobb hiba.");
                     ui.end_row();
                 }
 
+                // Only 10/12-bit raw samples have a curve to choose.
+                let deep = f.is_single_channel() && f.bits() > 8;
+                if deep {
                 ui.label("8 bites görbe");
-                let deep = e.camera.pixel_format.is_single_channel() && e.camera.pixel_format.bits() > 8;
-                ui.add_enabled(deep, egui::Checkbox::new(&mut e.recording.curve8, "10/12 bites kép 8 biten, a zajhoz illesztett görbével"))
+                // The GPU encodes at most 10 bit: 12-bit samples only on the curve.
+                let forced = needs_curve(e);
+                ui.add_enabled(!forced, egui::Checkbox::new(&mut e.recording.curve8, "10/12 bites kép 8 biten, a zajhoz illesztett görbével"))
                     .on_hover_text("A teljes dinamikatartomány megmarad 8 biten: a szinteket a szenzor zajához igazítja (sötétben sűrűn, világosban ritkán), a kerekítés a zajt kb. 5%-kal növeli. Az export és a lejátszó visszaalakítja lineárisra. Fele akkora adat, mint a 16 bites tárolás.")
-                    .on_disabled_hover_text("10 vagy 12 bites Bayer/Mono formátumhoz.");
+                    .on_disabled_hover_text("A GPU-kódoló legfeljebb 10 bitet tud: 12 bites képet csak a görbével vesz fel.");
                 ui.end_row();
+                }
 
                 ui.label("Mappa");
                 let mut dir = e.recording.output_dir.display().to_string();
@@ -2179,7 +2304,10 @@ impl App {
         });
         ui.spacing_mut().slider_width = ui.available_width() - 80.0;
         let before = v.t;
-        let seek = ui.add(egui::Slider::new(&mut v.t, 0.0..=end).suffix(" s").fixed_decimals(2));
+        // Clamp only the operator's edits: clamping the playback's own time
+        // would count as a seek and restart the playback (with a missing
+        // video length: the first two pictures over and over).
+        let seek = ui.add(egui::Slider::new(&mut v.t, 0.0..=end).clamping(egui::SliderClamping::Edits).suffix(" s").fixed_decimals(2));
         // Seeking while playing: play on from there.
         if v.player.is_some() && seek.changed() && v.t != before {
             let speed = v.real_fps.map_or(1.0, |f| v.info.fps / f);
@@ -2389,8 +2517,9 @@ impl eframe::App for App {
             });
         }
         if self.page == Page::Settings {
-            // First visit with a camera: read its limits once.
-            if self.modes.as_ref().is_none_or(|(d, _)| *d != self.edit.device)
+            // A UVC camera's modes are its choices: read them once.
+            if matches!(self.edit.device, Device::Uvc { .. })
+                && self.modes.as_ref().is_none_or(|(d, _)| *d != self.edit.device)
                 && !self.limits_pending
                 && self.recording.is_none()
                 && self.test.is_none()
@@ -2460,6 +2589,50 @@ const BLUE: egui::Color32 = egui::Color32::from_rgb(30, 100, 190);
 const LABEL_W: f32 = 150.0;
 
 /// "YUYV 1280×720 · 30 fps" (largest rate).
+/// Pixel format with what it means.
+fn format_label(f: PixelFormat) -> String {
+    let kind = if f.is_bayer() {
+        "nyers színes"
+    } else if f.is_single_channel() {
+        "szürke"
+    } else if f == PixelFormat::Mjpeg {
+        "tömörített"
+    } else {
+        "színes"
+    };
+    format!("{} · {} bit, {kind}", f.name(), f.bits())
+}
+
+/// The encoder can record frames of format `f`.
+fn encoder_fits(p: &encoder::Profile, f: PixelFormat) -> bool {
+    // GPU: grey/Bayer up to 10 bit, deeper ones on the 8-bit curve.
+    !p.hardware || f.bits() <= 10 || f.is_single_channel()
+}
+
+/// A GPU encoder with 12-bit samples: only on the 8-bit curve.
+fn needs_curve(s: &Scenario) -> bool {
+    let f = s.camera.pixel_format;
+    let gpu = encoder::PROFILES.iter().any(|p| p.id == s.recording.encoder && p.hardware);
+    gpu && f.is_single_channel() && f.bits() > 10
+}
+
+/// Recording settings that follow the camera's: an encoder that cannot
+/// take the format goes back to auto, the GPU at 12 bit uses the curve.
+fn fit_recording(s: &mut Scenario) -> Option<String> {
+    let f = s.camera.pixel_format;
+    if let Some(p) = encoder::PROFILES.iter().find(|p| p.id == s.recording.encoder)
+        && !encoder_fits(p, f)
+    {
+        s.recording.encoder = "auto".into();
+        return Some(format!("{} nem tudja a {} formátumot: kódoló auto", p.label, f.name()));
+    }
+    if needs_curve(s) && !s.recording.curve8 {
+        s.recording.curve8 = true;
+        return Some("12 bites kép a GPU-val: a 8 bites görbe bekapcsolva".into());
+    }
+    None
+}
+
 fn mode_label(m: &Mode) -> String {
     format!("{} {}×{} · {} fps", m.format.name(), m.width, m.height, m.fps)
 }
@@ -2472,6 +2645,27 @@ fn set_mode(s: &mut Scenario, m: &Mode) {
     (c.width, c.height, c.offset_x, c.offset_y) = (m.width, m.height, 0, 0);
     c.frame_rate = m.fps;
     c.capture_size = (!s.device.hw_crop()).then_some((m.width, m.height));
+}
+
+/// Fit `s` to one of a UVC camera's modes: the same format and size if
+/// the camera has it (a listed frame rate), else the first mode of the
+/// same format, else its first mode. Returns what changed.
+fn fit_mode(s: &mut Scenario, modes: &[Mode]) -> Option<String> {
+    let c = &s.camera;
+    let cap = c.capture_size.unwrap_or((c.width, c.height));
+    if let Some(m) = modes.iter().find(|m| m.format == c.pixel_format && (m.width, m.height) == cap) {
+        let ok = if m.rates.is_empty() { c.frame_rate > 0.0 && c.frame_rate <= m.fps + 1e-3 } else { m.rates.iter().any(|r| (r - c.frame_rate).abs() < 1e-3) };
+        if ok {
+            return None;
+        }
+        let old = c.frame_rate;
+        s.camera.frame_rate = m.fps;
+        return Some(format!("{old} fps helyett {} fps (a kamera ezzel a móddal ezt adja)", m.fps));
+    }
+    let m = modes.iter().find(|m| m.format == c.pixel_format).or(modes.first())?;
+    let old = format!("{} {}×{}", c.pixel_format.name(), cap.0, cap.1);
+    set_mode(s, m);
+    Some(format!("{old} helyett {} (a kamera saját módja)", mode_label(m)))
 }
 
 /// Highest frame rate that passed the recording test for this mode.
@@ -2735,7 +2929,7 @@ fn export_editor(ui: &mut egui::Ui, x: &mut ExportSettings, id: &str) {
 type Shot = (&'static str, fn(&mut App));
 
 /// Screenshot steps on the simulated camera.
-const SHOTS: [Shot; 6] = [
+const SHOTS: [Shot; 7] = [
     ("1_fooldal", |a| a.page = Page::Main),
     ("2_fooldal_felvetel", |a| {
         a.rec_name = "_kepernyokep".into();
@@ -2748,6 +2942,8 @@ const SHOTS: [Shot; 6] = [
         }
     }),
     ("5_beallitasok", |a| a.page = Page::Settings),
+    // More than the camera can: the window fits it and says so.
+    ("5b_tul_nagy_fps", |a| a.edit.camera.frame_rate = 1000.0),
     ("6_felvetel_lejatszasa", |a| {
         a.page = Page::Main;
         a.refresh_recordings();
@@ -2761,7 +2957,7 @@ const SHOTS: [Shot; 6] = [
 ];
 
 /// Walk on the real camera (`screenshots DIR camera`).
-const CAMERA_SHOTS: [Shot; 18] = [
+const CAMERA_SHOTS: [Shot; 20] = [
     ("01_fooldal", |a| a.page = Page::Main),
     ("02_fooldal_kivagas", |a| a.crop_centre(960.0, 540.0)),
     ("03_felvetel", |a| {
@@ -2798,6 +2994,15 @@ const CAMERA_SHOTS: [Shot; 18] = [
         }
     }),
     ("09_beallitasok_hatarok", |a| a.page = Page::Settings),
+    // More than the camera can: fitted at once, with a note.
+    ("09b_formatumvaltas_1000_fps", |a| {
+        a.edit.camera.pixel_format = PixelFormat::BayerRG8;
+        a.edit.camera.frame_rate = 1000.0;
+    }),
+    ("09c_kezi_expozicio_1_s", |a| {
+        a.edit.camera.auto_exposure = false;
+        a.edit.camera.exposure_us = 1_000_000.0;
+    }),
     ("10_beallitasok_kivagas", |a| a.crop_centre(1920.0, 480.0)),
     ("11_atlagolas", |a| {
         if let Some(s) = a.engine.scenario.as_mut() {
@@ -2825,6 +3030,49 @@ const CAMERA_SHOTS: [Shot; 18] = [
         }
     }),
     ("16_vege", |a| a.page = Page::Main),
+];
+
+/// Walk on the first UVC camera (`screenshots DIR uvc`): from the
+/// simulated camera to the webcam in the settings window, its modes, a
+/// recording and its playback. The recording (`_uvcteszt`) is kept.
+const UVC_SHOTS: [Shot; 10] = [
+    ("u01_beallitasok_sim", |a| a.page = Page::Settings),
+    ("u02_eszkoz_uvc", |a| {
+        if let Some(d) = a.devices.iter().find(|d| matches!(d, Device::Uvc { .. })).cloned() {
+            a.edit.device = d;
+        }
+    }),
+    ("u03_modok", |_| {}),
+    ("u04_masik_mod", |a| {
+        let modes = a.known_modes().to_vec();
+        if let Some(m) = modes.iter().rev().find(|m| m.format != a.edit.camera.pixel_format || m.width != a.edit.camera.width) {
+            set_mode(&mut a.edit, m);
+        }
+    }),
+    ("u05_kisebb_fps", |a| {
+        let cap = a.edit.camera.capture_size.unwrap_or((a.edit.camera.width, a.edit.camera.height));
+        let fmt = a.edit.camera.pixel_format;
+        if let Some(r) = a.known_modes().iter().find(|m| m.format == fmt && (m.width, m.height) == cap).and_then(|m| m.rates.iter().copied().reduce(f64::min)) {
+            a.edit.camera.frame_rate = r;
+        }
+    }),
+    ("u06_kivagas", |a| a.crop_centre(320.0, 240.0)),
+    ("u07_felvetel", |a| {
+        a.rec_name = "_uvcteszt".into();
+        a.start_recording();
+    }),
+    ("u08_leallitva", |a| a.stop_recording()),
+    ("u09_lejatszas", |a| {
+        a.page = Page::Main;
+        a.refresh_recordings();
+        if let Some(r) = a.rec.list.iter().find(|r| r.video.to_string_lossy().contains("_uvcteszt") && !r.export) {
+            let v = r.video.clone();
+            a.rec.expanded = Some(v.clone());
+            a.open_viewer(v);
+            a.play(true);
+        }
+    }),
+    ("u10_vege", |a| a.page = Page::Settings),
 ];
 
 /// How long each screenshot step runs before the picture (preview, decode).

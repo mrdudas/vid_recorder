@@ -37,6 +37,74 @@ pub struct Geometry {
     pub step: [u32; 4],
 }
 
+/// What the camera allows around its applied settings, read at every
+/// `apply` (GenICam computes each feature's range from the others). The
+/// settings window offers exactly this, so it cannot ask for what the
+/// camera refuses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ranges {
+    /// Formats the camera has (and we can record).
+    pub formats: Vec<PixelFormat>,
+    /// Highest frame rate with the applied format and size, at the shortest
+    /// exposure (USB link included).
+    pub max_fps: f64,
+    pub exposure_us: (f64, f64),
+    pub gain_db: (f64, f64),
+}
+
+/// Longest exposure that keeps the frame rate: 95% of the frame period.
+pub fn exposure_cap(r: &Ranges, fps: f64) -> f64 {
+    r.exposure_us.1.min(1e6 / fps * 0.95).max(r.exposure_us.0)
+}
+
+/// Snap the crop to the camera's steps and limits; notes say what changed.
+pub fn fit_crop(s: &mut CameraSettings, g: &Geometry) -> Vec<String> {
+    let before = (s.width, s.height, s.offset_x, s.offset_y);
+    let down = |v: u32, st: u32| v / st.max(1) * st.max(1);
+    let (sw, sh) = (down(g.sensor.0, g.step[0]), down(g.sensor.1, g.step[1]));
+    s.width = down(s.width, g.step[0]).clamp(g.min_size.0.min(sw), sw);
+    s.height = down(s.height, g.step[1]).clamp(g.min_size.1.min(sh), sh);
+    s.offset_x = down(s.offset_x, g.step[2]).min(down(g.sensor.0 - s.width, g.step[2]));
+    s.offset_y = down(s.offset_y, g.step[3]).min(down(g.sensor.1 - s.height, g.step[3]));
+    if (s.width, s.height, s.offset_x, s.offset_y) == before {
+        return Vec::new();
+    }
+    vec![format!("kivágás a kamera lépésközeihez igazítva: {}×{} ({}, {})", s.width, s.height, s.offset_x, s.offset_y)]
+}
+
+/// Frame rate, exposure and gain into the ranges, in this order: the
+/// frame rate first, the exposure fits into its frame period.
+pub fn fit_light(s: &mut CameraSettings, r: &Ranges) -> Vec<String> {
+    let mut notes = Vec::new();
+    if s.frame_rate > r.max_fps + 1e-3 {
+        // Rounding differences silently, real changes with a note.
+        if s.frame_rate - r.max_fps >= 0.05 {
+            notes.push(format!("{:.1} fps helyett {:.1}: ennyi a legtöbb ezzel a formátummal és kivágással", s.frame_rate, r.max_fps));
+        }
+        s.frame_rate = r.max_fps;
+    }
+    s.frame_rate = s.frame_rate.max(1.0);
+    let cap = exposure_cap(r, s.frame_rate);
+    let lo = r.exposure_us.0;
+    if s.auto_exposure {
+        let (a, b) = s.auto_exposure_range;
+        s.auto_exposure_range = (a.clamp(lo, cap), b.clamp(lo, cap).max(a.clamp(lo, cap)));
+        if b > cap + 0.5 && b < 999_999.0 {
+            notes.push(format!("automatikus expozíció legfeljebb {cap:.0} µs (egy képkocka ideje)"));
+        }
+    } else if s.exposure_us > cap + 0.5 || s.exposure_us < lo {
+        notes.push(format!("expozíció {:.0} µs helyett {:.0} µs (egy képkocka ideje)", s.exposure_us, s.exposure_us.clamp(lo, cap)));
+        s.exposure_us = s.exposure_us.clamp(lo, cap);
+    }
+    let (g0, g1) = r.gain_db;
+    if g1 > g0 {
+        s.gain_db = s.gain_db.clamp(g0, g1);
+        let (a, b) = s.auto_gain_range;
+        s.auto_gain_range = (a.clamp(g0, g1), b.clamp(g0, g1).max(a.clamp(g0, g1)));
+    }
+    notes
+}
+
 /// What the camera allows, read from it in well under a second instead of
 /// trying settings one by one.
 #[derive(Clone, Debug)]
@@ -80,6 +148,16 @@ pub trait Camera: Send {
     fn max_fps(&self) -> Option<f64> {
         None
     }
+    /// Ranges read at the last `apply`; `None`: the camera does not tell
+    /// (UVC: its modes are the choices).
+    fn ranges(&self) -> Option<Ranges> {
+        None
+    }
+    /// Adjust `s` to what the camera allows (format, crop, frame rate,
+    /// exposure, gain); notes say what changed. Only while not streaming.
+    fn fit(&mut self, _s: &mut CameraSettings) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
     /// Geometry read at the last `apply`.
     fn geometry(&self) -> Option<Geometry> {
         None
@@ -116,6 +194,24 @@ pub fn open(device: &Device) -> Result<Box<dyn Camera>, String> {
     })
 }
 
+/// The simulated sensor, like the Alvium 1800 U-291c.
+const SIM_GEOMETRY: Geometry = Geometry { sensor: (1936, 1216), min_size: (8, 8), step: [8, 2, 8, 8] };
+
+/// Like the Alvium: ~155 fps at 1080 lines (8/10 bit), 120 at 12 bit,
+/// faster with fewer lines.
+fn sim_ranges(s: &CameraSettings) -> Ranges {
+    let full = if s.pixel_format.bits() > 10 { 120.0 } else { 155.0 };
+    Ranges {
+        formats: PixelFormat::ALL
+            .into_iter()
+            .filter(|f| !matches!(f, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12 | PixelFormat::Mjpeg))
+            .collect(),
+        max_fps: (full * 1080.0 / s.height.max(8) as f64).min(1000.0).floor(),
+        exposure_us: (10.0, 10_000_000.0),
+        gain_db: (0.0, 48.0),
+    }
+}
+
 /// Generates a moving test pattern at the configured frame rate with
 /// sequential ids and nanosecond timestamps, like a real camera.
 pub struct SimCamera {
@@ -144,6 +240,27 @@ impl Camera for SimCamera {
         }
         self.settings = Some(s.clone());
         Ok(())
+    }
+
+    fn ranges(&self) -> Option<Ranges> {
+        let s = self.settings.as_ref()?;
+        Some(sim_ranges(s))
+    }
+
+    fn geometry(&self) -> Option<Geometry> {
+        Some(SIM_GEOMETRY)
+    }
+
+    fn fit(&mut self, s: &mut CameraSettings) -> Result<Vec<String>, String> {
+        let mut notes = Vec::new();
+        let r = sim_ranges(s);
+        if !r.formats.contains(&s.pixel_format) {
+            notes.push(format!("{} helyett BayerRG8: a kamera nem tudja", s.pixel_format.name()));
+            s.pixel_format = PixelFormat::BayerRG8;
+        }
+        notes.extend(fit_crop(s, &SIM_GEOMETRY));
+        notes.extend(fit_light(s, &sim_ranges(s)));
+        Ok(notes)
     }
 
     /// Like the Alvium 1800 U-291c the project uses.

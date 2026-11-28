@@ -259,12 +259,23 @@ pub fn media_info(path: &Path) -> Result<MediaInfo, String> {
     Ok(MediaInfo {
         width: num("width").ok_or_else(|| format!("{}: nem videó", path.display()))? as u32,
         height: num("height").unwrap_or(0.0) as u32,
-        duration: num("duration").unwrap_or(0.0),
+        duration: num("duration").filter(|d| *d > 0.0).or_else(|| packet_count(path).map(|n| n as f64 / fps)).unwrap_or(0.0),
         fps,
         pix_fmt: field("pix_fmt").unwrap_or_default(),
         format: field("TAG:PIXEL_FORMAT").and_then(|t| PixelFormat::ALL.into_iter().find(|f| f.name() == t)),
         curve: field("TAG:CURVE").as_deref() == Some(crate::curve::TAG),
     })
+}
+
+/// Frames in the file, counted by reading it through: for a file without a
+/// length in its header (recording not closed properly).
+fn packet_count(path: &Path) -> Option<u64> {
+    let out = Command::new(ffprobe_path())
+        .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// One decoded frame: raw camera samples (grey / Bayer recordings, shown

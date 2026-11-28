@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::camera::{self, Camera, Geometry, Limits, Mode};
+use crate::camera::{self, Camera, Geometry, Limits, Mode, Ranges};
 use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::recorder::{RecStats, Recorder};
 use crate::scenario::{Device, Scenario};
@@ -342,6 +342,47 @@ impl Engine {
     /// for `s`. The camera stays stopped until the next `apply`.
     pub fn limits(&mut self, s: &Scenario) -> Result<Limits, String> {
         self.stopped_camera(s)?.limits(&s.camera)
+    }
+
+    /// Fit `s` to what its camera allows (notes say what changed), then
+    /// apply it. The settings window uses this: it never asks the camera
+    /// for something it refuses. A missing camera: applied as it is (the
+    /// engine waits for it).
+    pub fn apply_fit(&mut self, s: &mut Scenario) -> Result<Vec<String>, String> {
+        if self.is_recording() {
+            return Err("cannot change scenario while recording".into());
+        }
+        let notes = match self.stopped_camera(s) {
+            Ok(cam) => match cam.fit(&mut s.camera) {
+                Ok(n) => n,
+                Err(e) => {
+                    // A refused write locks the Alvium: reopen it.
+                    if e.contains("I/O error") {
+                        self.camera = None;
+                    }
+                    vec![format!("a kamera határai nem olvashatók: {e}")]
+                }
+            },
+            Err(_) => Vec::new(),
+        };
+        self.apply(s)?;
+        Ok(notes)
+    }
+
+    /// Settings that do not touch the camera (name, recording, export,
+    /// preview): taken over without a restart.
+    pub fn update_meta(&mut self, s: &Scenario) {
+        if let Some(a) = self.scenario.as_mut()
+            && a.device == s.device
+            && a.camera == s.camera
+        {
+            *a = s.clone();
+        }
+    }
+
+    /// What the active camera allows around its settings (see [`Ranges`]).
+    pub fn ranges(&self) -> Option<Ranges> {
+        self.camera.as_ref().and_then(|(_, c)| c.ranges())
     }
 
     /// Sensor size, smallest size and steps of the active camera.
