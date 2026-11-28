@@ -177,6 +177,21 @@ pub fn available() -> &'static [&'static Profile] {
     })
 }
 
+/// Encoder for the corrected picture (10-bit YUV 4:2:0): "auto" takes the
+/// first working hardware encoder, else the first lossless 10-bit one.
+pub fn resolve_corrected(id: &str) -> Result<&'static Profile, String> {
+    let avail = available();
+    if id == "auto" {
+        return avail
+            .iter()
+            .find(|p| p.hardware)
+            .or_else(|| avail.iter().find(|p| p.lossless_bits >= 10))
+            .copied()
+            .ok_or_else(|| format!("no working encoder (ffmpeg: {})", ffmpeg_path().display()));
+    }
+    avail.iter().find(|p| p.id == id).copied().ok_or_else(|| format!("encoder {id} is not available on this machine"))
+}
+
 /// Resolve "auto" or a profile id to a usable profile for `format`.
 /// MJPEG is always copied unchanged.
 pub fn resolve(id: &str, format: PixelFormat) -> Result<&'static Profile, String> {

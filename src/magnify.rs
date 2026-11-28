@@ -329,7 +329,7 @@ struct PhaseLevel {
 /// pyramid, band-passed in time, smoothed in space (amplitude-weighted) and
 /// multiplied; the finest level is left alone (noise).
 pub struct Phase {
-    bands: Vec<Band>,
+    pub(crate) bands: Vec<Band>,
     levels: Vec<PhaseLevel>,
     /// Leaky integration of the phase keeps it bounded (high-pass at a
     /// tenth of the lowest band edge).
@@ -374,8 +374,11 @@ impl Phase {
                 let qx = -re.d[i] * p1.d[i] + pr.d[i] * r1.d[i];
                 let qy = -re.d[i] * p2.d[i] + pr.d[i] * r2.d[i];
                 let qamp = (qr * qr + qx * qx + qy * qy).sqrt() + 1e-9;
-                let dphi = (qr / qamp).clamp(-1.0, 1.0).acos();
-                let nrm = (qx * qx + qy * qy).sqrt() + 1e-9;
+                // acos(qr / |q|), well conditioned also near 0 (where acos
+                // turns tiny rounding differences into large angles).
+                let v = (qx * qx + qy * qy).sqrt();
+                let dphi = v.atan2(qr);
+                let nrm = v + 1e-9;
                 ph[0] = leak * ph[0] + dphi * qx / nrm;
                 ph[1] = leak * ph[1] + dphi * qy / nrm;
                 *amp = qamp.sqrt();
@@ -412,11 +415,11 @@ impl Phase {
 /// Laplacian level; the finest level is skipped and the next one halved
 /// (noise).
 pub struct Linear {
-    bands: Vec<Band>,
+    pub(crate) bands: Vec<Band>,
     filters: Vec<Vec<BandPass>>,
 }
 
-const LINEAR_WEIGHT: [f32; LEVELS + 1] = [0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+pub const LINEAR_WEIGHT: [f32; LEVELS + 1] = [0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
 
 impl Linear {
     pub fn band_count(&self) -> usize {

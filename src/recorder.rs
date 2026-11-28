@@ -17,6 +17,8 @@ use std::thread::JoinHandle;
 
 use crate::encoder::{self, Profile};
 use crate::frame::{BufferPool, Frame, PixelFormat};
+use crate::gpu_view::{self, Converter, Gpu, Look};
+use std::collections::VecDeque;
 
 /// Memory the recording queue may hold before frames are dropped.
 pub const QUEUE_BUDGET_BYTES: usize = 2 << 30;
@@ -48,6 +50,8 @@ pub struct Recorder {
 impl Recorder {
     /// Create `<dir>/<name>.mkv` (`.nut` for uncompressed) and `<dir>/<name>.csv`. ffmpeg starts with the
     /// first frame, so the stream format always matches the actual frames.
+    /// With `look` the corrected picture is recorded (every frame through
+    /// the live view's shader on the GPU), else the raw sensor data.
     pub fn start(
         dir: &Path,
         name: &str,
@@ -58,10 +62,12 @@ impl Recorder {
         frame_bytes: usize,
         fps: f64,
         pool: BufferPool,
+        look: Option<Arc<Mutex<Look>>>,
     ) -> Result<Recorder, String> {
         // Fail early if nothing can encode the requested format; the encoder
         // is chosen again from the first frame's actual format.
-        let container = encoder::resolve(encoder_id, format)?.container;
+        let gpu = if look.is_some() { Some(Gpu::headless()?) } else { None };
+        let container = if look.is_some() { encoder::resolve_corrected(encoder_id)? } else { encoder::resolve(encoder_id, format)? }.container;
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let video_path = dir.join(format!("{name}.{container}"));
         let csv_path = dir.join(format!("{name}.csv"));
@@ -86,7 +92,11 @@ impl Recorder {
             ffmpeg: None,
             dead: false,
             gpu_q,
-            curve: (curve8 && format.bits() > 8).then(|| (crate::curve::encode_table(format.bits()), Vec::new())),
+            curve: (look.is_none() && curve8 && format.bits() > 8).then(|| (crate::curve::encode_table(format.bits()), Vec::new())),
+            look,
+            gpu,
+            conv: None,
+            meta: VecDeque::new(),
         };
         let thread = std::thread::Builder::new()
             .name("recorder".into())
@@ -142,6 +152,12 @@ struct Writer {
     dead: bool,
     /// 10/12 -> 8 bit curve table and the converted frame.
     curve: Option<(Vec<u8>, Vec<u8>)>,
+    /// Corrected recording: the look, the GPU, the frames in flight and
+    /// their timestamps and IDs (written to the CSV when they come back).
+    look: Option<Arc<Mutex<Look>>>,
+    gpu: Option<Arc<Gpu>>,
+    conv: Option<Converter>,
+    meta: VecDeque<(u64, u64)>,
 }
 
 impl Writer {
@@ -151,6 +167,15 @@ impl Writer {
                 self.fail(e);
             }
             self.pool.put(frame.data);
+        }
+        // Frames still on the GPU.
+        if let Some(mut conv) = self.conv.take() {
+            while let Some(r) = conv.take() {
+                if let Err(e) = r.and_then(|d| self.emit(d)) {
+                    self.fail(e);
+                    break;
+                }
+            }
         }
         if let Err(e) = self.csv.flush() {
             self.fail(format!("csv: {e}"));
@@ -180,6 +205,18 @@ impl Writer {
         if self.dead {
             return Ok(()); // never restart ffmpeg over the same file
         }
+        if let Some(gpu) = &self.gpu {
+            if self.conv.is_none() {
+                self.conv = Some(Converter::new(gpu.clone(), f).ok_or_else(|| format!("{} kép nem alakítható", f.format.name()))?);
+            }
+            if self.ffmpeg.is_none() {
+                self.ffmpeg = Some(self.spawn_ffmpeg(f)?);
+            }
+            let mut conv = self.conv.take().unwrap();
+            let r = self.convert(&mut conv, f);
+            self.conv = Some(conv);
+            return r;
+        }
         if self.ffmpeg.is_none() {
             self.ffmpeg = Some(self.spawn_ffmpeg(f)?);
         }
@@ -194,16 +231,50 @@ impl Writer {
         };
         let (_, stdin) = self.ffmpeg.as_mut().unwrap();
         if let Err(e) = stdin.write_all(data) {
-            // ffmpeg quit: its own message tells why.
-            let (child, stdin) = self.ffmpeg.take().unwrap();
-            drop(stdin);
-            let why = child.wait_with_output().map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string()).unwrap_or_default();
-            self.dead = true;
-            return Err(format!("ffmpeg input: {e}: {why}"));
+            return Err(self.died(e));
         }
         writeln!(self.csv, "{},{}", f.timestamp_ns, f.id).map_err(|e| format!("csv: {e}"))?;
         self.stats.written.fetch_add(1, Relaxed);
         Ok(())
+    }
+
+    /// Send `f` to the GPU; write out the oldest corrected frames first if
+    /// all slots are busy.
+    fn convert(&mut self, conv: &mut Converter, f: &Frame) -> Result<(), String> {
+        while conv.full() {
+            match conv.take() {
+                Some(r) => self.emit(r?)?,
+                None => break,
+            }
+        }
+        let (table, cube) = self.look.as_ref().unwrap().lock().unwrap().tables();
+        conv.submit(f, &table, cube.as_ref())?;
+        self.meta.push_back((f.timestamp_ns, f.id));
+        Ok(())
+    }
+
+    /// A corrected frame to ffmpeg, its line to the CSV.
+    fn emit(&mut self, data: &[u8]) -> Result<(), String> {
+        let (ts, id) = self.meta.pop_front().ok_or("GPU: több kép jött vissza, mint amennyi ment")?;
+        if self.dead {
+            return Ok(());
+        }
+        let (_, stdin) = self.ffmpeg.as_mut().ok_or("ffmpeg nem fut")?;
+        if let Err(e) = stdin.write_all(data) {
+            return Err(self.died(e));
+        }
+        writeln!(self.csv, "{ts},{id}").map_err(|e| format!("csv: {e}"))?;
+        self.stats.written.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    /// ffmpeg quit: its own message tells why.
+    fn died(&mut self, e: std::io::Error) -> String {
+        let (child, stdin) = self.ffmpeg.take().unwrap();
+        drop(stdin);
+        let why = child.wait_with_output().map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string()).unwrap_or_default();
+        self.dead = true;
+        format!("ffmpeg input: {e}: {why}")
     }
 
     fn spawn_ffmpeg(&self, f: &Frame) -> Result<(Child, ChildStdin), String> {
@@ -211,6 +282,9 @@ impl Writer {
             let note = format!("a kamera {}-t ad (kért: {})", f.format.name(), self.requested.name());
             eprintln!("note: {note}");
             *self.stats.format_note.lock().unwrap() = Some(note);
+        }
+        if let Some(conv) = &self.conv {
+            return self.spawn_corrected(f, conv.size());
         }
         let encoder: &Profile = encoder::resolve(&self.encoder_id, f.format)?;
         *self.stats.encoder.lock().unwrap() = Some(encoder.label);
@@ -256,6 +330,38 @@ impl Writer {
             // Bayer is stored as grey; the tag tells the export what it is.
             .args(["-metadata:s:v:0", &format!("PIXEL_FORMAT={}", f.format.name())])
             .args(if self.curve.is_some() { vec!["-metadata:s:v:0".to_string(), format!("CURVE={}", crate::curve::TAG)] } else { vec![] })
+            .arg("-y")
+            .arg(&self.video_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot start ffmpeg ({}): {e}", encoder::ffmpeg_path().display()))?;
+        let stdin = child.stdin.take().unwrap();
+        Ok((child, stdin))
+    }
+
+    /// ffmpeg for the corrected picture: P010 in (10-bit 4:2:0, BT.709,
+    /// full range, sRGB curve), tagged `LOOK=corrected`.
+    fn spawn_corrected(&self, f: &Frame, (w, h): (u32, u32)) -> Result<(Child, ChildStdin), String> {
+        let encoder: &Profile = encoder::resolve_corrected(&self.encoder_id)?;
+        *self.stats.encoder.lock().unwrap() = Some(encoder.label);
+        let mut cmd = encoder::low_priority(&encoder::ffmpeg_path());
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+            // The colour tags on the input: as output options ffmpeg would
+            // insert a software conversion (~3 cores at 1072×1074, 120 fps).
+            .args(["-f", "rawvideo", "-pix_fmt", "p010le", "-color_range", "pc", "-colorspace", "bt709"])
+            .args(["-color_primaries", "bt709", "-color_trc", "iec61966-2-1"])
+            .args(["-video_size", &format!("{w}x{h}"), "-framerate", &format!("{}", self.fps), "-i", "pipe:0"]);
+        if encoder.hardware {
+            cmd.args(["-profile:v", "main10"]);
+        }
+        let mut child = cmd
+            .args(encoder.args.iter().enumerate().map(|(i, a)| {
+                if i > 0 && encoder.args[i - 1] == "-q" { self.gpu_q.to_string() } else { a.to_string() }
+            }))
+            .args(["-metadata:s:v:0", &format!("LOOK={}", gpu_view::LOOK_TAG)])
+            .args(["-metadata:s:v:0", &format!("SOURCE_FORMAT={}", f.format.name())])
             .arg("-y")
             .arg(&self.video_path)
             .stdin(Stdio::piped())

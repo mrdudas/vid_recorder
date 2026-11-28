@@ -17,12 +17,18 @@ use crate::recordings::{self, ExportSettings, Job, JobState, MediaInfo, Recordin
 use crate::scenario::{self, Device, Scenario, View};
 use crate::dark::{self, Dark};
 use crate::stack::{self, Stacker};
+use crate::gpu_view;
 
-/// Loaded preview LUT: file name, LUT, 8-bit grey fast-path table.
+/// Loaded preview LUT: file name and LUT.
 struct PreviewLut {
     name: String,
-    lut: Lut,
-    gray: Vec<[u8; 3]>,
+    lut: std::sync::Arc<Lut>,
+}
+
+/// A decoded recording frame ready for the GPU: samples and 1D table.
+struct Pic {
+    src: gpu_view::Source<'static>,
+    table: std::sync::Arc<Vec<f32>>,
 }
 
 /// Preview images are downscaled to at most this width.
@@ -77,8 +83,8 @@ struct Viewer {
     t: f64,
     /// Time of the frame on screen / being decoded.
     shown: Option<f64>,
-    busy: Option<std::sync::mpsc::Receiver<Result<egui::ColorImage, String>>>,
-    texture: Option<egui::TextureHandle>,
+    busy: Option<std::sync::mpsc::Receiver<Result<Pic, String>>>,
+    picture: Option<gpu_view::Picture>,
     error: Option<String>,
     /// Real frame rate from the timestamp CSV (the container's may differ).
     real_fps: Option<f64>,
@@ -89,7 +95,7 @@ struct Viewer {
 /// Plays a video at 25 pictures per second of real time: ffmpeg decodes on
 /// a worker thread, which paces the pictures.
 struct Player {
-    rx: std::sync::mpsc::Receiver<(f64, Result<egui::ColorImage, String>)>,
+    rx: std::sync::mpsc::Receiver<(f64, Result<Pic, String>)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -118,7 +124,7 @@ impl Player {
                 if let Some(w) = due.checked_duration_since(Instant::now()) {
                     std::thread::sleep(w);
                 }
-                if tx.send((t0 + n as f64 / rate, f.and_then(still_image))).is_err() {
+                if tx.send((t0 + n as f64 / rate, f.and_then(still_pic))).is_err() {
                     break;
                 }
                 n += 1;
@@ -164,15 +170,13 @@ pub struct App {
     probe_results: Vec<(Scenario, Verdict)>,
     probe_base: Option<Scenario>,
     message: String,
-    texture: Option<egui::TextureHandle>,
+    /// The GPU pipeline (wgpu renderer) and the live picture on it.
+    gpu: Option<std::sync::Arc<gpu_view::Gpu>>,
+    picture: Option<gpu_view::Picture>,
     lut_dir: PathBuf,
     lut: Option<PreviewLut>,
     /// Cameras offered on the settings page (refreshed on request).
     devices: Vec<Device>,
-    /// Smoothed auto white balance gains (R, G, B) for the preview.
-    wb_gains: [f32; 3],
-    /// Smoothed auto-levels black and white points (0..1) for the preview.
-    levels: (f32, f32),
     /// Camera limits for the device they were read from (or why not).
     limits: Option<(Device, Result<Limits, String>)>,
     /// Read the limits on the next frame (after the message is shown).
@@ -189,6 +193,8 @@ pub struct App {
     crop_drag: Option<CropDrag>,
     /// Camera target brightness while its slider is dragged.
     light_drag: Option<f64>,
+    /// Exposure and gain while their sliders are dragged (by hand).
+    sensor_drag: Option<(f64, f64)>,
     rec: RecPage,
     /// Screenshot mode (`vid_recorder screenshots`).
     shots: Option<Shots>,
@@ -321,12 +327,11 @@ impl App {
             probe_results: Vec::new(),
             probe_base: None,
             message: String::new(),
-            texture: None,
+            gpu: None,
+            picture: None,
             lut_dir,
             lut: None,
             devices: find_devices(),
-            wb_gains: [1.0; 3],
-            levels: (0.0, 1.0),
             limits: None,
             limits_pending: false,
             modes: None,
@@ -335,6 +340,7 @@ impl App {
             frame_pos: (0, 0),
             crop_drag: None,
             light_drag: None,
+            sensor_drag: None,
             rec: RecPage::default(),
             shots: None,
             last_rec: None,
@@ -355,6 +361,12 @@ impl App {
         app
     }
 
+    /// Draw the pictures on the GPU (the wgpu renderer of eframe).
+    pub fn with_gpu(mut self, rs: Option<&eframe::egui_wgpu::RenderState>) -> Self {
+        self.gpu = rs.map(gpu_view::Gpu::new);
+        self
+    }
+
     /// Screenshot mode: every scenario runs on the simulated camera (not
     /// saved), the pages are walked through and saved as PNG into `dir`.
     /// With `camera` the scenarios' own cameras are used and a longer walk
@@ -367,10 +379,11 @@ impl App {
             }
             self.edit.device = Device::Sim;
         }
+        let steps: &'static [Shot] = if uvc { &UVC_SHOTS } else if camera { &CAMERA_SHOTS } else { &SHOTS };
+        // Set first: a walk must not change the active scenario on disk.
+        self.shots = Some(Shots { dir, steps, cleanup: !camera && !uvc, step: 0, started: None, pending: None });
         let first = self.scenarios[0].clone();
         self.apply(&first);
-        let steps: &'static [Shot] = if uvc { &UVC_SHOTS } else if camera { &CAMERA_SHOTS } else { &SHOTS };
-        self.shots = Some(Shots { dir, steps, cleanup: !camera && !uvc, step: 0, started: None, pending: None });
         self
     }
 
@@ -446,6 +459,33 @@ impl App {
         if let Some(a) = &self.engine.scenario {
             s.view = a.view.clone();
         }
+        // Exposure and gain by hand, or the program's loop settings: to the
+        // streaming camera, no restart. Under the program's loop exposure
+        // and gain are its own.
+        if let Some(a) = self.engine.scenario.clone()
+            && a.device == s.device
+            && !a.camera.auto_exposure
+            && !s.camera.auto_exposure
+            && a.camera.program == s.camera.program
+            && light_only(&a.camera, &s.camera)
+        {
+            if s.camera.program {
+                (s.camera.exposure_us, s.camera.gain_db) = (a.camera.exposure_us, a.camera.gain_db);
+            } else if (s.camera.exposure_us, s.camera.gain_db) != (a.camera.exposure_us, a.camera.gain_db) {
+                match self.engine.live_light(Some(s.camera.exposure_us), Some(s.camera.gain_db), None) {
+                    Ok((e, g, _)) => {
+                        (s.camera.exposure_us, s.camera.gain_db) = (e, g);
+                        self.message = format!("Szenzor: {e:.0} µs, {g:.1} dB");
+                    }
+                    Err(e) => self.message = format!("Szenzor: {e}"),
+                }
+            }
+            if let Some(r) = self.engine.scenario.as_mut() {
+                let c = &mut r.camera;
+                (c.metering, c.program_target, c.program_rate) = (s.camera.metering, s.camera.program_target, s.camera.program_rate);
+            }
+            self.edit.camera = s.camera.clone();
+        }
         // A UVC camera: one of its own modes. Its modes are read first
         // (on a device switch the old format and size rarely fit).
         let mut mode_note = None;
@@ -520,10 +560,7 @@ impl App {
         self.lut = None;
         if let Some(name) = wanted {
             match Lut::load(&self.lut_dir.join(&name)) {
-                Ok(lut) => {
-                    let gray = lut.gray_table();
-                    self.lut = Some(PreviewLut { name, lut, gray });
-                }
+                Ok(lut) => self.lut = Some(PreviewLut { name, lut: std::sync::Arc::new(lut) }),
                 Err(e) => {
                     self.message = format!("LUT hiba: {e}");
                     // Remember the name so the failing load is not retried every frame.
@@ -535,74 +572,63 @@ impl App {
         }
     }
 
-    fn update_preview(&mut self, ctx: &egui::Context) {
+    fn update_preview(&mut self) {
         self.sync_lut();
         if let (Some(g), Some(s)) = (self.engine.geometry(), &self.engine.scenario) {
             self.geometry = Some((s.device.clone(), g));
         }
-        if let Some(frame) = self.engine.take_preview() {
-            self.frame_size = (frame.width, frame.height);
-            if let Some(s) = &self.engine.scenario {
-                self.frame_pos = (s.camera.offset_x, s.camera.offset_y);
+        let Some(frame) = self.engine.take_preview() else { return };
+        self.frame_size = (frame.width, frame.height);
+        if let Some(s) = &self.engine.scenario {
+            self.frame_pos = (s.camera.offset_x, s.camera.offset_y);
+        }
+        let view = self.engine.scenario.as_ref().map(|s| s.view.clone()).unwrap_or_default();
+        let name = self.engine.scenario.as_ref().map_or(String::new(), |s| s.name.clone());
+        self.take_dark(&frame);
+        // The dark frame, if switched on and it fits these frames.
+        let shape = Some((frame.format, frame.width, frame.height));
+        let dark = self.dark_of(shape).filter(|d| view.dark && self.engine.scenario.as_ref().is_some_and(|s| d.check(&s.camera, shape).is_ok()));
+        // A camera frame shown as it is: borrowed until it is on the GPU.
+        let mut plain = None;
+        let src = if view.average {
+            // Restart on a new scenario or other averaging settings.
+            let settings = stack::Settings { frames: view.average_frames, align: view.align, dark: dark.is_some() };
+            if self.stack_settings.as_ref() != Some(&(name.clone(), settings)) {
+                self.stacker.reset();
+                self.stack_settings = Some((name, settings));
             }
-            let view = self.engine.scenario.as_ref().map(|s| s.view.clone()).unwrap_or_default();
-            let wb = view.auto_white_balance.then_some(self.wb_gains);
-            let levels = view.auto_levels.then_some(self.levels);
-            let tone = tone_table(&view, levels);
-            let name = self.engine.scenario.as_ref().map_or(String::new(), |s| s.name.clone());
-            self.take_dark(&frame);
-            // The dark frame, if switched on and it fits these frames.
-            let shape = Some((frame.format, frame.width, frame.height));
-            let dark = self.dark_of(shape).filter(|d| view.dark && self.engine.scenario.as_ref().is_some_and(|s| d.check(&s.camera, shape).is_ok()));
-            let img = if view.average {
-                // Restart on a new scenario or other averaging settings.
-                let settings = stack::Settings { frames: view.average_frames, align: view.align, dark: dark.is_some() };
-                if self.stack_settings.as_ref() != Some(&(name.clone(), settings)) {
-                    self.stacker.reset();
-                    self.stack_settings = Some((name, settings));
-                }
-                if let Some(f) = self.stacker.push(frame, settings, dark) {
-                    self.engine.recycle(f);
-                }
-                match self.stacker.take() {
-                    Some(avg) => image_to_color(&avg, self.lut.as_ref(), wb, &tone),
-                    None => return,
-                }
-            } else if let Some(d) = dark {
-                self.stack_settings = None;
-                let img = stack::to_image(&frame, Some(&d)).map(|i| stack::downscale(&i, PREVIEW_MAX_WIDTH));
-                self.engine.recycle(frame);
-                img.and_then(|i| image_to_color(&i, self.lut.as_ref(), wb, &tone))
-            } else {
-                self.stack_settings = None;
-                let img = to_color_image(&frame, PREVIEW_MAX_WIDTH, self.lut.as_ref(), wb, &tone);
-                self.engine.recycle(frame);
-                img
-            };
-            let Some((img, means, hist)) = img else { return };
-            // Auto-levels: 0.5 % and 99.5 % of the brightness histogram.
-            let total: u32 = hist.iter().sum();
-            let pct = |p: f32| {
-                let mut acc = 0;
-                hist.iter().position(|&h| { acc += h; acc as f32 >= p * total as f32 }).unwrap_or(255) as f32 / 255.0
-            };
-            if total > 0 {
-                let (lo, hi) = (pct(0.005), pct(0.995));
-                let hi = hi.max(lo + 0.05);
-                self.levels = (0.8 * self.levels.0 + 0.2 * lo, 0.8 * self.levels.1 + 0.2 * hi);
+            if let Some(f) = self.stacker.push(frame, settings, dark) {
+                self.engine.recycle(f);
             }
-            // Grey world: scale R and B so their means match G; smoothed
-            // over frames so the preview does not flicker.
-            if let Some([r, g, b]) = means {
-                let target = [g / r.max(1e-3), 1.0, g / b.max(1e-3)].map(|x| x.clamp(0.25, 4.0) as f32);
-                for c in 0..3 {
-                    self.wb_gains[c] = 0.8 * self.wb_gains[c] + 0.2 * target[c];
-                }
+            match self.stacker.take() {
+                Some(avg) => Some(gpu_view::Source::from_image(&avg, false)),
+                None => return,
             }
-            match &mut self.texture {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
-            }
+        } else if let Some(d) = dark {
+            self.stack_settings = None;
+            let src = stack::to_image(&frame, Some(&d)).map(|i| gpu_view::Source::from_image(&i, false));
+            self.engine.recycle(frame);
+            src
+        } else {
+            self.stack_settings = None;
+            plain = Some(frame);
+            plain.as_ref().and_then(gpu_view::Source::from_frame)
+        };
+        let Some(src) = src else { return };
+        // The engine's look (shared with a corrected recording) follows
+        // the picture: automatics, LUT and view settings in its tables.
+        let (table, cube) = self.engine.observe(&src, self.lut.as_ref().map(|l| (l.name.clone(), l.lut.clone())));
+        // The program's exposure control drives the sensor from the picture.
+        if let Err(e) = self.engine.regulate(crate::control::Measure::of(&src)) {
+            self.message = format!("Expozíció-szabályzás: {e}");
+        }
+        let Some(gpu) = self.gpu.clone() else { return };
+        let p = self.picture.get_or_insert_with(|| gpu_view::Picture::new(gpu, &src));
+        p.upload(&src);
+        p.set_look(&table, cube.as_ref());
+        drop(src);
+        if let Some(f) = plain {
+            self.engine.recycle(f);
         }
     }
 
@@ -708,7 +734,7 @@ impl App {
                     let mut on = s.view.dark;
                     if ui
                         .checkbox(&mut on, egui::RichText::new("Sötétkép levonása (szűrő)").strong())
-                        .on_hover_text("Az élőképre, az átlagolásra és a mentett képre hat. A felvétel nyers marad.")
+                        .on_hover_text("Az élőképre, az átlagolásra és a mentett képre hat, a felvételre (egyelőre) nem.")
                         .changed()
                     {
                         if let Some(a) = self.engine.scenario.as_mut() {
@@ -755,15 +781,21 @@ impl App {
     }
 
     fn view_controls(&mut self, ui: &mut egui::Ui) {
-        self.camera_light(ui);
         let Some(s) = self.engine.scenario.as_mut() else { return };
         let v = &mut s.view;
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("Megjelenítés (csak az élőkép)").strong());
+        let corrected = s.recording.corrected;
+        ui.small(if corrected { "Az élőképre és a (korrigált) felvételre hat." } else { "Csak az élőképre hat, a felvétel nyers." });
         ui.checkbox(&mut v.auto_white_balance, "Automatikus fehéregyensúly");
         ui.checkbox(&mut v.auto_levels, "Automatikus szintek");
+        if v.auto_white_balance || v.auto_levels {
+            ui.horizontal(|ui| {
+                ui.label("Automatika sebessége");
+                ui.add(egui::Slider::new(&mut v.auto_rate, 0.01..=5.0).logarithmic(true).max_decimals(2).suffix(" Hz"))
+                    .on_hover_text("Milyen gyorsan követi a fehéregyensúly és a szintek a képet. A korrigált felvételen ez a változás is látszik: a mozgás- és színnagyítás légzéssávja kb. 0,2–0,5 Hz, a pulzusé 1–2 Hz. Felvételhez 0,05 Hz alatt nem zavar.");
+            });
+        }
         ui.checkbox(&mut v.average, "Átlagolás (zajcsökkentés)")
-            .on_hover_text("Az élőkép több kép átlaga. A felvétel nyers marad; az átlagolt kép elmenthető.");
+            .on_hover_text("Az élőkép több kép átlaga, a felvételre nem hat; az átlagolt kép elmenthető.");
         if v.average {
             let mut restart = false;
             let mut save = false;
@@ -812,15 +844,28 @@ impl App {
             }
         }
         egui::Grid::new("view").num_columns(2).show(ui, |ui| {
-            ui.label("Fényerő");
-            ui.add(egui::Slider::new(&mut v.brightness, -0.5..=0.5).fixed_decimals(2));
-            ui.end_row();
-            ui.label("Kontraszt");
-            ui.add(egui::Slider::new(&mut v.contrast, 0.25..=4.0).logarithmic(true).fixed_decimals(2));
-            ui.end_row();
+            let row = |ui: &mut egui::Ui, label: &str, w: egui::Slider, tip: &str| {
+                ui.label(label);
+                ui.add(w).on_hover_text(tip);
+                ui.end_row();
+            };
+            row(ui, "Expozíció", egui::Slider::new(&mut v.exposure_ev, -3.0..=3.0).fixed_decimals(2).suffix(" EV"), "Fényérték: +1 EV kétszer világosabb. A szintek után hat.");
+            row(ui, "Színhőmérséklet", egui::Slider::new(&mut v.temperature, -1.0..=1.0).fixed_decimals(2), "Hidegebb (−) vagy melegebb (+), a fehéregyensúly után.");
+            row(ui, "Árnyalat", egui::Slider::new(&mut v.tint, -1.0..=1.0).fixed_decimals(2), "Zöldebb (−) vagy bíborabb (+).");
+            if !v.auto_levels {
+                row(ui, "Fekete pont", egui::Slider::new(&mut v.black, 0.0..=0.5).fixed_decimals(3), "Ami ez alatt van, fekete lesz (a lineáris jel arányában).");
+                row(ui, "Fehér pont", egui::Slider::new(&mut v.white, 0.05..=1.0).logarithmic(true).fixed_decimals(3), "Ami e fölött van, fehér lesz.");
+            }
+            row(ui, "Gamma", egui::Slider::new(&mut v.gamma, 0.5..=3.0).logarithmic(true).fixed_decimals(2), "1: lineáris (a szenzor jele), 2,2: olyan, mint az sRGB, világosabb árnyékok.");
+            row(ui, "Árnyékok", egui::Slider::new(&mut v.shadows, -1.0..=1.0).fixed_decimals(2), "A sötét részek felhúzása (+) vagy mélyítése (−), a fekete és a fehér marad.");
+            row(ui, "Csúcsfények", egui::Slider::new(&mut v.highlights, -1.0..=1.0).fixed_decimals(2), "A világos részek visszafogása (−) vagy kiemelése (+).");
+            row(ui, "Kontraszt", egui::Slider::new(&mut v.contrast, 0.25..=4.0).logarithmic(true).fixed_decimals(2), "A középszürke körül.");
+            row(ui, "Fényerő", egui::Slider::new(&mut v.brightness, -0.5..=0.5).fixed_decimals(2), "Hozzáadott fényerő a végén.");
+            row(ui, "Telítettség", egui::Slider::new(&mut v.saturation, 0.0..=2.0).fixed_decimals(2), "0: szürke, 1: változatlan.");
+            row(ui, "Vibrancia", egui::Slider::new(&mut v.vibrance, -1.0..=1.0).fixed_decimals(2), "A kevéssé telített színeket erősíti jobban, a már élénkeket kíméli.");
         });
-        if ui.button("Alaphelyzet").clicked() {
-            *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, ..View::default() };
+        if ui.button("Alaphelyzet").on_hover_text("Az utófeldolgozás alapértékei; az automatikák és a sebességük marad.").clicked() {
+            *v = View { auto_white_balance: v.auto_white_balance, auto_levels: v.auto_levels, auto_rate: v.auto_rate, average: v.average, average_frames: v.average_frames, align: v.align, dark: v.dark, ..View::default() };
         }
         let frames = self.engine.actual().format.map(|f| (f, self.frame_size.0, self.frame_size.1));
         if self.dark_of(frames).is_some()
@@ -829,45 +874,126 @@ impl App {
             ui.checkbox(&mut s.view.dark, "Sötétkép levonása").on_hover_text("A kamera sötétképe (Beállítások → Sötétkalibráció).");
             self.edit.view.dark = s.view.dark;
         }
-        ui.small("A megjelenítés csak az élőképre hat, a felvétel nyers marad.");
+        let corrected = self.engine.scenario.as_ref().is_some_and(|s| s.recording.corrected);
+        ui.small(if corrected {
+            "Az utófeldolgozás és a LUT a felvételre is hat (korrigált felvétel); az átlagolás és a sötétkép nem."
+        } else {
+            "A megjelenítés csak az élőképre hat, a felvétel nyers marad."
+        });
     }
 
-    /// Brightness at the source: the camera's auto exposure (longest
-    /// exposure the frame rate allows, then the least gain) aims at the
-    /// target. Applied to the camera when the slider is released.
+    /// The sensor, at the source: by hand, the camera's own automatics, or
+    /// the program's control loop. Exposure and gain by hand and the loop's
+    /// settings go to the streaming camera at once (also while recording);
+    /// switching the mode restarts it.
     fn camera_light(&mut self, ui: &mut egui::Ui) {
-        let Some(s) = self.engine.scenario.as_ref().filter(|s| s.device == Device::U3v) else { return };
+        let (Some(r), Some(s)) = (self.engine.ranges(), self.engine.scenario.clone()) else { return };
         let mut c = s.camera.clone();
         if let Some(t) = self.light_drag {
             c.auto_target = t;
         }
-        let mut commit = false;
-        ui.label(egui::RichText::new("Kamera (a forrásnál)").strong());
         let recording = self.engine.is_recording();
-        ui.vertical(|ui| {
-            commit |= ui
-                .add_enabled(!recording, egui::Checkbox::new(&mut c.auto_exposure, "automatikus expozíció"))
-                .on_hover_text("A kamera a lehető leghosszabb expozíciót használja (az fps-ből: egy képkocka ideje), és csak ha ez kevés, növeli az erősítést, a lehető legkevésbé.")
-                .changed();
-            if c.auto_exposure {
+        let mode = |c: &scenario::CameraSettings| if c.auto_exposure { 1 } else if c.program { 2 } else { 0 };
+        let mut m = mode(&c);
+        ui.add_enabled_ui(!recording, |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut m, 0, "kézi").on_hover_text("Expozíció és erősítés kézzel, élőben (felvétel közben is).");
+                ui.radio_value(&mut m, 1, "kamera").on_hover_text("A kamera saját automatikája: átlagra állít, kontrasztos jelenetnél beégeti a világos részeket.");
+                ui.radio_value(&mut m, 2, "program").on_hover_text("A program szabályzó köre: a beérkező képből méri a csúcsfényt, az átlagot és a beégést, és élőben állítja az expozíciót, majd ha kell, az erősítést.");
+            })
+            .response
+            .on_disabled_hover_text("Felvétel közben a mód nem váltható.");
+        });
+        if m != mode(&c) {
+            let mut s = s.clone();
+            (s.camera.auto_exposure, s.camera.program) = (m == 1, m == 2);
+            self.message = match self.run(s) {
+                Ok(()) => ["Szenzor: kézi", "Szenzor: a kamera automatikája", "Szenzor: a program szabályzója"][m].into(),
+                Err(e) => format!("A kamera nem fogadta el: {e}. Visszaállítva."),
+            };
+            return;
+        }
+        let cap = cam::exposure_cap(&r, c.frame_rate);
+        match m {
+            1 => {
+                let mut commit = false;
                 ui.horizontal(|ui| {
                     ui.label("Célfényerő");
                     let r = ui
                         .add(egui::Slider::new(&mut c.auto_target, 5.0..=80.0).fixed_decimals(0).suffix(" %"))
-                        .on_hover_text("Erre az átlagos fényerőre állít a kamera. Ha a világos részek beégnek, csökkentsd. A felvételre is hat.");
+                        .on_hover_text("Erre az átlagos fényerőre állít a kamera. Ha a világos részek beégnek, csökkentsd.");
                     if r.dragged() {
                         self.light_drag = Some(c.auto_target);
                     }
                     commit |= r.drag_stopped() || (r.changed() && !r.dragged());
                 });
-            } else {
-                ui.small(format!("Kézi: {:.0} µs, {:.1} dB (Beállítások)", c.exposure_us, c.gain_db));
+                if commit {
+                    self.light_drag = None;
+                    self.set_camera_light(true, c.auto_target);
+                }
             }
-        });
-        if commit {
-            self.light_drag = None;
-            self.set_camera_light(c.auto_exposure, c.auto_target);
+            0 => {
+                let (mut e, mut g) = self.sensor_drag.unwrap_or((c.exposure_us, c.gain_db));
+                let mut commit = false;
+                egui::Grid::new("sensor").num_columns(2).show(ui, |ui| {
+                    ui.label("Expozíció");
+                    let re = ui.add(egui::Slider::new(&mut e, r.exposure_us.0..=cap).logarithmic(true).max_decimals(0).suffix(" µs"));
+                    ui.end_row();
+                    ui.label("Erősítés");
+                    let rg = ui.add(egui::Slider::new(&mut g, r.gain_db.0..=r.gain_db.1).max_decimals(1).suffix(" dB"));
+                    ui.end_row();
+                    for r in [&re, &rg] {
+                        if r.dragged() {
+                            self.sensor_drag = Some((e, g));
+                        }
+                        commit |= r.drag_stopped() || (r.changed() && !r.dragged());
+                    }
+                });
+                if commit {
+                    self.sensor_drag = None;
+                    match self.engine.live_light(Some(e), Some(g), None) {
+                        Ok((e, g, _)) => {
+                            (self.edit.camera.exposure_us, self.edit.camera.gain_db) = (e, g);
+                            self.message = format!("Szenzor: {e:.0} µs, {g:.1} dB");
+                        }
+                        Err(err) => self.message = format!("Szenzor: {err}"),
+                    }
+                }
+            }
+            _ => {
+                let mut p = (c.metering, c.program_target, c.program_rate);
+                ui.horizontal(|ui| {
+                    ui.label("Mérés");
+                    for (v, label, tip) in [
+                        (scenario::Metering::Highlights, "csúcsfény", "A legvilágosabb részek (99,5%) a cél alá kerülnek: nem ég be semmi, a szenzor a lehető legtöbb fényt kapja (legkisebb zaj). A sötétebb részeket az utófeldolgozás húzza fel."),
+                        (scenario::Metering::Mean, "átlag", "Az átlagos fényerő a cél, de a csúcsfény 95% alatt marad."),
+                    ] {
+                        if ui.radio(p.0 == v, label).on_hover_text(tip).clicked() && p.0 != v {
+                            (p.0, p.1) = (v, v.default_target());
+                        }
+                    }
+                });
+                egui::Grid::new("program").num_columns(2).show(ui, |ui| {
+                    ui.label("Cél");
+                    let mut pct = p.1 * 100.0;
+                    if ui.add(egui::Slider::new(&mut pct, 5.0..=95.0).fixed_decimals(0).suffix(" %")).changed() {
+                        p.1 = pct / 100.0;
+                    }
+                    ui.end_row();
+                    ui.label("Sebesség");
+                    ui.add(egui::Slider::new(&mut p.2, 0.05..=5.0).logarithmic(true).max_decimals(2).suffix(" Hz"))
+                        .on_hover_text("Milyen gyorsan követi a fényváltozást. A felvételen is látszik: nagyításhoz lassú (≤ 0,1 Hz) vagy rögzített beállítás ajánlott.");
+                    ui.end_row();
+                });
+                if p != (c.metering, c.program_target, c.program_rate) {
+                    for x in [self.engine.scenario.as_mut().map(|s| &mut s.camera), Some(&mut self.edit.camera)].into_iter().flatten() {
+                        (x.metering, x.program_target, x.program_rate) = p;
+                    }
+                }
+                ui.small(&self.engine.control.status);
+            }
         }
+        ui.small(format!("Most: {:.0} µs · {:.1} dB · {:.1} fps", c.exposure_us, c.gain_db, c.frame_rate));
     }
 
     /// Auto exposure on/off and its target, on the running scenario.
@@ -905,11 +1031,11 @@ impl App {
     /// selection can be moved, resized by its edges and corners, or drawn
     /// anew (see `crop_to`).
     fn preview(&mut self, ui: &mut egui::Ui, sensor_view: bool, crop: Crop) {
-        let Some(t) = &self.texture else {
+        let Some(t) = &self.picture else {
             ui.centered_and_justified(|ui| ui.label(egui::RichText::new("Nincs kép").size(18.0).weak()));
             return;
         };
-        let (tex, ts) = (t.id(), t.size_vec2());
+        let ts = t.size();
         let area = ui.available_rect_before_wrap();
         let fs = egui::vec2(self.frame_size.0 as f32, self.frame_size.1 as f32);
         let geo = self.geometry();
@@ -931,8 +1057,7 @@ impl App {
         let resp = ui.allocate_rect(rect, if crop != Crop::Off { egui::Sense::drag() } else { egui::Sense::hover() });
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
-        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        painter.image(tex, egui::Rect::from_min_max(to_screen(img.min), to_screen(img.max)), uv, egui::Color32::WHITE);
+        t.paint(&painter, egui::Rect::from_min_max(to_screen(img.min), to_screen(img.max)));
         if let Some(r) = &self.recording {
             // Above the crop shading drawn later.
             let top = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("rec_badge")));
@@ -1158,7 +1283,10 @@ impl App {
         card(ui, "Felvételek", |ui| {
             egui::ScrollArea::vertical().id_salt("recordings").max_height(300.0).show(ui, |ui| self.recordings_list(ui));
         });
-        card(ui, "Élőkép", |ui| self.view_controls(ui));
+        if self.engine.ranges().is_some() {
+            card(ui, "Szenzor (a kamerában)", |ui| self.camera_light(ui));
+        }
+        card(ui, "Utófeldolgozás (GPU)", |ui| self.view_controls(ui));
         card(ui, "Részletek", |ui| self.details(ui));
         card(ui, "Rendszer", |ui| self.system_info(ui));
     }
@@ -1592,7 +1720,7 @@ impl App {
             v.player = None;
             return;
         }
-        if v.error.is_some() && v.texture.is_none() {
+        if v.error.is_some() && v.picture.is_none() {
             return;
         }
         let end = (v.info.duration - 1.0 / v.info.fps).max(0.0);
@@ -1717,7 +1845,7 @@ impl App {
             }
             // Unsaved changes of the active scenario.
             let stored = self.scenarios.iter().find(|x| x.name == self.edit.name);
-            let differs = stored.is_none_or(|x| x.camera != self.edit.camera || x.recording != self.edit.recording || x.export != self.edit.export || x.preview_lut != self.edit.preview_lut || x.device != self.edit.device);
+            let differs = stored.is_none_or(|x| camera_differs(&x.camera, &self.edit.camera) || x.recording != self.edit.recording || x.export != self.edit.export || x.preview_lut != self.edit.preview_lut || x.device != self.edit.device);
             if differs {
                 if let Some(saved) = stored.cloned()
                     && ui.button("Visszaállítás").on_hover_text("A mentett beállítások vissza a kamerára.").clicked()
@@ -1987,11 +2115,18 @@ impl App {
 
                 let cap = cam::exposure_cap(&r, c.frame_rate);
                 let (g0, g1) = r.gain_db;
-                ui.label("Automatikus");
-                ui.checkbox(&mut c.auto_exposure, "a kamera állítja")
-                    .on_hover_text("A lehető leghosszabb expozíció (legfeljebb egy képkocka ideje), és csak ha ez kevés, a legkisebb szükséges erősítés. A felvételre is hat.");
+                ui.label("Vezérlés");
+                ui.horizontal(|ui| {
+                    let mut m = if c.auto_exposure { 1 } else if c.program { 2 } else { 0 };
+                    ui.radio_value(&mut m, 0, "kézi").on_hover_text("Expozíció és erősítés kézzel; élőben, újraindítás nélkül.");
+                    ui.radio_value(&mut m, 1, "kamera")
+                        .on_hover_text("A kamera saját automatikája: a lehető leghosszabb expozíció, majd a legkisebb erősítés, az átlagos fényerőre. Kontrasztos jelenetnél beégeti a világos részeket.");
+                    ui.radio_value(&mut m, 2, "program")
+                        .on_hover_text("A program szabályzó köre: a beérkező képből méri a csúcsfényt, az átlagot és a beégést, és élőben (felvétel közben is) állítja az expozíciót, majd ha kell, az erősítést.");
+                    (c.auto_exposure, c.program) = (m == 1, m == 2);
+                });
                 ui.end_row();
-                if c.auto_exposure {
+                if c.auto_exposure || c.program {
                     ui.label("Expozíció");
                     ui.horizontal(|ui| {
                         let (lo, hi) = &mut c.auto_exposure_range;
@@ -2017,10 +2152,34 @@ impl App {
                         .on_hover_text("Nagyobb erősítés: világosabb, de zajosabb kép.");
                         ui.end_row();
                     }
-                    ui.label("Célfényerő");
-                    ui.add(egui::Slider::new(&mut c.auto_target, 5.0..=80.0).fixed_decimals(0).suffix(" %"))
-                        .on_hover_text("Erre az átlagos fényerőre állít az automatika. Ha a világos részek beégnek, csökkentsd. A kamera alapértéke kb. 50%, ez világos ablakos jelenetnél a kép ötödét beégeti; 25%-nál kb. 1%-ot.");
-                    ui.end_row();
+                    if c.auto_exposure {
+                        ui.label("Célfényerő");
+                        ui.add(egui::Slider::new(&mut c.auto_target, 5.0..=80.0).fixed_decimals(0).suffix(" %"))
+                            .on_hover_text("Erre az átlagos fényerőre állít az automatika. Ha a világos részek beégnek, csökkentsd. A kamera alapértéke kb. 50%, ez világos ablakos jelenetnél a kép ötödét beégeti; 25%-nál kb. 1%-ot.");
+                        ui.end_row();
+                    } else {
+                        ui.label("Mérés");
+                        ui.horizontal(|ui| {
+                            for (v, label) in [(scenario::Metering::Highlights, "csúcsfény (nem ég be)"), (scenario::Metering::Mean, "átlag")] {
+                                if ui.radio(c.metering == v, label).clicked() && c.metering != v {
+                                    (c.metering, c.program_target) = (v, v.default_target());
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Cél");
+                        let mut pct = c.program_target * 100.0;
+                        if ui.add(egui::Slider::new(&mut pct, 5.0..=95.0).fixed_decimals(0).suffix(" %").update_while_editing(false)).changed() {
+                            c.program_target = pct / 100.0;
+                        }
+                        ui.end_row();
+                        ui.label("Sebesség");
+                        ui.add(egui::Slider::new(&mut c.program_rate, 0.05..=5.0).logarithmic(true).max_decimals(2).suffix(" Hz").update_while_editing(false));
+                        ui.end_row();
+                        ui.label("Mérve");
+                        ui.small(&self.engine.control.status);
+                        ui.end_row();
+                    }
                 } else {
                     ui.label("Expozíció");
                     ui.add(egui::Slider::new(&mut c.exposure_us, r.exposure_us.0..=cap).logarithmic(true).max_decimals(0).suffix(" µs").update_while_editing(false))
@@ -2041,22 +2200,31 @@ impl App {
             grid(ui, "rec", |ui| {
                 let e = &mut self.edit;
                 let f = e.camera.pixel_format;
+                ui.label("Felvétel");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut e.recording.corrected, true, "korrigált kép")
+                        .on_hover_text("Amit az élőkép mutat: fehéregyensúly, szintek, LUT, fényerő, kontraszt, a GPU-n minden képre. 10 bites YUV 4:2:0, BT.709. A levágott sötét és világos rész elvész.");
+                    ui.radio_value(&mut e.recording.corrected, false, "nyers szenzoradat")
+                        .on_hover_text("A kamera képe változatlanul (Bayer/Mono, bitre pontosan, vagy a 8 bites zajgörbével).");
+                });
+                ui.end_row();
+                let corrected = e.recording.corrected;
                 ui.label("Kódoló");
-                if f == PixelFormat::Mjpeg {
+                if f == PixelFormat::Mjpeg && !corrected {
                     ui.label("MJPEG: a kamera képe változatlanul kerül a fájlba");
                 } else {
                     let label = encoder::PROFILES.iter().find(|p| p.id == e.recording.encoder).map_or("auto (veszteségmentes)", |p| p.label);
                     egui::ComboBox::from_id_salt("encoder").width(320.0).selected_text(label).show_ui(ui, |ui| {
                         ui.selectable_value(&mut e.recording.encoder, "auto".to_string(), "auto (veszteségmentes)");
                         // Only what can record this format.
-                        for p in encoder::available().into_iter().filter(|p| encoder_fits(p, f)) {
+                        for p in encoder::available().into_iter().filter(|p| corrected || encoder_fits(p, f)) {
                             ui.selectable_value(&mut e.recording.encoder, p.id.to_string(), p.label);
                         }
                     });
                 }
                 ui.end_row();
 
-                if e.recording.encoder == "hevc_qsv" && f != PixelFormat::Mjpeg {
+                if e.recording.encoder == "hevc_qsv" && (corrected || f != PixelFormat::Mjpeg) {
                     ui.label("GPU minőség");
                     ui.add(egui::Slider::new(&mut e.recording.gpu_q, 8..=30).text("q (kisebb = pontosabb)"))
                         .on_hover_text("Intel GPU HEVC minőség. q8: a legpontosabb, amit a low-power mód tud (12 bites görbés felvétel, 1080p, 120 fps: kb. 3–5 GB/perc, zaj +50–60%). Nagyobb q: kisebb fájl, nagyobb hiba.");
@@ -2065,7 +2233,7 @@ impl App {
 
                 // Only 10/12-bit raw samples have a curve to choose.
                 let deep = f.is_single_channel() && f.bits() > 8;
-                if deep {
+                if deep && !corrected {
                 ui.label("8 bites görbe");
                 // The GPU encodes at most 10 bit: 12-bit samples only on the curve.
                 let forced = needs_curve(e);
@@ -2195,14 +2363,14 @@ impl App {
     fn open_viewer(&mut self, path: PathBuf) {
         let real_fps = self.rec.list.iter().find(|r| r.video == path).and_then(|r| Some(r.frames? as f64 / r.seconds?));
         self.rec.viewer = Some(match recordings::media_info(&path) {
-            Ok(info) => Viewer { path, info, t: 0.0, shown: None, busy: None, texture: None, error: None, real_fps, player: None },
+            Ok(info) => Viewer { path, info, t: 0.0, shown: None, busy: None, picture: None, error: None, real_fps, player: None },
             Err(e) => Viewer {
                 path,
                 info: MediaInfo { width: 0, height: 0, duration: 0.0, fps: 25.0, pix_fmt: String::new(), format: None, curve: false },
                 t: 0.0,
                 shown: Some(0.0),
                 busy: None,
-                texture: None,
+                picture: None,
                 error: Some(e),
                 real_fps,
                 player: None,
@@ -2212,6 +2380,7 @@ impl App {
 
     /// The browsed video: frame, time slider and step buttons.
     fn viewer(&mut self, ui: &mut egui::Ui) {
+        let gpu = self.gpu.clone();
         let Some(v) = &mut self.rec.viewer else { return };
         // Pictures of the running playback; it ends at the end of the video.
         if let Some(p) = &v.player {
@@ -2229,11 +2398,8 @@ impl App {
             }
             if let Some((t, img)) = last {
                 match img {
-                    Ok(img) => {
-                        match &mut v.texture {
-                            Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
-                            None => v.texture = Some(ui.ctx().load_texture("viewer", img, egui::TextureOptions::LINEAR)),
-                        }
+                    Ok(pic) => {
+                        show_pic(&mut v.picture, gpu.as_ref(), pic);
                         v.error = None;
                     }
                     Err(e) => v.error = Some(e),
@@ -2249,11 +2415,8 @@ impl App {
         // Collect a finished decode, start the next if the time moved.
         if let Some(rx) = &v.busy {
             match rx.try_recv() {
-                Ok(Ok(img)) => {
-                    match &mut v.texture {
-                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                        None => v.texture = Some(ui.ctx().load_texture("viewer", img, egui::TextureOptions::LINEAR)),
-                    }
+                Ok(Ok(pic)) => {
+                    show_pic(&mut v.picture, gpu.as_ref(), pic);
                     v.error = None;
                     v.busy = None;
                 }
@@ -2269,7 +2432,7 @@ impl App {
             let (tx, rx) = std::sync::mpsc::channel();
             let (path, info, t) = (v.path.clone(), v.info.clone(), v.t);
             std::thread::spawn(move || {
-                let _ = tx.send(recordings::decode_frame(&path, &info, t, PREVIEW_MAX_WIDTH as u32).and_then(still_image));
+                let _ = tx.send(recordings::decode_frame(&path, &info, t, PREVIEW_MAX_WIDTH as u32).and_then(still_pic));
             });
             v.busy = Some(rx);
             v.shown = Some(v.t);
@@ -2316,14 +2479,13 @@ impl App {
         if let Some(e) = &v.error {
             ui.colored_label(egui::Color32::from_rgb(200, 60, 50), e);
         }
-        if let Some(t) = &v.texture {
+        if let Some(t) = &v.picture {
             let area = ui.available_rect_before_wrap();
-            let ts = t.size_vec2();
+            let ts = t.size();
             let scale = (area.width() / ts.x).min(area.height() / ts.y).max(0.01);
             let rect = egui::Rect::from_center_size(area.center(), ts * scale);
             ui.allocate_rect(rect, egui::Sense::hover());
-            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            ui.painter().image(t.id(), rect, uv, egui::Color32::WHITE);
+            t.paint(ui.painter(), rect);
         }
     }
 
@@ -2500,7 +2662,7 @@ impl eframe::App for App {
             }
         }
         self.watch_camera();
-        self.update_preview(&ctx);
+        self.update_preview();
         self.poll_test();
         // While recording: live view only, no settings window.
         let recording = self.recording.is_some();
@@ -2609,8 +2771,30 @@ fn encoder_fits(p: &encoder::Profile, f: PixelFormat) -> bool {
     !p.hardware || f.bits() <= 10 || f.is_single_channel()
 }
 
-/// A GPU encoder with 12-bit samples: only on the 8-bit curve.
+/// The two differ at most in what is set live: exposure and gain, and the
+/// program's loop settings.
+fn light_only(a: &scenario::CameraSettings, b: &scenario::CameraSettings) -> bool {
+    let mut b = b.clone();
+    (b.exposure_us, b.gain_db) = (a.exposure_us, a.gain_db);
+    (b.metering, b.program_target, b.program_rate) = (a.metering, a.program_target, a.program_rate);
+    *a == b
+}
+
+/// Camera settings as saved: under the program's loop exposure and gain
+/// are not part of them.
+fn camera_differs(saved: &scenario::CameraSettings, now: &scenario::CameraSettings) -> bool {
+    let mut n = now.clone();
+    if n.program && saved.program {
+        (n.exposure_us, n.gain_db) = (saved.exposure_us, saved.gain_db);
+    }
+    *saved != n
+}
+
+/// A GPU encoder with raw 12-bit samples: only on the 8-bit curve.
 fn needs_curve(s: &Scenario) -> bool {
+    if s.recording.corrected {
+        return false;
+    }
     let f = s.camera.pixel_format;
     let gpu = encoder::PROFILES.iter().any(|p| p.id == s.recording.encoder && p.hardware);
     gpu && f.is_single_channel() && f.bits() > 10
@@ -2621,6 +2805,7 @@ fn needs_curve(s: &Scenario) -> bool {
 fn fit_recording(s: &mut Scenario) -> Option<String> {
     let f = s.camera.pixel_format;
     if let Some(p) = encoder::PROFILES.iter().find(|p| p.id == s.recording.encoder)
+        && !s.recording.corrected
         && !encoder_fits(p, f)
     {
         s.recording.encoder = "auto".into();
@@ -2929,7 +3114,7 @@ fn export_editor(ui: &mut egui::Ui, x: &mut ExportSettings, id: &str) {
 type Shot = (&'static str, fn(&mut App));
 
 /// Screenshot steps on the simulated camera.
-const SHOTS: [Shot; 7] = [
+const SHOTS: [Shot; 10] = [
     ("1_fooldal", |a| a.page = Page::Main),
     ("2_fooldal_felvetel", |a| {
         a.rec_name = "_kepernyokep".into();
@@ -2944,6 +3129,17 @@ const SHOTS: [Shot; 7] = [
     ("5_beallitasok", |a| a.page = Page::Settings),
     // More than the camera can: the window fits it and says so.
     ("5b_tul_nagy_fps", |a| a.edit.camera.frame_rate = 1000.0),
+    // The program's control loop drives the (simulated) sensor.
+    ("5c_szenzor_program", |a| {
+        a.edit.camera.auto_exposure = false;
+        a.edit.camera.program = true;
+    }),
+    ("5d_fooldal_program", |a| a.page = Page::Main),
+    ("5e_utofeldolgozas", |a| {
+        if let Some(s) = a.engine.scenario.as_mut() {
+            (s.view.gamma, s.view.saturation, s.view.shadows) = (2.2, 1.6, 0.4);
+        }
+    }),
     ("6_felvetel_lejatszasa", |a| {
         a.page = Page::Main;
         a.refresh_recordings();
@@ -3162,175 +3358,6 @@ fn extra_to_json(s: &Scenario) -> String {
     }
 }
 
-/// Auto-levels (black and white point, if given), then brightness/contrast,
-/// as an 8-bit table.
-fn tone_table(v: &View, levels: Option<(f32, f32)>) -> [u8; 256] {
-    std::array::from_fn(|i| {
-        let mut x = i as f32 / 255.0;
-        if let Some((lo, hi)) = levels {
-            x = (x - lo) / (hi - lo);
-        }
-        let x = (x - 0.5) * v.contrast + 0.5 + v.brightness;
-        (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-    })
-}
-
-/// Downscaled 8-bit RGB preview: white balance gains (colour sources only),
-/// then the LUT, then the tone table. Bayer RGGB is shown by taking each 2×2
-/// cell as one pixel (no interpolation); MJPEG is decoded first. Also returns
-/// the mean R, G, B before white balance (unsaturated pixels, colour only)
-/// for the auto white balance, and a brightness histogram before the tone
-/// table for the auto-levels. `None` if the frame cannot be decoded.
-/// Preview of a linear averaged image: white balance, LUT and tone as in
-/// [`to_color_image`].
-fn image_to_color(
-    img: &stack::Image,
-    lut: Option<&PreviewLut>,
-    wb: Option<[f32; 3]>,
-    tone: &[u8; 256],
-) -> Option<(egui::ColorImage, Option<[f64; 3]>, [u32; 256])> {
-    let (w, h, ch) = (img.width, img.height, img.channels);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    let (mut sum, mut n) = ([0f64; 3], 0u64);
-    let mut hist = [0u32; 256];
-    for p in img.data.chunks_exact(ch) {
-        if ch == 1 {
-            let v = to8(p[0]);
-            let px = lut.map_or([v, v, v], |l| l.gray[v as usize]);
-            hist[px[1] as usize] += 1;
-            rgb.extend(px.map(|c| tone[c as usize]));
-            continue;
-        }
-        if p.iter().all(|&c| c < 250.0 / 255.0) {
-            (0..3).for_each(|c| sum[c] += p[c] as f64 * 255.0);
-            n += 1;
-        }
-        let mut px: [f32; 3] = [p[0], p[1], p[2]];
-        if let Some(g) = wb {
-            px = std::array::from_fn(|c| (px[c] * g[c]).min(1.0));
-        }
-        if let Some(l) = lut {
-            px = l.lut.apply(px);
-        }
-        let px = px.map(to8);
-        hist[((px[0] as u32 + 2 * px[1] as u32 + px[2] as u32) / 4) as usize] += 1;
-        rgb.extend(px.map(|c| tone[c as usize]));
-    }
-    let means = (n > 0).then(|| sum.map(|c| c / n as f64));
-    Some((egui::ColorImage::from_rgb([w, h], &rgb), means, hist))
-}
-
-fn to_color_image(
-    f: &Frame,
-    max_width: usize,
-    lut: Option<&PreviewLut>,
-    wb: Option<[f32; 3]>,
-    tone: &[u8; 256],
-) -> Option<(egui::ColorImage, Option<[f64; 3]>, [u32; 256])> {
-    let (w, h) = (f.width as usize, f.height as usize);
-    let decoded;
-    let (data, format, w, h) = if f.format == PixelFormat::Mjpeg {
-        let options = zune_jpeg::zune_core::options::DecoderOptions::default()
-            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGB);
-        let mut dec =
-            zune_jpeg::JpegDecoder::new_with_options(zune_jpeg::zune_core::bytestream::ZCursor::new(&f.data[..]), options);
-        decoded = dec.decode().ok()?;
-        let info = dec.info()?;
-        (&decoded[..], None, info.width as usize, info.height as usize)
-    } else {
-        (&f.data[..], Some(f.format), w, h)
-    };
-
-    let mut step = w.div_ceil(max_width).max(1);
-    if format.is_some_and(|f| f.is_bayer() || matches!(f, PixelFormat::Yuyv | PixelFormat::Uyvy | PixelFormat::Nv12)) {
-        step = step.next_multiple_of(2);
-    }
-    let (ow, oh) = (w / step, h / step);
-    let need = match format {
-        None => w * h * 3,
-        Some(fmt) => Frame::byte_size(w as u32, h as u32, fmt),
-    };
-    if data.len() < need || ow == 0 || oh == 0 {
-        return None;
-    }
-    let bpp = format.map_or(3, |f| f.bytes_per_pixel());
-    let shift = format.map_or(0, |f| f.bits().saturating_sub(8));
-    let mono = |x: usize, y: usize| -> u8 {
-        let i = (y * w + x) * bpp;
-        if bpp == 1 {
-            data[i]
-        } else {
-            (u16::from_le_bytes([data[i], data[i + 1]]) >> shift).min(255) as u8
-        }
-    };
-    // BT.601 limited range, as used by UVC cameras.
-    let yuv = |y: u8, u: u8, v: u8| -> [u8; 3] {
-        let (c, d, e) = (y as f32 - 16.0, u as f32 - 128.0, v as f32 - 128.0);
-        let clamp = |x: f32| x.clamp(0.0, 255.0) as u8;
-        [clamp(1.164 * c + 1.596 * e), clamp(1.164 * c - 0.392 * d - 0.813 * e), clamp(1.164 * c + 2.017 * d)]
-    };
-
-    let mut rgb = Vec::with_capacity(ow * oh * 3);
-    let (mut sum, mut n) = ([0u64; 3], 0u64);
-    let mut hist = [0u32; 256];
-    for oy in 0..oh {
-        let y = oy * step;
-        for ox in 0..ow {
-            let x = ox * step;
-            let px: [u8; 3] = match format {
-                None => {
-                    let i = (y * w + x) * 3;
-                    [data[i], data[i + 1], data[i + 2]]
-                }
-                Some(PixelFormat::Yuyv) => {
-                    let i = (y * w + x) * 2;
-                    yuv(data[i], data[i + 1], data[i + 3])
-                }
-                Some(PixelFormat::Uyvy) => {
-                    let i = (y * w + x) * 2;
-                    yuv(data[i + 1], data[i], data[i + 2])
-                }
-                Some(PixelFormat::Nv12) => {
-                    let uv = w * h + (y / 2) * w + x;
-                    yuv(data[y * w + x], data[uv], data[uv + 1])
-                }
-                Some(f) if f.is_bayer() => {
-                    let g = ((mono(x + 1, y) as u16 + mono(x, y + 1) as u16) / 2) as u8;
-                    [mono(x, y), g, mono(x + 1, y + 1)]
-                }
-                Some(_) => {
-                    // Mono: fast LUT path through the grey table.
-                    let v = mono(x, y);
-                    let px = lut.map_or([v, v, v], |l| l.gray[v as usize]);
-                    hist[px[1] as usize] += 1;
-                    rgb.extend(px.map(|c| tone[c as usize]));
-                    continue;
-                }
-            };
-            if px.iter().all(|&c| c < 250) {
-                (0..3).for_each(|c| sum[c] += px[c] as u64);
-                n += 1;
-            }
-            let px = match wb {
-                Some(g) => std::array::from_fn(|c| (px[c] as f32 * g[c]).min(255.0) as u8),
-                None => px,
-            };
-            let px = match lut {
-                Some(l) => l.lut.apply(px.map(|c| c as f32 / 255.0)).map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8),
-                None => px,
-            };
-            hist[((px[0] as u32 + 2 * px[1] as u32 + px[2] as u32) / 4) as usize] += 1;
-            rgb.extend(px.map(|c| tone[c as usize]));
-        }
-    }
-    let means = (n > 0).then(|| sum.map(|c| c as f64 / n as f64));
-    Some((egui::ColorImage::from_rgb([ow, oh], &rgb), means, hist))
-}
-
 /// Camera limits; a click on a frame rate returns (format, height, fps) to
 /// load into the editor.
 fn limits_table(ui: &mut egui::Ui, l: &Limits) -> Option<(PixelFormat, u32, f64)> {
@@ -3370,25 +3397,29 @@ fn limits_table(ui: &mut egui::Ui, l: &Limits) -> Option<(PixelFormat, u32, f64)
 
 /// A decoded recording frame for the viewer: raw camera data like the live
 /// preview, with one-shot grey-world white balance and auto-levels.
-fn still_image(still: Still) -> Result<egui::ColorImage, String> {
+fn still_pic(still: Still) -> Result<Pic, String> {
     let f = match still {
-        Still::Rgb { width, height, data } => return Ok(egui::ColorImage::from_rgb([width, height], &data)),
+        Still::Rgb { width, height, data } => {
+            let src = gpu_view::Source::from_rgb8(width, height, &data);
+            return Ok(Pic { src, table: std::sync::Arc::new(gpu_view::table(&View::default(), None, None, false)) });
+        }
         Still::Raw(f) => f,
     };
-    let plain = tone_table(&View::default(), None);
-    let (_, means, hist) = to_color_image(&f, PREVIEW_MAX_WIDTH, None, None, &plain).ok_or("a képkocka nem dekódolható")?;
-    let wb = means.map(|[r, g, b]| [g / r.max(1e-3), 1.0, g / b.max(1e-3)].map(|x| x.clamp(0.25, 4.0) as f32));
-    let total: u32 = hist.iter().sum();
-    let pct = |p: f32| {
-        let mut acc = 0;
-        hist.iter().position(|&h| {
-            acc += h;
-            acc as f32 >= p * total as f32
-        })
-        .unwrap_or(255) as f32
-            / 255.0
-    };
-    let (lo, hi) = (pct(0.005), pct(0.995));
-    let tone = tone_table(&View::default(), Some((lo, hi.max(lo + 0.05))));
-    to_color_image(&f, PREVIEW_MAX_WIDTH, None, wb, &tone).map(|(img, _, _)| img).ok_or_else(|| "a képkocka nem dekódolható".into())
+    let src = owned(gpu_view::Source::from_frame(&f).ok_or("a képkocka nem dekódolható")?);
+    let wb = src.stats(None).0.map(gpu_view::wb_of);
+    let levels = gpu_view::levels_of(&src.stats(wb).1);
+    Ok(Pic { table: std::sync::Arc::new(gpu_view::table(&View::default(), levels, wb, false)), src })
+}
+
+/// A copy of `src` that does not borrow the frame.
+fn owned(src: gpu_view::Source) -> gpu_view::Source<'static> {
+    gpu_view::Source { data: std::borrow::Cow::Owned(src.data.into_owned()), ..src }
+}
+
+/// Put a decoded frame on the viewer's GPU picture.
+fn show_pic(picture: &mut Option<gpu_view::Picture>, gpu: Option<&std::sync::Arc<gpu_view::Gpu>>, pic: Pic) {
+    let Some(gpu) = gpu else { return };
+    let p = picture.get_or_insert_with(|| gpu_view::Picture::new(gpu.clone(), &pic.src));
+    p.upload(&pic.src);
+    p.set_look(&pic.table, None);
 }

@@ -179,6 +179,12 @@ pub trait Camera: Send {
     fn live(&mut self, _target: Option<f64>, _offset: Option<(u32, u32)>) -> Result<(), String> {
         Err("a kamera futás közben nem állítható".into())
     }
+    /// Exposure [µs], gain [dB] and/or frame rate while the camera streams
+    /// (also recording), within what it allows now. Returns what it runs
+    /// now: (exposure, gain, frame rate).
+    fn live_light(&mut self, _exposure_us: Option<f64>, _gain_db: Option<f64>, _fps: Option<f64>) -> Result<(f64, f64, f64), String> {
+        Err("a kamera futás közben nem állítja az expozíciót".into())
+    }
     /// The device went away (unplugged); it has to be opened again.
     fn disconnected(&self) -> bool {
         false
@@ -218,11 +224,19 @@ pub struct SimCamera {
     settings: Option<CameraSettings>,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// Exposure × gain relative to 2 ms at 0 dB (f64 bits): the pattern's
+    /// brightness, so the exposure control can be tried without a camera.
+    light: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SimCamera {
     pub fn new() -> Self {
-        SimCamera { settings: None, running: Arc::new(AtomicBool::new(false)), thread: None }
+        SimCamera { settings: None, running: Arc::new(AtomicBool::new(false)), thread: None, light: Arc::new(1f64.to_bits().into()) }
+    }
+
+    fn set_light(&self, s: &CameraSettings) {
+        let l = if s.auto_exposure { 1.0 } else { s.exposure_us / 2000.0 * 10f64.powf(s.gain_db / 20.0) };
+        self.light.store(l.to_bits(), Relaxed);
     }
 }
 
@@ -276,8 +290,10 @@ impl Camera for SimCamera {
     fn start(&mut self, pool: BufferPool, mut sink: FrameSink) -> Result<(), String> {
         self.stop();
         let s = self.settings.clone().ok_or("no settings applied")?;
+        self.set_light(&s);
         self.running.store(true, Relaxed);
         let running = self.running.clone();
+        let light = self.light.clone();
         let thread = std::thread::Builder::new()
             .name("sim-camera".into())
             .spawn(move || {
@@ -291,7 +307,7 @@ impl Camera for SimCamera {
                         std::thread::sleep(wait);
                     }
                     let mut data = pool.get(len);
-                    fill_pattern(&mut data, s.width as usize, s.pixel_format, id);
+                    fill_pattern(&mut data, s.width as usize, s.pixel_format, id, f64::from_bits(light.load(Relaxed)));
                     sink(Frame {
                         id,
                         timestamp_ns: start.elapsed().as_nanos() as u64,
@@ -308,6 +324,24 @@ impl Camera for SimCamera {
         Ok(())
     }
 
+    fn live_light(&mut self, exposure_us: Option<f64>, gain_db: Option<f64>, fps: Option<f64>) -> Result<(f64, f64, f64), String> {
+        let s = self.settings.as_mut().ok_or("no settings applied")?;
+        if fps.is_some_and(|f| (f - s.frame_rate).abs() > 1e-6) {
+            return Err("a szimulált kamera fps-e futás közben nem változik".into());
+        }
+        let r = sim_ranges(s);
+        if let Some(e) = exposure_us {
+            s.exposure_us = e.clamp(r.exposure_us.0, exposure_cap(&r, s.frame_rate));
+        }
+        if let Some(g) = gain_db {
+            s.gain_db = g.clamp(r.gain_db.0, r.gain_db.1);
+        }
+        s.auto_exposure = false;
+        let s = s.clone();
+        self.set_light(&s);
+        Ok((s.exposure_us, s.gain_db, s.frame_rate))
+    }
+
     fn stop(&mut self) {
         self.running.store(false, Relaxed);
         if let Some(t) = self.thread.take() {
@@ -322,20 +356,22 @@ impl Drop for SimCamera {
     }
 }
 
-/// Diagonal gradient moving with the frame id.
-fn fill_pattern(data: &mut [u8], width: usize, format: PixelFormat, id: u64) {
+/// Diagonal gradient moving with the frame id, scaled by `light` (clipped
+/// at full scale like a sensor).
+fn fill_pattern(data: &mut [u8], width: usize, format: PixelFormat, id: u64, light: f64) {
     let shift = id as usize * 4;
+    let k = (light * 256.0) as u32;
     if format.bytes_per_pixel() == 1 {
         for (y, row) in data.chunks_exact_mut(width).enumerate() {
             for (x, px) in row.iter_mut().enumerate() {
-                *px = (x + y + shift) as u8;
+                *px = ((((x + y + shift) as u32 & 255) * k) >> 8).min(255) as u8;
             }
         }
     } else {
         let max = (1u32 << format.bits()) - 1;
         for (y, row) in data.chunks_exact_mut(width * 2).enumerate() {
             for (x, px) in row.chunks_exact_mut(2).enumerate() {
-                let v = (((x + y + shift) as u32 * 16) & max) as u16;
+                let v = (((((x + y + shift) as u32 * 16) & max) as u64 * k as u64) >> 8).min(max as u64) as u16;
                 px.copy_from_slice(&v.to_le_bytes());
             }
         }

@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 use crate::camera::{self, Camera, Geometry, Limits, Mode, Ranges};
 use crate::frame::{self, BufferPool, Frame, PixelFormat};
 use crate::recorder::{RecStats, Recorder};
+use crate::gpu_view::{Look, Source};
+use crate::lut::Lut;
+use crate::control::{Control, Measure};
 use crate::scenario::{Device, Scenario};
 
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(40);
@@ -94,6 +97,11 @@ pub struct Engine {
     last_received: (u64, Instant),
     /// Last reconnect error, logged only when it changes.
     last_error: String,
+    /// What the picture looks like: the live view and a corrected
+    /// recording use the same tables.
+    pub look: Arc<Mutex<Look>>,
+    /// The program's exposure control loop (`CameraSettings::program`).
+    pub control: Control,
 }
 
 pub struct RecordingInfo {
@@ -105,6 +113,8 @@ pub struct RecordingInfo {
 impl Engine {
     pub fn new() -> Self {
         Engine {
+            look: Arc::new(Mutex::new(Look::default())),
+            control: Control::default(),
             camera: None,
             shared: Arc::new(Shared {
                 pool: BufferPool::default(),
@@ -225,6 +235,8 @@ impl Engine {
         }
         self.lost = None;
         *self.shared.continuity.lock().unwrap() = Continuity::default();
+        self.look.lock().unwrap().reset();
+        self.control.reset();
         let r = self.start(s, false);
         if r.is_err() && self.camera_gone() && s.device != Device::Sim {
             self.lost = Some((s.clone(), Instant::now()));
@@ -426,6 +438,17 @@ impl Engine {
         self.shared.preview.lock().unwrap().take()
     }
 
+    /// Follow the picture `src` with the running scenario's look (view
+    /// settings, colour LUT, automatics); returns the 1D table and cube.
+    pub fn observe(&self, src: &Source, lut: Option<(String, Arc<Lut>)>) -> (Arc<Vec<f32>>, Option<Arc<Vec<u16>>>) {
+        let mut look = self.look.lock().unwrap();
+        if let Some(s) = &self.scenario {
+            look.set(&s.view, lut);
+        }
+        look.observe(src);
+        look.tables()
+    }
+
     /// Give a preview frame's buffer back for reuse.
     pub fn recycle(&self, f: Frame) {
         self.shared.pool.put(f.data);
@@ -450,6 +473,40 @@ impl Engine {
         Ok(())
     }
 
+    /// Exposure, gain and/or frame rate written to the streaming camera
+    /// (also while recording); the running scenario follows what the camera
+    /// runs now. Its own auto exposure is switched off by then.
+    pub fn live_light(&mut self, exposure_us: Option<f64>, gain_db: Option<f64>, fps: Option<f64>) -> Result<(f64, f64, f64), String> {
+        let (Some(s), Some((_, cam))) = (self.scenario.as_mut(), self.camera.as_mut()) else {
+            return Err("a kamera nem fut".into());
+        };
+        if s.camera.auto_exposure {
+            return Err("a kamera saját automatikája fut".into());
+        }
+        let (e, g, f) = cam.live_light(exposure_us, gain_db, fps)?;
+        (s.camera.exposure_us, s.camera.gain_db, s.camera.frame_rate) = (e, g, f);
+        Ok((e, g, f))
+    }
+
+    /// The program's exposure control: one step on the measured picture,
+    /// written live to the camera (also while recording).
+    pub fn regulate(&mut self, m: Measure) -> Result<(), String> {
+        let Some(s) = &self.scenario else { return Ok(()) };
+        let c = s.camera.clone();
+        if !c.program || c.auto_exposure {
+            return Ok(());
+        }
+        let Some(r) = self.ranges() else { return Ok(()) };
+        let cap = crate::camera::exposure_cap(&r, c.frame_rate);
+        let emin = r.exposure_us.0.max(c.auto_exposure_range.0);
+        let gmin = r.gain_db.0.max(c.auto_gain_range.0);
+        let bounds = (emin, cap.min(c.auto_exposure_range.1).max(emin), gmin, r.gain_db.1.min(c.auto_gain_range.1).max(gmin));
+        if let Some((e, g)) = self.control.step(m, &c, (c.exposure_us, c.gain_db), bounds) {
+            self.live_light(Some(e), Some(g), None)?;
+        }
+        Ok(())
+    }
+
     pub fn is_recording(&self) -> bool {
         self.shared.recorder.lock().unwrap().is_some()
     }
@@ -470,6 +527,7 @@ impl Engine {
             Frame::byte_size(c.width, c.height, c.pixel_format),
             c.frame_rate,
             self.shared.pool.clone(),
+            s.recording.corrected.then(|| self.look.clone()),
         )?;
         let info = RecordingInfo {
             stats: rec.stats.clone(),

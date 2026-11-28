@@ -1,9 +1,12 @@
 mod camera;
+mod control;
 mod curve;
 mod encoder;
 mod engine;
 mod export;
 mod frame;
+mod gpu_magnify;
+mod gpu_view;
 mod lut;
 mod magnify;
 mod probe;
@@ -41,6 +44,10 @@ usage:
   vid_recorder screenshots [dir=screenshots] [camera|uvc]
                                walk through the GUI pages with the simulated
                                camera and save each page as PNG
+  vid_recorder live-test <scenario|sim|u3v>
+                               record ~12 s while exposure, gain and frame
+                               rate change on the streaming camera; reports
+                               write times, brightness and frame continuity
   vid_recorder probe <scenario|sim|u3v> [seconds=5]
                                ask the camera which formats, sizes and max
                                frame rates it supports and record-test each
@@ -78,6 +85,7 @@ fn main() -> ExitCode {
         }),
         Some("camera-test") => camera_test(&args[1..]),
         Some("record") => record(&args[1..]),
+        Some("live-test") => live_test(&args[1..]),
         Some("probe") => probe_camera(&args[1..]),
         Some("screenshots") => screenshots(&args[1..]),
         Some("limits") => limits(&args[1..]),
@@ -125,7 +133,10 @@ fn screenshots(args: &[String]) -> Result<bool, String> {
     eframe::run_native(
         "vid_recorder",
         options,
-        Box::new(move |_cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog")).screenshots(dir, camera, uvc)))),
+        Box::new(move |cc| {
+            let app = ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog")).with_gpu(cc.wgpu_render_state.as_ref());
+            Ok(Box::new(app.screenshots(dir, camera, uvc)))
+        }),
     )
     .map_err(|e| e.to_string())?;
     Ok(true)
@@ -139,7 +150,7 @@ fn gui() -> Result<bool, String> {
     eframe::run_native(
         "vid_recorder",
         options,
-        Box::new(|_cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog"))))),
+        Box::new(|cc| Ok(Box::new(ui::App::new(Engine::new(), scenario_dir(), PathBuf::from("slog")).with_gpu(cc.wgpu_render_state.as_ref())))),
     )
     .map_err(|e| e.to_string())?;
     Ok(true)
@@ -244,7 +255,18 @@ fn record(args: &[String]) -> Result<bool, String> {
     }
     let start = std::time::Instant::now();
     let mut report = std::time::Instant::now();
+    // No window: the look (automatics) follows the preview frames here.
+    let lut = s.preview_lut.as_ref().and_then(|n| Some((n.clone(), std::sync::Arc::new(lut::Lut::load(&PathBuf::from("slog").join(n)).ok()?))));
     while seconds.is_none_or(|s| start.elapsed().as_secs_f64() < s) && !matches!(rx.try_recv(), Ok(())) && engine.is_recording() {
+        if let Some(f) = engine.take_preview() {
+            if let Some(src) = gpu_view::Source::from_frame(&f) {
+                engine.observe(&src, lut.clone());
+                if let Err(e) = engine.regulate(control::Measure::of(&src)) {
+                    eprintln!("expozíció: {e}");
+                }
+            }
+            engine.recycle(f);
+        }
         if let Some(m) = engine.poll() {
             eprintln!("{:.1} s: {m}", start.elapsed().as_secs_f64());
         }
@@ -259,6 +281,9 @@ fn record(args: &[String]) -> Result<bool, String> {
                 engine.stats().lost_at_camera.load(Relaxed),
                 if engine.waiting_for_camera() { " · WAITING FOR CAMERA" } else { "" }
             );
+            if let Some(c) = engine.scenario.as_ref().map(|s| &s.camera).filter(|c| c.program) {
+                eprintln!("   expozíció {:.0} µs · erősítés {:.1} dB · {}", c.exposure_us, c.gain_db, engine.control.status);
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -275,6 +300,85 @@ fn record(args: &[String]) -> Result<bool, String> {
 }
 
 /// Scenario by name, or the defaults for "sim" / "u3v".
+/// Exposure, gain and frame rate written while the camera streams and
+/// records: how long each write takes, whether the picture follows, and
+/// whether any frame goes missing (frame IDs in the CSV).
+fn live_test(args: &[String]) -> Result<bool, String> {
+    let mut s = scenario_or_device(args.first().ok_or("usage: live-test <scenario|sim|u3v>")?)?;
+    s.camera.auto_exposure = false;
+    s.recording.corrected = false;
+    s.recording.curve8 = false;
+    s.recording.encoder = "auto".into();
+    let mut engine = Engine::new();
+    let mut s2 = s.clone();
+    let notes = engine.apply_fit(&mut s2)?;
+    for n in notes {
+        eprintln!("fit: {n}");
+    }
+    let (e0, g0, f0) = (s2.camera.exposure_us, s2.camera.gain_db, s2.camera.frame_rate);
+    eprintln!("start: {e0:.0} µs, {g0:.1} dB, {f0:.2} fps, {}", s2.camera.pixel_format.name());
+    let name = chrono::Local::now().format("_livetest_%H%M%S").to_string();
+    let info = engine.start_recording(&name)?;
+    // Mean brightness of the preview frames over a while.
+    let mean = |engine: &Engine, secs: f64| -> f64 {
+        let t = std::time::Instant::now();
+        let (mut sum, mut n) = (0.0, 0);
+        while t.elapsed().as_secs_f64() < secs {
+            if let Some(f) = engine.take_preview() {
+                if let Some(src) = gpu_view::Source::from_frame(&f) {
+                    let (m, hist) = src.stats(None);
+                    let tot: u64 = hist.iter().map(|&h| h as u64).sum();
+                    let avg = m.map(|m| (m[0] + m[1] + m[2]) / 3.0).unwrap_or_else(|| {
+                        hist.iter().enumerate().map(|(i, &h)| i as f64 * h as f64).sum::<f64>() / (tot.max(1) as f64 * (hist.len() - 1) as f64)
+                    });
+                    sum += avg;
+                    n += 1;
+                }
+                engine.recycle(f);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sum / n.max(1) as f64
+    };
+    let steps: Vec<(&str, Option<f64>, Option<f64>, Option<f64>)> = vec![
+        ("alap", None, None, None),
+        ("expozíció /2", Some(e0 / 2.0), None, None),
+        ("expozíció vissza", Some(e0), None, None),
+        ("erősítés +6 dB", None, Some(g0 + 6.0), None),
+        ("erősítés vissza", None, Some(g0), None),
+        ("fps /2", None, None, Some(f0 / 2.0)),
+        ("fps vissza", None, None, Some(f0)),
+        ("expozíció /4 + erősítés +12 dB", Some(e0 / 4.0), Some(g0 + 12.0), None),
+        ("vissza", Some(e0), Some(g0), None),
+    ];
+    for (label, e, g, f) in steps {
+        let t = std::time::Instant::now();
+        let r = if e.is_none() && g.is_none() && f.is_none() { Ok((e0, g0, f0)) } else { engine.live_light(e, g, f) };
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        std::thread::sleep(Duration::from_millis(300));
+        let m = mean(&engine, 1.0);
+        match r {
+            Ok((e, g, f)) => println!("{label:32} {ms:6.1} ms  →  {e:8.0} µs {g:5.1} dB {f:7.2} fps   átlag {:5.1}%", m * 100.0),
+            Err(err) => println!("{label:32} {ms:6.1} ms  →  HIBA: {err}   átlag {:5.1}%", m * 100.0),
+        }
+    }
+    engine.finish_recording();
+    let st = &info.stats;
+    // Frame continuity from the CSV.
+    let csv = std::fs::read_to_string(&info.csv).map_err(|e| e.to_string())?;
+    let rows: Vec<(u64, u64)> = csv.lines().skip(1).filter_map(|l| {
+        let (t, i) = l.split_once(',')?;
+        Some((t.parse().ok()?, i.parse().ok()?))
+    }).collect();
+    let gaps: u64 = rows.windows(2).map(|w| w[1].1.saturating_sub(w[0].1 + 1)).sum();
+    let max_dt = rows.windows(2).map(|w| w[1].0.saturating_sub(w[0].0)).max().unwrap_or(0) as f64 / 1e6;
+    println!("képek {} · sorszám-hiány {gaps} · eldobva (sor) {} · kamera vesztett {} · leghosszabb képköz {max_dt:.1} ms", rows.len(), st.dropped.load(Relaxed), engine.stats().lost_at_camera.load(Relaxed));
+    for p in [&info.video, &info.csv] {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(gaps == 0)
+}
+
 fn scenario_or_device(name: &str) -> Result<Scenario, String> {
     match scenario::load_all(&scenario_dir()).into_iter().find(|s| s.name == name) {
         Some(s) => Ok(s),

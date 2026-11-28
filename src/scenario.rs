@@ -75,11 +75,74 @@ pub struct View {
     pub align: bool,
     /// Subtract the scenario's dark frame (see `dark`).
     pub dark: bool,
+    /// How fast the automatic white balance and levels follow the picture
+    /// [Hz] (first-order lag). They also act on a corrected recording.
+    #[serde(default = "default_auto_rate")]
+    pub auto_rate: f32,
+    /// Post-processing on the GPU (live view and corrected recording).
+    /// Exposure compensation [EV, stops].
+    #[serde(default)]
+    pub exposure_ev: f32,
+    /// Colour temperature (-1 cooler .. 1 warmer) and tint (-1 green ..
+    /// 1 magenta), on top of the white balance.
+    #[serde(default)]
+    pub temperature: f32,
+    #[serde(default)]
+    pub tint: f32,
+    /// Black and white point (0..1 of the linear signal) when the levels
+    /// are not automatic.
+    #[serde(default)]
+    pub black: f32,
+    #[serde(default = "one")]
+    pub white: f32,
+    /// Display gamma (1: linear, 2.2: like sRGB).
+    #[serde(default = "one")]
+    pub gamma: f32,
+    /// Lift (+) or deepen (-) the shadows, recover (-) or brighten (+) the
+    /// highlights (-1..1).
+    #[serde(default)]
+    pub shadows: f32,
+    #[serde(default)]
+    pub highlights: f32,
+    /// Colour saturation (1: as is, 0: grey) and vibrance (saturation that
+    /// spares the already saturated colours, -1..1).
+    #[serde(default = "one")]
+    pub saturation: f32,
+    #[serde(default)]
+    pub vibrance: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+fn default_auto_rate() -> f32 {
+    0.5
 }
 
 impl Default for View {
     fn default() -> Self {
-        View { auto_white_balance: true, auto_levels: false, brightness: 0.0, contrast: 1.0, average: false, average_frames: 0, align: false, dark: false }
+        View {
+            auto_white_balance: true,
+            auto_levels: false,
+            brightness: 0.0,
+            contrast: 1.0,
+            average: false,
+            average_frames: 0,
+            align: false,
+            dark: false,
+            auto_rate: default_auto_rate(),
+            exposure_ev: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            black: 0.0,
+            white: 1.0,
+            gamma: 1.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            saturation: 1.0,
+            vibrance: 0.0,
+        }
     }
 }
 
@@ -124,6 +187,48 @@ pub struct CameraSettings {
     /// Any other GenICam feature, written as is (name -> number/string/bool).
     #[serde(default)]
     pub extra: BTreeMap<String, serde_json::Value>,
+    /// The program's exposure control loop (`control.rs`): measures the
+    /// incoming picture and drives exposure, then gain, live within the
+    /// auto ranges. The camera's own automatics stay off.
+    #[serde(default)]
+    pub program: bool,
+    #[serde(default)]
+    pub metering: Metering,
+    /// What the loop aims at, 0..1 of full scale: the bright end (99.5th
+    /// percentile of the brightest channel) or the mean.
+    #[serde(default = "program_target")]
+    pub program_target: f64,
+    /// How fast the loop follows [Hz].
+    #[serde(default = "program_rate")]
+    pub program_rate: f64,
+}
+
+/// What the program's exposure control measures.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum Metering {
+    /// The bright end just below full scale (expose to the right): no
+    /// burnt-out highlights, the most light the sensor can take.
+    #[default]
+    Highlights,
+    /// The mean brightness, with the highlights kept from burning out.
+    Mean,
+}
+
+impl Metering {
+    pub fn default_target(self) -> f64 {
+        match self {
+            Metering::Highlights => 0.8,
+            Metering::Mean => 0.18,
+        }
+    }
+}
+
+fn program_target() -> f64 {
+    0.8
+}
+
+fn program_rate() -> f64 {
+    1.0
 }
 
 fn auto_target() -> f64 {
@@ -151,6 +256,15 @@ pub struct RecordingSettings {
     /// The low-power mode is no more accurate below 8.
     #[serde(default = "default_gpu_q")]
     pub gpu_q: u32,
+    /// Record the corrected picture, as the live view shows it (white
+    /// balance, levels, LUT, brightness, contrast; 10-bit 4:2:0), instead of
+    /// the raw sensor data.
+    #[serde(default = "default_corrected")]
+    pub corrected: bool,
+}
+
+fn default_corrected() -> bool {
+    true
 }
 
 fn default_gpu_q() -> u32 {
@@ -179,8 +293,12 @@ impl Default for Scenario {
                 reverse_x: false,
                 reverse_y: false,
                 extra: BTreeMap::new(),
+                program: false,
+                metering: Metering::Highlights,
+                program_target: program_target(),
+                program_rate: program_rate(),
             },
-            recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into(), curve8: true, gpu_q: 8 },
+            recording: RecordingSettings { encoder: "auto".into(), output_dir: "recordings".into(), curve8: true, gpu_q: 8, corrected: true },
             preview_lut: None,
             view: View::default(),
             export: Default::default(),

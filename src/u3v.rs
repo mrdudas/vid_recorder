@@ -573,6 +573,43 @@ impl Camera for U3vCamera {
         Ok(())
     }
 
+    fn live_light(&mut self, exposure_us: Option<f64>, gain_db: Option<f64>, fps: Option<f64>) -> Result<(f64, f64, f64), String> {
+        let mut p = self.cam.params_ctxt().map_err(|e| e.to_string())?;
+        // Write only what is writable now and within range: a refused write
+        // locks the Alvium.
+        let check = |p: &mut Params, name: &str| -> Result<(), String> {
+            let w = p.node(name).and_then(|n| n.as_float(p)).is_some_and(|n| n.is_writable(p).unwrap_or(false));
+            if w { Ok(()) } else { Err(format!("{name} futás közben nem írható")) }
+        };
+        let read = |p: &mut Params, name: &str| p.node(name).and_then(|n| n.as_float(p)).and_then(|n| n.value(p).ok());
+        // A shorter exposure first: the frame rate's maximum depends on it.
+        let fps_now = read(&mut p, "AcquisitionFrameRate").unwrap_or(0.0);
+        let faster = fps.is_some_and(|f| f > fps_now);
+        if faster && let Some(f) = fps {
+            if let Some(e) = exposure_us {
+                check(&mut p, "ExposureTime")?;
+                set_float_clamped(&mut p, "ExposureTime", e.min(0.95e6 / f))?;
+            }
+            check(&mut p, "AcquisitionFrameRate")?;
+            set_float_clamped(&mut p, "AcquisitionFrameRate", f)?;
+        } else if let Some(f) = fps {
+            check(&mut p, "AcquisitionFrameRate")?;
+            set_float_clamped(&mut p, "AcquisitionFrameRate", f)?;
+        }
+        if let Some(e) = exposure_us {
+            check(&mut p, "ExposureTime")?;
+            set_float_clamped(&mut p, "ExposureTime", e)?;
+        }
+        if let Some(g) = gain_db {
+            check(&mut p, "Gain")?;
+            set_float_clamped(&mut p, "Gain", g)?;
+        }
+        let e = read(&mut p, "ExposureTime").ok_or("ExposureTime nem olvasható")?;
+        let g = read(&mut p, "Gain").unwrap_or(0.0);
+        let f = read(&mut p, "AcquisitionFrameRate").unwrap_or(fps_now);
+        Ok((e, g, f))
+    }
+
     fn reset(&mut self) {
         self.stop();
         let Ok(mut p) = self.cam.params_ctxt() else { return };

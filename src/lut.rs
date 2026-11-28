@@ -88,16 +88,6 @@ impl Lut {
         }
         out
     }
-
-    /// Table for 8-bit grey input -> 8-bit RGB (fast path for mono preview).
-    pub fn gray_table(&self) -> Vec<[u8; 3]> {
-        (0..256)
-            .map(|v| {
-                let x = v as f32 / 255.0;
-                self.apply([x, x, x]).map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-            })
-            .collect()
-    }
 }
 
 /// `.cube` files under `dir` (recursive), as paths relative to `dir` with
@@ -146,7 +136,7 @@ mod tests {
     #[test]
     fn invert_1d() {
         let lut = Lut::parse("LUT_1D_SIZE 2\n1 1 1\n0 0 0\n").unwrap();
-        assert_eq!(lut.gray_table()[0], [255, 255, 255]);
-        assert_eq!(lut.gray_table()[255], [0, 0, 0]);
+        assert_eq!(lut.apply([0.0; 3]), [1.0; 3]);
+        assert_eq!(lut.apply([1.0; 3]), [0.0; 3]);
     }
 }

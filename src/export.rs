@@ -32,6 +32,8 @@ pub const USAGE: &str = "\
                  alpha=N[,N..]  magnification (one, or one per band)
                  start=S dur=S  part of the recording (seconds)
                  width=N        process at this width (faster)
+                 cpu            magnify on the processor (default: the
+                                GPU if there is one)
                  bayer=rggb|bggr|grbg|gbrg  mosaic (default: from the tag)
                  fps=N          output frame rate (frames dropped/repeated)
                  slow           keep every frame, play at fps (default 25)
@@ -47,6 +49,9 @@ const WARM_UP: f64 = 8.0;
 enum Method {
     Phase(magnify::Phase),
     Linear(magnify::Linear),
+    /// The same on the GPU (`gpu_magnify`).
+    GpuPhase(crate::gpu_magnify::Phase),
+    GpuLinear(crate::gpu_magnify::Linear),
     Broadband(magnify::Broadband),
     Colour(magnify::Colour),
 }
@@ -60,6 +65,8 @@ struct Options {
     width: Option<usize>,
     bayer: Option<String>,
     slow: bool,
+    /// Magnify on the processor even if there is a GPU.
+    cpu: bool,
     fps: Option<f64>,
     codec: Option<String>,
     crf: Option<u32>,
@@ -70,6 +77,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     for a in args {
         if a == "slow" {
             o.slow = true;
+            continue;
+        }
+        if a == "cpu" {
+            o.cpu = true;
             continue;
         }
         let (k, v) = a.split_once('=').ok_or_else(|| format!("unknown option {a}"))?;
@@ -104,7 +115,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     Ok(o)
 }
 
-fn build_method(name: &str, o: &Options, fps: f64, colour_input: bool) -> Result<Method, String> {
+fn build_method(name: &str, o: &Options, fps: f64, colour_input: bool, gpu: Option<(&std::sync::Arc<crate::gpu_view::Gpu>, usize, usize)>) -> Result<Method, String> {
     let (bands, alphas): (Vec<(f64, f64)>, Vec<f32>) = match name {
         "phase" => (vec![PULSE, BREATH], vec![30.0, 20.0]),
         "tremor" => (TREMOR.to_vec(), vec![30.0]),
@@ -131,9 +142,11 @@ fn build_method(name: &str, o: &Options, fps: f64, colour_input: bool) -> Result
             return Err(format!("band {}-{} Hz is not usable at {fps:.2} fps (upper edge must be below {:.2} Hz)", b.lo, b.hi, fps / 2.0));
         }
     }
-    Ok(match name {
-        "phase" | "tremor" => Method::Phase(magnify::Phase::new(&bands, fps)),
-        "linear" => Method::Linear(magnify::Linear::new(&bands, fps)),
+    Ok(match (name, gpu) {
+        ("phase" | "tremor", Some((g, w, h))) => Method::GpuPhase(crate::gpu_magnify::Phase::new(g.clone(), &bands, fps, w, h)),
+        ("linear", Some((g, w, h))) => Method::GpuLinear(crate::gpu_magnify::Linear::new(g.clone(), &bands, fps, w, h)),
+        ("phase" | "tremor", None) => Method::Phase(magnify::Phase::new(&bands, fps)),
+        ("linear", None) => Method::Linear(magnify::Linear::new(&bands, fps)),
         _ => {
             if !colour_input {
                 return Err("colour needs a colour recording".into());
@@ -448,7 +461,30 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     }
 
     let mut methods: Vec<Method> =
-        methods.split(',').map(|m| build_method(m.trim(), &o, fps, colour)).collect::<Result<_, _>>()?;
+        {
+            // The GPU magnifies if there is one (and `cpu` is not asked for).
+            let gpu = if o.cpu { None } else { crate::gpu_view::Gpu::headless().map_err(|e| eprintln!("GPU: {e}, processor instead")).ok() };
+            // Colour, phase / tremor / linear only: the whole frame on the GPU.
+            let names: Vec<&str> = methods.split(',').map(str::trim).collect();
+            if let Some(g) = &gpu
+                && colour
+                && names.iter().all(|m| matches!(*m, "phase" | "tremor" | "linear"))
+            {
+                let gm = names
+                    .iter()
+                    .map(|m| {
+                        Ok(match build_method(m, &o, fps, colour, None)? {
+                            Method::Phase(p) => crate::gpu_magnify::Method::Phase(p.bands.clone()),
+                            Method::Linear(l) => crate::gpu_magnify::Method::Linear(l.bands.clone()),
+                            _ => unreachable!(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                return gpu_export(g.clone(), &gm, input, output, &p, &o, fps, (w, h));
+            }
+            eprintln!("magnification on the {}", if gpu.is_some() { "GPU" } else { "processor" });
+            names.iter().map(|m| build_method(m, &o, fps, colour, gpu.as_ref().map(|g| (g, w, h)))).collect::<Result<_, _>>()?
+        };
 
     let warm = o.start.min(WARM_UP);
     let from = o.start - warm;
@@ -481,6 +517,8 @@ pub fn run(args: &[String]) -> Result<bool, String> {
         .map(|m| match m {
             Method::Phase(p) => p.band_count(),
             Method::Linear(l) => l.band_count(),
+            Method::GpuPhase(p) => p.band_count(),
+            Method::GpuLinear(l) => l.band_count(),
             Method::Broadband(b) => b.band_count(),
             Method::Colour(_) => 1,
         })
@@ -495,13 +533,23 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     let mut src = dec[0].stdout.take().unwrap();
     let mut grid = vec![0u8; gw * gh * ch];
     let (t0, mut n, mut written) = (Instant::now(), 0usize, 0usize);
+    // Where the time goes: reading, magnifying, composing, writing.
+    let mut spent = [0f64; 4];
+    let mut lap = Instant::now();
+    let mut tick = |i: usize, spent: &mut [f64; 4]| {
+        spent[i] += lap.elapsed().as_secs_f64();
+        lap = Instant::now();
+    };
     while let Some(frame) = read_frame(&mut src, w, h, ch, &mut buf)? {
+        tick(0, &mut spent);
         let y = if ch == 3 { magnify::luma(&frame) } else { frame[0].clone() };
         let mut out: Vec<Vec<Plane>> = vec![frame.clone()];
         for m in &mut methods {
             let lumas = match m {
                 Method::Phase(p) => p.process(&y),
                 Method::Linear(l) => l.process(&y),
+                Method::GpuPhase(p) => p.process(&y),
+                Method::GpuLinear(l) => l.process(&y),
                 Method::Broadband(b) => b.process(&y),
                 Method::Colour(c) => {
                     out.push(c.process(&frame));
@@ -514,6 +562,7 @@ pub fn run(args: &[String]) -> Result<bool, String> {
             }
         }
         n += 1;
+        tick(1, &mut spent);
         if n <= warm_frames {
             continue;
         }
@@ -528,7 +577,9 @@ pub fn run(args: &[String]) -> Result<bool, String> {
                 }
             }
         });
+        tick(2, &mut spent);
         enc_in.write_all(&grid).map_err(|e| format!("encoder: {e}"))?;
+        tick(3, &mut spent);
         written += 1;
         if written % (fps.round() as usize * 10).max(1) == 0 {
             let s = t0.elapsed().as_secs_f64();
@@ -539,6 +590,110 @@ pub fn run(args: &[String]) -> Result<bool, String> {
     let ok = enc.wait().map_err(|e| e.to_string())?.success();
     dec.iter_mut().for_each(|c| _ = c.wait());
     eprintln!("{written} frames -> {output} ({:.0} s)", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "time: reading {:.1} s, magnifying {:.1} s, composing {:.1} s, waiting for the encoder {:.1} s ({n} frames in, {written} out)",
+        spent[0], spent[1], spent[2], spent[3]
+    );
+    Ok(ok && written > 0)
+}
+
+/// Magnification with the whole frame on the GPU (`gpu_magnify::Export`):
+/// the decoder's 16-bit RGB goes up, the finished grid comes back for the
+/// encoder; the GPU works while the next frame is read.
+#[allow(clippy::too_many_arguments)]
+fn gpu_export(
+    gpu: std::sync::Arc<crate::gpu_view::Gpu>,
+    methods: &[crate::gpu_magnify::Method],
+    input: &str,
+    output: &str,
+    p: &Probe,
+    o: &Options,
+    fps: f64,
+    (w, h): (usize, usize),
+) -> Result<bool, String> {
+    eprintln!("magnification on the GPU (whole frame)");
+    let bands: usize = methods.iter().map(|m| match m {
+        crate::gpu_magnify::Method::Phase(b) | crate::gpu_magnify::Method::Linear(b) => b.len(),
+    }).sum();
+    let cols = ((1 + bands) as f64).sqrt().ceil() as usize;
+    let mut ex = crate::gpu_magnify::Export::new(gpu, methods, fps, w, h, cols);
+    let (gw, gh) = ex.grid_size();
+    let warm = o.start.min(WARM_UP);
+    let (from, len) = (o.start - warm, o.dur.map(|d| d + warm));
+    let warm_frames = (warm * p.fps).round() as usize;
+    let mut enc = spawn_encoder(output, "rgb0", (gw, gh), fps, o, Stdio::piped())?;
+    let mut enc_in = enc.stdin.take().unwrap();
+    let mut dec = spawn_decoder(input, p, o, from, len, (w, h), true)?;
+    let mut src = dec[0].stdout.take().unwrap();
+    let t0 = Instant::now();
+    // Three stages at once: a reader thread, the GPU, a writer thread.
+    let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let (back_tx, back_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let reader = std::thread::spawn(move || -> Result<(), String> {
+        loop {
+            let mut buf = back_rx.try_recv().unwrap_or_else(|_| vec![0u8; w * h * 6]);
+            match src.read_exact(&mut buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(format!("decoder: {e}")),
+            }
+            if in_tx.send(buf).is_err() {
+                return Ok(());
+            }
+        }
+    });
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let writer = std::thread::spawn(move || -> Result<usize, String> {
+        let mut written = 0usize;
+        for grid in out_rx {
+            enc_in.write_all(&grid).map_err(|e| format!("encoder: {e}"))?;
+            written += 1;
+            if written % (fps.round() as usize * 10).max(1) == 0 {
+                eprintln!("{:.0} s of video, {:.1} frames/s", written as f64 / fps, written as f64 / t0.elapsed().as_secs_f64());
+            }
+        }
+        Ok(written)
+    });
+    // Time this thread spends waiting for frames, for the GPU, for the writer.
+    let mut spent = [0f64; 3];
+    let mut lap = Instant::now();
+    macro_rules! tick {
+        ($i:expr) => {{
+            spent[$i] += lap.elapsed().as_secs_f64();
+            lap = Instant::now();
+        }};
+    }
+    let mut n = 0usize;
+    let mut done = false;
+    loop {
+        // Next frame to the GPU (none left: drain what is in flight).
+        let next = if done { None } else { in_rx.recv().ok() };
+        tick!(0);
+        done |= next.is_none();
+        if next.is_none() && ex.pending() == 0 {
+            break;
+        }
+        while ex.full() || (next.is_none() && ex.pending() > 0) {
+            let t = ex.take();
+            tick!(1);
+            if let Some(Some(grid)) = t {
+                out_tx.send(grid.to_vec()).map_err(|_| "encoder stopped".to_string())?;
+            }
+            tick!(2);
+        }
+        if let Some(buf) = next {
+            n += 1;
+            ex.submit(&buf, n > warm_frames);
+            let _ = back_tx.send(buf);
+        }
+    }
+    drop(out_tx);
+    reader.join().map_err(|_| "reader panicked")??;
+    let written = writer.join().map_err(|_| "writer panicked")??;
+    let ok = enc.wait().map_err(|e| e.to_string())?.success();
+    dec.iter_mut().for_each(|c| _ = c.wait());
+    eprintln!("{written} frames -> {output} ({:.0} s)", t0.elapsed().as_secs_f64());
+    eprintln!("waiting: for frames {:.1} s, for the GPU {:.1} s, for the encoder {:.1} s ({n} frames in, {written} out)", spent[0], spent[1], spent[2]);
     Ok(ok && written > 0)
 }
 
